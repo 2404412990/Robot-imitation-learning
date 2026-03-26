@@ -2,7 +2,7 @@
 
 <a href="https://github.com/zju3dv/GVHMR">GVHMR</a>
 
-<a href="https://github.com/YanjieZe/GM">GMR</a>
+<a href="https://github.com/YanjieZe/GMR">GMR</a>
 
 <a href="https://github.com/loongOpen/Unity-RL-Playground">格物平台</a>
 
