@@ -11,7 +11,7 @@ GVHMR + GMR 是一个三维人体姿态估计与运动重建项目。
 
 2.3 结果观察
 获取输出结果并进行了初步观察
-https://github.com/2404412990/Robot-imitation-learning/blob/af362535da14e37dfc54f423f0038bb44edd64ee/docs/video/%E5%B1%8F%E5%B9%95%E6%88%AA%E5%9B%BE%202026-03-27%20034632.png
+
 
 三、不足
 快速运动响应不足
