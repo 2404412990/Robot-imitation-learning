@@ -12,7 +12,7 @@ GVHMR + GMR 是一个三维人体姿态估计与运动重建项目。
 2.3 结果观察
 获取输出结果并进行了初步观察
 
-<img src=docs/video/g3.gif alt="animated" />
+<img src=docs/video/s3.png alt="animated" />
 
 三、不足
 快速运动响应不足
