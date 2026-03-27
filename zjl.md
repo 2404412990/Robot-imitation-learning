@@ -18,6 +18,4 @@ Step 4：运行 GMR：将人体运动映射到 G1 机器人关节空间
 
 Step 5：将其中的csv文件导入unity-gewu环境中再次进行仿真检验
 
-<video src="https://github.com/2404412990/Robot-imitation-learning/blob/main/docs/video/unitree_g1_K_dance.mp4" width="800" controls="controls">
-你的Markdown编辑器不支持视频嵌入，请点击链接查看：https://github.com/2404412990/Robot-imitation-learning/blob/main/docs/video/unitree_g1_K_dance.mp4
-</video>
+<img src=docs/video/k.png alt="animated" />
