@@ -18,4 +18,4 @@ Step 4：运行 GMR：将人体运动映射到 G1 机器人关节空间
 
 Step 5：将其中的csv文件导入unity-gewu环境中再次进行仿真检验
 
-<img src=docs/video/k.png alt="animated" />
+<img src=docs/video/image.png alt="animated" />
