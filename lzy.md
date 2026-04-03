@@ -5,7 +5,7 @@
 
 <img src=docs/img/GVHMR_REALTIME_OUTPUT.png />
 
-因为GVHMR的主体网络用的是transformer，对实时输入不太擅长，故换为主体网络为RNN的WHAM
+因为GVHMR的主体网络用的是transformer，对实时输入不太擅长，故换为主体网络为RNN的<a href="https://github.com/yohanshin/WHAM">WHAM</a>
 
 在仅加入多线程优化的realtime.py下，虽然精度不如GVHMR的transformer，但帧率可以稳定在7.8~9 fps之间。
 
