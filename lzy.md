@@ -11,6 +11,10 @@
 
 <img src=docs/video/WHAM_REALTIME.gif alt="animated" />
 
+
+<img src=docs/video/subject3.gif alt="animated" />
+
+
 ## Future works
 
 搭建gewu平台离线输入视频和实时输入摄像头画面，接受服务器传回数据的前端框架
