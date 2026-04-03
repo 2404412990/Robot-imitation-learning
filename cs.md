@@ -1,5 +1,5 @@
 # 4.3 进行方法探索和试错
-我们先是将GVHMR的输入转化为一帧一帧的视频来模仿实时输入，并且维护一个10帧大小的窗口来输入给模型进行姿态提取，目前速度较慢，一秒处理一帧，还没有算上GMR进行重映射的时间，所以放弃GVHMR模型改用更加轻量的WHAM模型；此外我们又尝试了mediapipe进行直接端到端动作映射，但其由于是单眼摄像头映射，所以精度很差，虽然帧率较高也不会考虑。使用WHAM模型帧率达到了10帧左右，虽然较慢，但还有优化空间，可以使用RTMpose替代姿态提取模型进一步提高速度。
+我们先是将GVHMR的输入转化为一帧一帧的视频来模仿实时输入，并且维护一个10帧大小的窗口来输入给模型进行姿态提取，目前速度较慢，一秒处理一帧，还没有算上GMR进行重映射的时间，所以放弃GVHMR模型改用更加轻量的[WHAM](https://github.com/yohanshin/WHAM)模型；此外我们又尝试了[mediapipe](https://medium.com/@riddhisi238/real-time-pose-estimation-from-video-using-mediapipe-and-opencv-in-python-20f9f19c77a6)进行直接端到端动作映射，但其由于是单眼摄像头映射，所以精度很差，虽然帧率较高也不会考虑。使用WHAM模型帧率达到了10帧左右，虽然较慢，但还有优化空间，可以使用[RTMpose](https://github.com/open-mmlab/mmpose/tree/main/projects/rtmpose)替代姿态提取模型进一步提高速度。
 
 ## 不足
 这个流程虽然相较于GVHMR较快，但是由于还要进行人体动作的重映射，再次将WHAM的输出结果传递给GMR输出为动作序列文件来进行replay，所以整个流程比较割裂，还需切换环境，可以做进一步优化集成。
