@@ -1,0 +1,27 @@
+# Dockerignore
+
+.git
+.gitignore
+.vscode
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+checkpoints/
+assets/
+dataset/
+examples/
+docs/
+
+output/
+pkl_outputs/
+videos/
+*.ipynb_checkpoints
+
+third-party/DPVO/
+
+**/.git/
+**/*.egg-info/

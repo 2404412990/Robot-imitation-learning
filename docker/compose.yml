@@ -1,0 +1,20 @@
+services:
+  wham-gmr:
+    image: wham-gmr:local
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    ipc: host
+    network_mode: host
+    gpus: all
+    environment:
+      DISPLAY: ${DISPLAY:-}
+      WHAM_PYTHON: /opt/conda/envs/wham/bin/python
+      GMR_PYTHON: /opt/conda/envs/gmr/bin/python
+    volumes:
+      - ..:/workspace
+      - /tmp/.X11-unix:/tmp/.X11-unix
+    command: bash
