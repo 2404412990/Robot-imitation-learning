@@ -4,6 +4,8 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+      args:
+        CUDA_BASE_IMAGE: ${CUDA_BASE_IMAGE:-docker.m.daocloud.io/nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04}
     working_dir: /workspace
     stdin_open: true
     tty: true

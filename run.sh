@@ -1,5 +1,14 @@
 #!/usr/bin/env bash
+
+if [ -z "${BASH_VERSION:-}" ]; then
+	echo "[E2E] This script requires bash. Please run: bash run.sh"
+	exit 2
+fi
+
 set -euo pipefail
+
+# Ensure local packages are importable even when scripts are launched by path.
+export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
 
 # =========================
 # End-to-end WHAM -> GMR stream pipeline
@@ -52,27 +61,41 @@ else
 	GMR_VIDEO_PATH=${GMR_VIDEO_PATH:-videos/live_stream_robot.mp4}
 fi
 
-STREAM_CHUNK_SIZE=${STREAM_CHUNK_SIZE:-16}
-
 SMOOTH_ALPHA=${SMOOTH_ALPHA:-0.35}
 HEIGHT_ADJUST=${HEIGHT_ADJUST:-1}
-ROOT_ORIGIN_OFFSET=${ROOT_ORIGIN_OFFSET:-1}
+ROOT_ORIGIN_OFFSET=${ROOT_ORIGIN_OFFSET:-0}
 VIEWER_WARMUP_FRAMES=${VIEWER_WARMUP_FRAMES:-12}
 POLL_INTERVAL=${POLL_INTERVAL:-0.05}
 IDLE_TIMEOUT=${IDLE_TIMEOUT:-0}
 DONE_GRACE_SEC=${DONE_GRACE_SEC:-2.0}
 
+# WHAM performance controls (can be overridden via env before running run.sh).
+WHAM_USE_AMP=${WHAM_USE_AMP:-0}
+WHAM_DETECT_INTERVAL=${WHAM_DETECT_INTERVAL:-1}
+WHAM_INFER_INTERVAL=${WHAM_INFER_INTERVAL:-1}
+WHAM_STREAM_SEQ_LEN=${WHAM_STREAM_SEQ_LEN:-16}
+WHAM_INPUT_SCALE=${WHAM_INPUT_SCALE:-1.0}
+export WHAM_USE_AMP WHAM_DETECT_INTERVAL WHAM_INFER_INTERVAL WHAM_STREAM_SEQ_LEN WHAM_INPUT_SCALE
+
+GMR_TORCH_DEVICE=${GMR_TORCH_DEVICE:-cpu}
+
 # GMR viewer camera controls.
-CAMERA_FOLLOW=${CAMERA_FOLLOW:-1}
-CAMERA_LOOKAT_HEIGHT_OFFSET=${CAMERA_LOOKAT_HEIGHT_OFFSET:-0.75}
-CAMERA_ELEVATION=${CAMERA_ELEVATION:--5.0}
-CAMERA_DISTANCE_SCALE=${CAMERA_DISTANCE_SCALE:-1.0}
+CAMERA_FOLLOW=${CAMERA_FOLLOW:-0}
+# Default to a lower, slightly top-down and closer camera framing.
+CAMERA_LOOKAT_HEIGHT_OFFSET=${CAMERA_LOOKAT_HEIGHT_OFFSET:-0.45}
+CAMERA_ELEVATION=${CAMERA_ELEVATION:-12.0}
+CAMERA_DISTANCE_SCALE=${CAMERA_DISTANCE_SCALE:-0.85}
 CAMERA_AZIMUTH=${CAMERA_AZIMUTH:-}
 
 mkdir -p "${OUTPUT_DIR}" "${STREAM_NPZ_DIR}" "$(dirname "${PKL_PATH}")" "$(dirname "${CSV_PATH}")" "$(dirname "${GMR_VIDEO_PATH}")"
 
+GMR_READY_FLAG=${GMR_READY_FLAG:-${STREAM_NPZ_DIR}/gmr_ready.flag}
+STREAM_TAIL_PATH=${STREAM_TAIL_PATH:-${STREAM_NPZ_DIR}/stream_tail.pkl}
+READY_TIMEOUT_SEC=60
+STARTUP_DELAY_SEC=0.5
+
 # Clean stream artifacts before launching consumer to avoid mixing stale chunks from prior runs.
-rm -f "${STREAM_NPZ_DIR}"/chunk_*.npz "${STREAM_NPZ_DIR}"/stream_done.flag
+rm -f "${STREAM_NPZ_DIR}"/chunk_*.npz "${STREAM_NPZ_DIR}"/stream_done.flag "${GMR_READY_FLAG}" "${STREAM_TAIL_PATH}"
 
 WHAM_CMD=(
 	"${WHAM_PYTHON}" demo_stream_mt.py
@@ -80,12 +103,15 @@ WHAM_CMD=(
 	--time "${TIME}"
 	--output_dir "${OUTPUT_DIR}"
 	--stream_npz_dir "${STREAM_NPZ_DIR}"
-	--stream_chunk_size "${STREAM_CHUNK_SIZE}"
 )
 
 GMR_CMD=(
 	"${GMR_PYTHON}" scripts/smplx_to_robot_stream.py
 	--stream_npz_dir "${STREAM_NPZ_DIR}"
+	--stream_mode tail
+	--stream_tail_path "${STREAM_TAIL_PATH}"
+	--torch_device "${GMR_TORCH_DEVICE}"
+	--ready_flag_path "${GMR_READY_FLAG}"
 	--robot "${ROBOT}"
 	--coord_fix yup_to_zup
 	--save_path "${PKL_PATH}"
@@ -131,7 +157,18 @@ if [[ "${RECORD_WHAMVIDEO}" == "1" ]]; then
 fi
 
 if [[ "${RECORD_GMRVIDEO}" == "1" ]]; then
-	GMR_CMD+=(--record_gmrvideo --rate_limit --video_path "${GMR_VIDEO_PATH}")
+	GMR_CMD+=(--record_gmrvideo --video_path "${GMR_VIDEO_PATH}")
+fi
+
+echo "[E2E] Render flags: RECORD_WHAMVIDEO=${RECORD_WHAMVIDEO} RECORD_GMRVIDEO=${RECORD_GMRVIDEO} USE_XVFB_GMR=${USE_XVFB_GMR} DISPLAY=${DISPLAY:-<unset>}"
+echo "[E2E] Camera params: follow=${CAMERA_FOLLOW} lookat_h=${CAMERA_LOOKAT_HEIGHT_OFFSET} elev=${CAMERA_ELEVATION} dist_scale=${CAMERA_DISTANCE_SCALE} azimuth=${CAMERA_AZIMUTH:-<auto>}"
+echo "[E2E] WHAM perf params: amp=${WHAM_USE_AMP} detect_interval=${WHAM_DETECT_INTERVAL} infer_interval=${WHAM_INFER_INTERVAL} seq_len=${WHAM_STREAM_SEQ_LEN} input_scale=${WHAM_INPUT_SCALE}"
+echo "[E2E] WHAM stream mode=tail (fixed)"
+echo "[E2E] GMR torch_device=${GMR_TORCH_DEVICE}"
+if [[ "${RECORD_GMRVIDEO}" == "1" && "${USE_XVFB_GMR}" == "1" ]]; then
+	echo "[E2E] GMR is running with xvfb; MuJoCo window will not appear on physical screen."
+elif [[ "${RECORD_GMRVIDEO}" == "1" && -z "${DISPLAY:-}" ]]; then
+	echo "[E2E] Warning: DISPLAY is empty; MuJoCo window may not appear."
 fi
 
 echo "[E2E] Starting GMR consumer (${GMR_ENV}) with ${GMR_PYTHON} ..."
@@ -141,6 +178,43 @@ else
 	"${GMR_CMD[@]}" &
 fi
 GMR_PID=$!
+
+# Fast-fail if consumer exits immediately (e.g., import errors) to avoid wasting
+# time running WHAM producer while GMR is already dead.
+GMR_START_WAIT_SEC=${GMR_START_WAIT_SEC:-2}
+sleep "${GMR_START_WAIT_SEC}"
+if ! kill -0 "${GMR_PID}" 2>/dev/null; then
+	echo "[E2E] GMR consumer exited during startup. Check the error above."
+	wait "${GMR_PID}" || true
+	exit 1
+fi
+
+# Wait for consumer readiness marker so producer starts only after GMR is ready.
+echo "[E2E] Waiting GMR ready flag: ${GMR_READY_FLAG} (timeout=${READY_TIMEOUT_SEC}s) ..."
+ready_start_ts=$(date +%s)
+while [[ ! -f "${GMR_READY_FLAG}" ]]; do
+	if ! kill -0 "${GMR_PID}" 2>/dev/null; then
+		echo "[E2E] GMR consumer exited before ready flag was created."
+		wait "${GMR_PID}" || true
+		exit 1
+	fi
+	now_ts=$(date +%s)
+	elapsed=$(( now_ts - ready_start_ts ))
+	if [[ ${elapsed} -ge ${READY_TIMEOUT_SEC} ]]; then
+		echo "[E2E] Warning: timed out waiting for ready flag; continue startup."
+		break
+	fi
+	sleep 0.1
+done
+
+if [[ -f "${GMR_READY_FLAG}" ]]; then
+	echo "[E2E] GMR ready flag detected."
+fi
+
+if [[ "${STARTUP_DELAY_SEC}" != "0" ]]; then
+	echo "[E2E] Additional startup delay before WHAM: ${STARTUP_DELAY_SEC}s"
+	sleep "${STARTUP_DELAY_SEC}"
+fi
 
 cleanup() {
 	if [[ -n "${GMR_PID:-}" ]] && kill -0 "${GMR_PID}" 2>/dev/null; then

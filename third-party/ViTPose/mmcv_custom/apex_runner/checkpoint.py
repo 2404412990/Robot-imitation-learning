@@ -12,8 +12,8 @@ from mmcv.runner.checkpoint import weights_to_cpu, get_state_dict
 
 try:
     import apex
-except:
-    print('apex is not installed')
+except Exception:
+    apex = None
 
 
 def save_checkpoint(model, filename, optimizer=None, meta=None):
@@ -54,8 +54,9 @@ def save_checkpoint(model, filename, optimizer=None, meta=None):
         for name, optim in optimizer.items():
             checkpoint['optimizer'][name] = optim.state_dict()
 
-    # save amp state dict in the checkpoint
-    checkpoint['amp'] = apex.amp.state_dict()
+    # Save AMP state only when apex is available.
+    if apex is not None:
+        checkpoint['amp'] = apex.amp.state_dict()
 
     if filename.startswith('pavi://'):
         try:

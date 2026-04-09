@@ -1,8 +1,8 @@
 from mmcv.runner import OptimizerHook, HOOKS
 try:
     import apex
-except:
-    print('apex is not installed')
+except Exception:
+    apex = None
 
 
 @HOOKS.register_module()
@@ -22,6 +22,8 @@ class DistOptimizerHook_custom(OptimizerHook):
     def after_train_iter(self, runner):
         runner.outputs['loss'] /= self.update_interval
         if self.use_fp16:
+            if apex is None:
+                raise RuntimeError('Apex is required for fp16 training but is not installed.')
             with apex.amp.scale_loss(runner.outputs['loss'], runner.optimizer) as scaled_loss:
                 scaled_loss.backward()
         else:

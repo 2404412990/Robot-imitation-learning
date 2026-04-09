@@ -7,9 +7,9 @@ import select
 import torch
 import numpy as np
 from loguru import logger
-from collections import defaultdict
 import threading
 from queue import Queue, Full, Empty
+from contextlib import nullcontext
 
 try:
     import termios
@@ -19,7 +19,12 @@ except Exception:
     tty = None
 
 from configs.config import get_cfg_defaults
-from lib.vis.renderer import Renderer
+try:
+    from lib.vis.renderer import Renderer
+    RENDERER_IMPORT_ERROR = None
+except Exception as e:
+    Renderer = None
+    RENDERER_IMPORT_ERROR = e
 import imageio
 from collections import deque
 from lib.data.utils.normalizer import Normalizer
@@ -28,8 +33,15 @@ from lib.models import build_network, build_body_model
 from lib.models.preproc.detector import DetectionModel
 from lib.models.preproc.extractor import FeatureExtractor
 from lib.utils.kp_utils import root_centering
-import torchvision.transforms as transforms
 from lib.models.preproc.backbone.utils import process_image
+from scripts.stream_demo_common import (
+    TailStreamWriter,
+    env_flag,
+    estimate_fps_from_timestamps,
+    init_preview_window,
+    rotate_frame_bgr,
+    sanitize_preview_frame,
+)
 
 STREAM_SEQ_LEN = 16
 
@@ -37,37 +49,6 @@ def xyxy_to_cxcys(bbox, s_factor=1.2):
     cx, cy = bbox[[0, 2]].mean(), bbox[[1, 3]].mean()
     scale = max(bbox[2] - bbox[0], bbox[3] - bbox[1]) / 200 * s_factor
     return np.array([cx, cy, scale])
-
-def cxcys_to_bbox(cx, cy, scale):
-    w = h = scale * 200.0
-    return np.array([cx - w/2, cy - h/2, cx + w/2, cy + h/2])
-
-def rotate_frame_bgr(frame, rotate_deg):
-    if rotate_deg == 90:
-        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
-    if rotate_deg == 180:
-        return cv2.rotate(frame, cv2.ROTATE_180)
-    if rotate_deg == 270:
-        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
-    return frame
-
-
-def estimate_fps_from_timestamps(timestamps, fallback_fps=30.0):
-    if timestamps is None:
-        return float(max(1.0, fallback_fps))
-    ts = np.asarray(timestamps, dtype=np.float64).reshape(-1)
-    ts = ts[np.isfinite(ts)]
-    if ts.size < 2:
-        return float(max(1.0, fallback_fps))
-    ts = np.sort(ts)
-    dt = np.diff(ts)
-    dt = dt[dt > 1e-4]
-    if dt.size == 0:
-        return float(max(1.0, fallback_fps))
-    est = 1.0 / float(np.median(dt))
-    if not np.isfinite(est):
-        return float(max(1.0, fallback_fps))
-    return float(np.clip(est, 1.0, 120.0))
 
 
 def run_stream_mt(
@@ -77,15 +58,42 @@ def run_stream_mt(
     rotate_deg=None,
     record_whamvideo=False,
     stream_npz_dir=None,
-    stream_chunk_size=16,
     capture_time=0.0,
 ):
     os.makedirs(output_dir, exist_ok=True)
     device = cfg.DEVICE.lower()
+    is_cuda_device = str(device).startswith('cuda') and torch.cuda.is_available()
+    use_amp = env_flag('WHAM_USE_AMP', True) and is_cuda_device
+    detect_interval = max(1, int(os.environ.get('WHAM_DETECT_INTERVAL', '2')))
+    infer_interval = max(1, int(os.environ.get('WHAM_INFER_INTERVAL', '1')))
+    stream_seq_len = max(4, int(os.environ.get('WHAM_STREAM_SEQ_LEN', str(STREAM_SEQ_LEN))))
+
+    if is_cuda_device:
+        torch.backends.cudnn.benchmark = True
+        if hasattr(torch.backends, 'cuda') and hasattr(torch.backends.cuda, 'matmul'):
+            torch.backends.cuda.matmul.allow_tf32 = True
+        if hasattr(torch.backends, 'cudnn'):
+            torch.backends.cudnn.allow_tf32 = True
+
+    def autocast_ctx():
+        if use_amp:
+            return torch.autocast(device_type='cuda', dtype=torch.float16)
+        return nullcontext()
+
     root_dir = os.path.abspath(os.path.dirname(__file__))
     is_webcam = video_path == '0' or video_path == 0
     webcam_capture_time = max(0.0, float(capture_time))
     webcam_start_ts = None
+    preview_window_name = 'WHAM Stream'
+    preview_window_enabled = bool(record_whamvideo)
+    logger.info(
+        f"Perf opts: amp={int(use_amp)} detect_interval={detect_interval} "
+        f"infer_interval={infer_interval} seq_len={stream_seq_len} device={device} "
+        "stream_mode=tail"
+    )
+    if preview_window_enabled and os.name != 'nt' and not os.environ.get('DISPLAY'):
+        logger.warning("RECORD_WHAMVIDEO=1 but DISPLAY is not set; preview window disabled.")
+        preview_window_enabled = False
     
     # Init Models
     logger.info("Loading models...")
@@ -135,14 +143,45 @@ def run_stream_mt(
     assert ok and probe is not None, f'Failed to read first frame from {video_path}'
     if rotate_deg is not None:
         probe = rotate_frame_bgr(probe, rotate_deg)
+
+    input_scale = float(os.environ.get('WHAM_INPUT_SCALE', '1.0'))
+    input_scale = float(np.clip(input_scale, 0.1, 1.0))
+    input_scale = float(min(input_scale, 1.0))
+    apply_input_resize = input_scale < 0.999
+    if apply_input_resize:
+        new_w = max(2, int(round(probe.shape[1] * input_scale)))
+        new_h = max(2, int(round(probe.shape[0] * input_scale)))
+        probe = cv2.resize(probe, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        logger.info(f"Input resized for speed: scale={input_scale:.3f}, size={new_w}x{new_h}")
+
     first_frame = probe
     if is_webcam:
         webcam_start_ts = time.time()
     height, width = first_frame.shape[:2]
+    logger.info(f"Effective input size: {width}x{height} (scale={input_scale:.3f})")
+
+    if preview_window_enabled:
+        try:
+            preview_max_w = max(320, int(os.environ.get('WHAM_PREVIEW_MAX_WIDTH', '960')))
+            preview_max_h = max(240, int(os.environ.get('WHAM_PREVIEW_MAX_HEIGHT', '540')))
+            init_w, init_h = init_preview_window(
+                preview_window_name,
+                width,
+                height,
+                preview_max_w,
+                preview_max_h,
+            )
+            logger.info(f"WHAM preview window initialized at {init_w}x{init_h}.")
+        except Exception as e:
+            logger.warning(f"Failed to initialize preview window ({e}); preview disabled.")
+            preview_window_enabled = False
     
     from lib.utils.imutils import compute_cam_intrinsics
     res = torch.tensor([width, height]).float()
     intrinsics = compute_cam_intrinsics(res)
+    intrinsics_batch = intrinsics.unsqueeze(0).to(device)
+    res_batch = res.unsqueeze(0).to(device)
+    import lib.utils.transforms as pt_transforms
 
     renderer = None
     writer = None
@@ -150,8 +189,15 @@ def run_stream_mt(
     writer_buffer = []
     writer_buffer_ts = []
     if record_whamvideo:
-        focal_length = (width ** 2 + height ** 2) ** 0.5
-        renderer = Renderer(width, height, focal_length, device, smpl.faces)
+        if Renderer is None:
+            logger.warning(f"pytorch3d renderer unavailable ({RENDERER_IMPORT_ERROR}); continue without mesh overlay.")
+        else:
+            focal_length = (width ** 2 + height ** 2) ** 0.5
+            try:
+                renderer = Renderer(width, height, focal_length, device, smpl.faces)
+            except Exception as e:
+                logger.warning(f"Failed to initialize renderer ({e}); continue without mesh overlay.")
+                renderer = None
         if not is_webcam:
             writer = imageio.get_writer(
                 wham_video_path,
@@ -163,21 +209,10 @@ def run_stream_mt(
         else:
             logger.info("Webcam WHAM writer will use measured runtime FPS for output video.")
 
+    tail_writer = None
     if stream_npz_dir is not None:
-        os.makedirs(stream_npz_dir, exist_ok=True)
-        # Clear stale chunks and done flag from previous runs.
-        for name in os.listdir(stream_npz_dir):
-            if name.startswith('chunk_') and name.endswith('.npz'):
-                try:
-                    os.remove(os.path.join(stream_npz_dir, name))
-                except OSError:
-                    pass
-        done_flag = os.path.join(stream_npz_dir, 'stream_done.flag')
-        if os.path.exists(done_flag):
-            try:
-                os.remove(done_flag)
-            except OSError:
-                pass
+        tail_writer = TailStreamWriter(stream_npz_dir, flush_interval=1)
+        logger.info(f"Tail stream enabled: {tail_writer.tail_path} (flush_interval={tail_writer.flush_interval})")
 
 
     # Queues for pipeline
@@ -185,10 +220,6 @@ def run_stream_mt(
     det_Q = Queue(maxsize=10)
     ext_Q = Queue(maxsize=10)
     wham_Q = Queue(maxsize=10)
-
-    stream_chunk = []
-    stream_chunk_index = 0
-    stable_stream_betas = None
 
     def ensure_webcam_writer(force=False):
         nonlocal writer, writer_buffer, writer_buffer_ts
@@ -215,57 +246,6 @@ def run_stream_mt(
         logger.info(f"Initialized webcam WHAM writer at {est_fps:.2f} FPS.")
         writer_buffer = []
         writer_buffer_ts = []
-
-    def flush_stream_chunk(force=False):
-        nonlocal stream_chunk_index, stream_chunk, stable_stream_betas
-        if stream_npz_dir is None:
-            return
-        if len(stream_chunk) == 0:
-            return
-        if (not force) and (len(stream_chunk) < max(1, int(stream_chunk_size))):
-            return
-
-        frame_ids = np.array([int(item[0]) for item in stream_chunk], dtype=np.int64)
-        frame_ids.sort()
-
-        frame_dict = {int(item[0]): (item[1], float(item[2])) for item in stream_chunk}
-        frame_data = []
-        frame_ts = []
-        for fid in frame_ids:
-            data_i, ts_i = frame_dict[int(fid)]
-            frame_data.append(data_i)
-            frame_ts.append(ts_i)
-
-        pose_body = np.stack([d['body_pose'] for d in frame_data], axis=0).astype(np.float32)
-        root_orient = np.stack([d['global_orient_global'] for d in frame_data], axis=0).astype(np.float32)
-        trans = np.stack([d['transl_global'] for d in frame_data], axis=0).astype(np.float32)
-        if stable_stream_betas is None:
-            stable_stream_betas = np.median(
-                np.stack([d['betas'] for d in frame_data], axis=0).astype(np.float32), axis=0
-            ).astype(np.float32)
-        betas = stable_stream_betas.copy()
-        chunk_fps = estimate_fps_from_timestamps(frame_ts, fallback_fps=float(fps))
-
-        chunk_name = f"chunk_{stream_chunk_index:06d}_{int(frame_ids[0]):06d}_{int(frame_ids[-1]):06d}.npz"
-        chunk_path = os.path.join(stream_npz_dir, chunk_name)
-        tmp_chunk_path = chunk_path + '.tmp'
-        with open(tmp_chunk_path, 'wb') as f:
-            np.savez(
-                f,
-                frame_ids=frame_ids,
-                pose_body=pose_body,
-                root_orient=root_orient,
-                trans=trans,
-                betas=betas,
-                mocap_frame_rate=np.array(float(chunk_fps), dtype=np.float32),
-                gender=np.array('neutral'),
-                coord_system=np.array('y-up'),
-                source=np.array('wham_stream_mt'),
-            )
-        os.replace(tmp_chunk_path, chunk_path)
-        logger.info(f"Stream chunk saved: {chunk_path} ({len(frame_ids)} frames, fps={chunk_fps:.2f})")
-        stream_chunk = []
-        stream_chunk_index += 1
 
     def extract_latest_vertices(pred):
         verts = pred['verts_cam']
@@ -361,6 +341,10 @@ def run_stream_mt(
 
     def request_stop():
         stop_event.set()
+        try:
+            cap.release()
+        except Exception:
+            pass
         # Wake up any thread blocked on queue.get(). If a queue is full,
         # drop one item to make room for the sentinel so stop can propagate.
         for q in (read_Q, det_Q, ext_Q, wham_Q):
@@ -424,7 +408,12 @@ def run_stream_mt(
     def reader_thread():
         frame_id = 0
         if first_frame is not None:
-            read_Q.put((frame_id, time.time(), first_frame))
+            while not stop_event.is_set():
+                try:
+                    read_Q.put((frame_id, time.time(), first_frame), timeout=0.1)
+                    break
+                except Full:
+                    continue
             frame_id += 1
 
         while cap.isOpened() and not stop_event.is_set():
@@ -436,99 +425,190 @@ def run_stream_mt(
             if not ret: break
             if rotate_deg is not None:
                 frame = rotate_frame_bgr(frame, rotate_deg)
-            read_Q.put((frame_id, time.time(), frame))
+            if apply_input_resize:
+                frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+            while not stop_event.is_set():
+                try:
+                    read_Q.put((frame_id, time.time(), frame), timeout=0.1)
+                    break
+                except Full:
+                    continue
             frame_id += 1
-        read_Q.put(None)
+        try:
+            read_Q.put(None, timeout=0.2)
+        except Exception:
+            pass
     
     def detector_thread():
         detector.initialize_tracking()
         selected_track_id = None
+        last_detect_frame = -10**9
+        last_track_id = None
+        last_kp2d = None
+        last_bbox_c = None
+
         while not stop_event.is_set():
-            data = read_Q.get()
-            if data is None: det_Q.put(None); break
+            try:
+                data = read_Q.get(timeout=0.1)
+            except Empty:
+                continue
+            if data is None:
+                try:
+                    det_Q.put(None, timeout=0.2)
+                except Exception:
+                    pass
+                break
             frame_id, start_time, frame = data
-            
-            # 内部调用推理
-            detector.track(frame, fps, 1000)
-            
-            # 使用最新的一帧结果
-            poses = detector.pose_results_last
-            
-            # 我们只追踪最主主体
+
             track_id = None
             kp2d = None
             bbox_c = None
+
+            need_detect = (frame_id - last_detect_frame) >= detect_interval or last_track_id is None
+            if need_detect:
+                detector.track(frame, fps, 1000)
+                poses = detector.pose_results_last
+
+                if len(poses) > 0:
+                    valid_poses = []
+                    for pose in poses:
+                        valid = (pose['keypoints'][:, -1] > 0.3).sum()
+                        if valid >= 6:
+                            valid_poses.append(pose)
+
+                    best_pose = None
+                    if len(valid_poses) > 0:
+                        if selected_track_id is not None:
+                            for pose in valid_poses:
+                                if pose['track_id'] == selected_track_id:
+                                    best_pose = pose
+                                    break
+
+                        if best_pose is None:
+                            best_pose = max(
+                                valid_poses,
+                                key=lambda p: (p['bbox'][2] - p['bbox'][0]) * (p['bbox'][3] - p['bbox'][1])
+                            )
+
+                    if best_pose is not None:
+                        selected_track_id = best_pose['track_id']
+                        track_id = best_pose['track_id']
+                        bbox_c = xyxy_to_cxcys(best_pose['bbox'])
+                        kp2d = best_pose['keypoints']
+
+                last_detect_frame = frame_id
+                if track_id is not None and kp2d is not None and bbox_c is not None:
+                    last_track_id = int(track_id)
+                    last_kp2d = kp2d.copy()
+                    last_bbox_c = bbox_c.copy()
+                else:
+                    last_track_id = None
+                    last_kp2d = None
+                    last_bbox_c = None
+            else:
+                track_id = last_track_id
+                kp2d = None if last_kp2d is None else last_kp2d.copy()
+                bbox_c = None if last_bbox_c is None else last_bbox_c.copy()
             
-            if len(poses) > 0:
-                valid_poses = []
-                for pose in poses:
-                    valid = (pose['keypoints'][:, -1] > 0.3).sum()
-                    if valid >= 6:
-                        valid_poses.append(pose)
-
-                best_pose = None
-                if len(valid_poses) > 0:
-                    # Prefer previously selected track to avoid identity switching jitter.
-                    if selected_track_id is not None:
-                        for pose in valid_poses:
-                            if pose['track_id'] == selected_track_id:
-                                best_pose = pose
-                                break
-
-                    # Fallback: choose largest visible person.
-                    if best_pose is None:
-                        best_pose = max(
-                            valid_poses,
-                            key=lambda p: (p['bbox'][2] - p['bbox'][0]) * (p['bbox'][3] - p['bbox'][1])
-                        )
-
-                if best_pose is not None:
-                    selected_track_id = best_pose['track_id']
-                    track_id = best_pose['track_id']
-                    bbox_c = xyxy_to_cxcys(best_pose['bbox'])
-                    kp2d = best_pose['keypoints']
-            
-            det_Q.put((frame_id, start_time, frame, track_id, kp2d, bbox_c))
+            while not stop_event.is_set():
+                try:
+                    det_Q.put((frame_id, start_time, frame, track_id, kp2d, bbox_c), timeout=0.1)
+                    break
+                except Full:
+                    continue
             
     def extractor_thread():
+        init_cache = {}
         while not stop_event.is_set():
-            data = det_Q.get()
-            if data is None: ext_Q.put(None); break
+            try:
+                data = det_Q.get(timeout=0.1)
+            except Empty:
+                continue
+            if data is None:
+                try:
+                    ext_Q.put(None, timeout=0.2)
+                except Exception:
+                    pass
+                break
             frame_id, start_time, frame, track_id, kp2d, bbox_c = data
             
             if track_id is not None:
                 cx, cy, scale = bbox_c
                 norm_img, _ = process_image(frame[..., ::-1], [cx, cy], scale, 256, 256)
-                norm_img = torch.from_numpy(norm_img).unsqueeze(0).to(device)
+                norm_img = torch.from_numpy(norm_img).unsqueeze(0).to(device, non_blocking=True)
+
+                with torch.inference_mode():
+                    with autocast_ctx():
+                        feature = extractor.model(norm_img, encode=True)
+
+                init_data = init_cache.get(track_id)
+                if init_data is None:
+                    dummy_tracking = {track_id: {}}
+                    with torch.inference_mode():
+                        with autocast_ctx():
+                            extractor.predict_init(norm_img, dummy_tracking, track_id, flip_eval=False)
+                    init_data = dummy_tracking[track_id]
+                    init_cache[track_id] = init_data
                 
-                with torch.no_grad():
-                    feature = extractor.model(norm_img, encode=True)
-                
-                # Recompute init from current frame to avoid stale pose lock.
-                dummy_tracking = {track_id: {}}
-                with torch.no_grad():
-                    extractor.predict_init(norm_img, dummy_tracking, track_id, flip_eval=False)
-                init_data = dummy_tracking[track_id]
-                
-                ext_Q.put((frame_id, start_time, frame, track_id, kp2d, bbox_c, feature, init_data))
+                while not stop_event.is_set():
+                    try:
+                        ext_Q.put((frame_id, start_time, frame, track_id, kp2d, bbox_c, feature, init_data), timeout=0.1)
+                        break
+                    except Full:
+                        continue
             else:
-                ext_Q.put((frame_id, start_time, frame, None, None, None, None, None))
+                while not stop_event.is_set():
+                    try:
+                        ext_Q.put((frame_id, start_time, frame, None, None, None, None, None), timeout=0.1)
+                        break
+                    except Full:
+                        continue
                 
+    def build_wham_inits(init_data_hist, first_norm_kp2d):
+        with torch.inference_mode():
+            init_output = smpl.get_output(
+                global_orient=init_data_hist['init_global_orient'].to(device),
+                body_pose=init_data_hist['init_body_pose'].to(device),
+                betas=init_data_hist['init_betas'].to(device),
+                pose2rot=False,
+                return_full_pose=True
+            )
+
+        init_kp3d = root_centering(init_output.joints[:, :17], 'coco')
+        init_kp = torch.cat(
+            (init_kp3d.reshape(1, -1), first_norm_kp2d.reshape(1, -1)),
+            dim=-1
+        ).unsqueeze(0).to(device)
+        init_smpl = pt_transforms.matrix_to_rotation_6d(init_output.full_pose).unsqueeze(0).to(device)
+        init_root = pt_transforms.matrix_to_rotation_6d(init_output.global_orient).to(device)
+        return (init_kp, init_smpl), init_root
+
     def wham_thread():
         temporal_history = {}
 
         while not stop_event.is_set():
-            data = ext_Q.get()
-            if data is None: wham_Q.put(None); break
+            try:
+                data = ext_Q.get(timeout=0.1)
+            except Empty:
+                continue
+            if data is None:
+                try:
+                    wham_Q.put(None, timeout=0.2)
+                except Exception:
+                    pass
+                break
             frame_id, start_time, frame, track_id, kp2d, bbox_c, feature, init_data = data
             
             if track_id is not None:
                 if track_id not in temporal_history:
                     temporal_history[track_id] = {
-                        'kp2d': deque(maxlen=STREAM_SEQ_LEN),
-                        'bbox': deque(maxlen=STREAM_SEQ_LEN),
-                        'feature': deque(maxlen=STREAM_SEQ_LEN),
+                        'kp2d': deque(maxlen=stream_seq_len),
+                        'bbox': deque(maxlen=stream_seq_len),
+                        'feature': deque(maxlen=stream_seq_len),
                         'init_data': init_data,
+                        'cached_inits': None,
+                        'cached_init_root': None,
+                        'last_pred': None,
                     }
 
                 hist = temporal_history[track_id]
@@ -543,54 +623,84 @@ def run_stream_mt(
                 norm_kp2d, _ = keypoints_normalizer(
                     kp2d_t[..., :-1].clone(), res, intrinsics, 224, 224, bbox_t
                 )
-                norm_kp2d = norm_kp2d.unsqueeze(0).to(device)
+                norm_kp2d = norm_kp2d.unsqueeze(0).to(device, non_blocking=True)
                 
-                feature_t = torch.stack(list(hist['feature']), dim=0).unsqueeze(0).to(device)
+                feature_t = torch.stack(list(hist['feature']), dim=0).unsqueeze(0).to(device, non_blocking=True)
+
+                if hist['cached_inits'] is None or hist['cached_init_root'] is None:
+                    hist['cached_inits'], hist['cached_init_root'] = build_wham_inits(
+                        hist['init_data'],
+                        norm_kp2d[0, 0].clone()
+                    )
+
+                if infer_interval > 1 and (frame_id % infer_interval) != 0 and hist['last_pred'] is not None:
+                    last_verts_cam, last_smplx_params = hist['last_pred']
+                    while not stop_event.is_set():
+                        try:
+                            wham_Q.put(
+                                (
+                                    frame_id,
+                                    start_time,
+                                    frame,
+                                    True,
+                                    last_verts_cam.copy(),
+                                    track_id,
+                                    {k: v.copy() for k, v in last_smplx_params.items()},
+                                ),
+                                timeout=0.1,
+                            )
+                            break
+                        except Full:
+                            continue
+                    continue
                 
-                init_data_hist = hist['init_data']
-                init_output = smpl.get_output(
-                    global_orient=init_data_hist['init_global_orient'].to(device),
-                    body_pose=init_data_hist['init_body_pose'].to(device),
-                    betas=init_data_hist['init_betas'].to(device),
-                    pose2rot=False,
-                    return_full_pose=True
-                )
-                init_kp3d = root_centering(init_output.joints[:, :17], 'coco')
-                init_kp = torch.cat((init_kp3d.reshape(1, -1), norm_kp2d[0, 0].clone().reshape(1, -1)), dim=-1).unsqueeze(0).to(device)
+                cam_angvel = torch.zeros((1, norm_kp2d.shape[1], 6), device=device)
                 
-                import lib.utils.transforms as pt_transforms
-                init_smpl = pt_transforms.matrix_to_rotation_6d(init_output.full_pose).unsqueeze(0).to(device)
-                init_root = pt_transforms.matrix_to_rotation_6d(init_output.global_orient).to(device)
-                
-                cam_angvel = torch.zeros((1, norm_kp2d.shape[1], 6)).to(device)
-                
-                inits = (init_kp, init_smpl)
+                inits = hist['cached_inits']
+                init_root = hist['cached_init_root']
 
                 try:
-                    with torch.no_grad():
-                        pred = network(
-                            norm_kp2d,
-                            inits,
-                            feature_t,
-                            mask=mask,
-                            init_root=init_root,
-                            cam_angvel=cam_angvel,
-                            return_y_up=True,
-                            cam_intrinsics=intrinsics.unsqueeze(0).to(device),
-                            bbox=bbox_t.unsqueeze(0).to(device),
-                            res=res.unsqueeze(0).to(device),
-                            refine_traj=False,
-                            states=None
-                        )
+                    with torch.inference_mode():
+                        with autocast_ctx():
+                            pred = network(
+                                norm_kp2d,
+                                inits,
+                                feature_t,
+                                mask=mask,
+                                init_root=init_root,
+                                cam_angvel=cam_angvel,
+                                return_y_up=True,
+                                cam_intrinsics=intrinsics_batch,
+                                bbox=bbox_t.unsqueeze(0).to(device, non_blocking=True),
+                                res=res_batch,
+                                refine_traj=False,
+                                states=None
+                            )
 
                     verts_cam = extract_latest_vertices(pred).detach().cpu().numpy()
                     smplx_params = extract_latest_smplx_params(pred)
-                    wham_Q.put((frame_id, start_time, frame, True, verts_cam, track_id, smplx_params))
+                    hist['last_pred'] = (verts_cam.copy(), {k: v.copy() for k, v in smplx_params.items()})
+                    while not stop_event.is_set():
+                        try:
+                            wham_Q.put((frame_id, start_time, frame, True, verts_cam, track_id, smplx_params), timeout=0.1)
+                            break
+                        except Full:
+                            continue
                 except Exception:
                     logger.exception(f"WHAM inference failed on frame {frame_id}")
-                    wham_Q.put((frame_id, start_time, frame, False, None, track_id, None))
+                    while not stop_event.is_set():
+                        try:
+                            wham_Q.put((frame_id, start_time, frame, False, None, track_id, None), timeout=0.1)
+                            break
+                        except Full:
+                            continue
             else:
-                wham_Q.put((frame_id, start_time, frame, False, None, None, None))
+                while not stop_event.is_set():
+                    try:
+                        wham_Q.put((frame_id, start_time, frame, False, None, None, None), timeout=0.1)
+                        break
+                    except Full:
+                        continue
 
     t1 = threading.Thread(target=reader_thread, daemon=True)
     t2 = threading.Thread(target=detector_thread, daemon=True)
@@ -650,9 +760,8 @@ def run_stream_mt(
         if gvhmr_params is not None:
             frame_param_map[frame_id] = gvhmr_params
             frame_timestamp_map[frame_id] = float(start_time)
-            if stream_npz_dir is not None:
-                stream_chunk.append((int(frame_id), gvhmr_params, float(start_time)))
-                flush_stream_chunk(force=False)
+            if tail_writer is not None:
+                tail_writer.write_record(frame_id, start_time, gvhmr_params)
         
         curr_time = time.time()
         throughput_time = curr_time - last_frame_time
@@ -666,25 +775,26 @@ def run_stream_mt(
         if record_whamvideo:
             if success and verts_cam is not None:
                 # Render using WHAM Renderer
-                verts_tensor = torch.from_numpy(verts_cam).to(device=device, dtype=torch.float32)
-                # Render mesh expects bounding box update internally
-                try:
-                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    if renderer is not None:
+                if renderer is not None:
+                    verts_tensor = torch.from_numpy(verts_cam).to(device=device, dtype=torch.float32)
+                    # Render mesh expects bounding box update internally
+                    try:
+                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                         rendered_frame = renderer.render_mesh(verts_tensor, frame_rgb, colors=[0.2, 0.4, 0.8])
                         frame = cv2.cvtColor(rendered_frame, cv2.COLOR_RGB2BGR)
-                except Exception:
-                    render_error_count += 1
-                    if render_error_count <= 5 or render_error_count % 50 == 0:
-                        logger.exception(f"Render failed on frame {frame_id} (count={render_error_count})")
+                    except Exception:
+                        render_error_count += 1
+                        if render_error_count <= 5 or render_error_count % 50 == 0:
+                            logger.exception(f"Render failed on frame {frame_id} (count={render_error_count})")
                 cv2.putText(frame, f"Frame {frame_id} | FPS: {avg_fps:.1f} | Latency: {latency:.2f}s", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
             else:
                 cv2.putText(frame, f"Frame {frame_id} | FPS: {avg_fps:.1f} | Latency: {latency:.2f}s", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
 
-            frame_rgb_out = frame[..., ::-1]
+            frame = sanitize_preview_frame(frame)
+            frame_rgb_out = np.ascontiguousarray(frame[..., ::-1])
             if is_webcam:
                 if writer is None:
-                    writer_buffer.append(frame_rgb_out)
+                    writer_buffer.append(frame_rgb_out.copy())
                     writer_buffer_ts.append(float(curr_time))
                     ensure_webcam_writer(force=False)
                 else:
@@ -692,8 +802,8 @@ def run_stream_mt(
             elif writer is not None:
                 writer.append_data(frame_rgb_out)
 
-            if is_webcam:
-                cv2.imshow('WHAM Stream', frame)
+            if preview_window_enabled:
+                cv2.imshow(preview_window_name, frame)
                 key = cv2.waitKey(1) & 0xFF
                 if key == 27 or key == ord('q'):
                     logger.info("User requested exit from preview window.")
@@ -704,22 +814,23 @@ def run_stream_mt(
         if frame_id % 10 == 0:
             logger.info(f"Frame {frame_id} processed | FPS: {avg_fps:.1f} | Latency: {latency:.3f} s")
             
-    flush_stream_chunk(force=True)
-    if stream_npz_dir is not None:
-        done_flag = os.path.join(stream_npz_dir, 'stream_done.flag')
-        with open(done_flag, 'w') as f:
-            # Write total chunk count so the consumer can wait for full consumption.
-            f.write(str(int(stream_chunk_index)))
+    if tail_writer is not None:
+        tail_writer.close(frame_count=len(frame_param_map))
 
     if record_whamvideo and is_webcam:
         ensure_webcam_writer(force=True)
     if writer is not None:
         writer.close()
 
+    request_stop()
+    join_timeout = max(1.0, float(os.environ.get('WHAM_THREAD_JOIN_TIMEOUT', '3.0')))
     for t, name in ((t1, 'reader'), (t2, 'detector'), (t3, 'extractor'), (t4, 'wham')):
-        t.join(timeout=1.0)
+        t.join(timeout=join_timeout)
         if t.is_alive():
-            logger.warning(f"{name} thread did not exit in time; continue shutdown.")
+            if terminal_stop_event.is_set():
+                logger.info(f"{name} thread still running during fast-stop; continue shutdown.")
+            else:
+                logger.warning(f"{name} thread did not exit in time; continue shutdown.")
     if terminal_listener is not None and terminal_listener.is_alive():
         stop_event.set()
         terminal_listener.join(timeout=0.5)
@@ -738,7 +849,7 @@ def run_stream_mt(
         if first_valid is None:
             logger.warning("No valid WHAM parameters were collected. Skip GMR SMPL-X npz save.")
             cap.release()
-            if is_webcam and record_whamvideo:
+            if preview_window_enabled:
                 cv2.destroyAllWindows()
             logger.info("Stream processing finished.")
             return
@@ -793,7 +904,7 @@ def run_stream_mt(
         logger.info(f"Saved GMR SMPL-X npz to {gmr_smplx_npz} (frames={n_frames}, fps={output_fps:.2f})")
 
     cap.release()
-    if is_webcam and record_whamvideo:
+    if preview_window_enabled:
         cv2.destroyAllWindows()
     logger.info("Stream processing finished.")
 
@@ -808,9 +919,7 @@ if __name__ == '__main__':
     parser.add_argument('--rotate', type=int, default=None, choices=[0, 90, 180, 270],
                         help='Optional manual clockwise rotation for input frames.')
     parser.add_argument('--stream_npz_dir', type=str, default=None,
-                        help='Optional directory to write incremental SMPL-X npz chunks for streaming.')
-    parser.add_argument('--stream_chunk_size', type=int, default=16,
-                        help='Number of frames per stream chunk npz.')
+                        help='Optional directory to write append-only SMPL-X tail stream (stream_tail.pkl).')
     parser.add_argument('--time', type=float, default=0.0,
                         help='When --video=0 (webcam): >0 auto-stop after this many seconds; 0 waits for terminal q/ESC.')
     args = parser.parse_args()
@@ -827,6 +936,5 @@ if __name__ == '__main__':
         rotate_deg=args.rotate,
         record_whamvideo=record_whamvideo,
         stream_npz_dir=args.stream_npz_dir,
-        stream_chunk_size=max(1, int(args.stream_chunk_size)),
         capture_time=max(0.0, float(args.time)),
     )

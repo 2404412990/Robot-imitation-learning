@@ -12,8 +12,8 @@ from .checkpoint import save_checkpoint
 
 try:
     import apex
-except:
-    print('apex is not installed')
+except Exception:
+    apex = None
 
 
 @RUNNERS.register_module()
@@ -97,7 +97,10 @@ class IterBasedRunnerAmp(IterBasedRunner):
                     f'but got {type(self.optimizer)}')
 
         if 'amp' in checkpoint:
-            apex.amp.load_state_dict(checkpoint['amp'])
-            self.logger.info('load amp state dict')
+            if apex is not None:
+                apex.amp.load_state_dict(checkpoint['amp'])
+                self.logger.info('load amp state dict')
+            else:
+                self.logger.warning('Checkpoint contains amp state but apex is not installed; skip amp restore.')
 
         self.logger.info(f'resumed from epoch: {self.epoch}, iter {self.iter}')

@@ -1,4 +1,5 @@
-FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
+ARG CUDA_BASE_IMAGE=nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
+FROM ${CUDA_BASE_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive \
     TZ=Etc/UTC \
@@ -55,17 +56,26 @@ COPY . /opt/src/wham
 
 # WHAM runtime environment
 RUN conda run -n wham pip install --upgrade "pip<26" "setuptools<81" "wheel<0.46" && \
-        conda run -n wham pip install --index-url https://download.pytorch.org/whl/cu118 \
+    conda run -n wham pip install --index-url https://download.pytorch.org/whl/cu118 \
       torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 && \
-        conda run -n wham pip install --no-build-isolation -r requirements.txt && \
-        conda run -n wham pip install json_tricks && \
+        conda run -n wham conda install -y -c conda-forge iopath && \
+        wget -q -O /tmp/pytorch3d-0.7.8-py39_cu118_pyt211.tar.bz2 \
+            https://conda.anaconda.org/pytorch3d/linux-64/pytorch3d-0.7.8-py39_cu118_pyt211.tar.bz2 && \
+        conda run -n wham conda install -y --no-deps /tmp/pytorch3d-0.7.8-py39_cu118_pyt211.tar.bz2 && \
+        rm -f /tmp/pytorch3d-0.7.8-py39_cu118_pyt211.tar.bz2 && \
+        conda run -n wham python -c "import pytorch3d" && \
+    conda run -n wham pip install --no-build-isolation -r requirements.txt && \
+    conda run -n wham pip install --no-build-isolation "chumpy==0.70" && \
+    conda run -n wham pip install json_tricks && \
     conda run -n wham pip install --no-deps --no-build-isolation -v third-party/ViTPose
 
 # GMR runtime environment
 RUN conda run -n gmr pip install --upgrade "pip<26" "setuptools<81" "wheel<0.46" && \
     conda run -n gmr pip install --index-url https://download.pytorch.org/whl/cu118 \
       torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 && \
-    conda run -n gmr pip install -e .
+    conda run -n gmr pip install "numpy<2" && \
+    conda run -n gmr pip install -e . && \
+    conda run -n gmr pip install "numpy<2"
 
 # Optional: if you need full WHAM demo.py SLAM dependencies, compile DPVO manually.
 # Example:
