@@ -21,12 +21,14 @@ bash run.sh
 
 ```bash
 OUTPUT_ROOT=output/faster_run \
-RECORD_WHAMVIDEO=0 \
-RECORD_GMRVIDEO=0 \
+RECORD_WHAMVIDEO=1 \
+RECORD_GMRVIDEO=1 \
 VIDEO=examples/IMG_9732.mov \
 WHAM_DETECT_INTERVAL=2 \
 WHAM_INFER_INTERVAL=2 \
 WHAM_STREAM_SEQ_LEN=12 \
+WHAM_INPUT_SCALE=0.5 \
+GMR_TORCH_DEVICE=cuda \
 bash run.sh
 ```
 
@@ -71,8 +73,6 @@ bash run.sh
 - `WHAM_INPUT_SCALE`：默认 `1.0`。输入缩放比例（`0.1~1.0`），越小越快。
 
 - `GMR_TORCH_DEVICE`：默认 `cpu`。控制 GMR 后处理/FK 的 torch 设备（`cpu`/`cuda`/`auto`）。
-
-- GMR 窗口渲染默认启用异步线程与低延迟策略（固定：`async=1`、`rate_limit=0`、启动缓冲 `0.2s`、最大缓冲 `0.6s`），无需额外配置这些参数。
 
 ## docker配置
 
