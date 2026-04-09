@@ -82,6 +82,12 @@ GMR_TORCH_DEVICE=${GMR_TORCH_DEVICE:-cpu}
 GMR_VIEWER_READY_TIMEOUT_SEC=${GMR_VIEWER_READY_TIMEOUT_SEC:-8}
 GMR_VIEWER_THREAD_JOIN_TIMEOUT_SEC=${GMR_VIEWER_THREAD_JOIN_TIMEOUT_SEC:-10}
 
+# One-time warmup to reduce first-run CUDA/PyTorch cold-start stalls.
+E2E_WARMUP=${E2E_WARMUP:-1}
+E2E_WARMUP_FORCE=${E2E_WARMUP_FORCE:-0}
+E2E_WARMUP_ONCE=${E2E_WARMUP_ONCE:-1}
+E2E_WARMUP_CACHE_ROOT=${E2E_WARMUP_CACHE_ROOT:-${PWD}/.cache/wham-gmr}
+
 # GMR viewer camera controls.
 CAMERA_FOLLOW=${CAMERA_FOLLOW:-0}
 # Default to a lower, slightly top-down and closer camera framing.
@@ -172,11 +178,77 @@ echo "[E2E] WHAM perf params: amp=${WHAM_USE_AMP} detect_interval=${WHAM_DETECT_
 echo "[E2E] WHAM stream mode=tail (fixed)"
 echo "[E2E] GMR torch_device=${GMR_TORCH_DEVICE}"
 echo "[E2E] GMR viewer mode: async thread + low-latency fixed profile (ready_timeout=${GMR_VIEWER_READY_TIMEOUT_SEC}s, join_timeout=${GMR_VIEWER_THREAD_JOIN_TIMEOUT_SEC}s)"
+echo "[E2E] Warmup: enabled=${E2E_WARMUP} once=${E2E_WARMUP_ONCE} force=${E2E_WARMUP_FORCE}"
 if [[ "${RECORD_GMRVIDEO}" == "1" && "${USE_XVFB_GMR}" == "1" ]]; then
 	echo "[E2E] GMR is running with xvfb; MuJoCo window will not appear on physical screen."
 elif [[ "${RECORD_GMRVIDEO}" == "1" && -z "${DISPLAY:-}" ]]; then
 	echo "[E2E] Warning: DISPLAY is empty; MuJoCo window may not appear."
 fi
+
+run_env_warmup() {
+	local name="$1"
+	local py_bin="$2"
+	if [[ ! -x "${py_bin}" ]]; then
+		echo "[E2E] Warmup warning: ${name} python not executable: ${py_bin}"
+		return 0
+	fi
+
+	if ! "${py_bin}" - <<'PY'
+import time
+
+try:
+    import numpy as np
+    import torch
+
+    t0 = time.time()
+    if torch.cuda.is_available():
+        dev = torch.device("cuda:0")
+        x = torch.randn(512, 512, device=dev)
+        y = torch.randn(512, 512, device=dev)
+        _ = x @ y
+        w = torch.randn(1, 3, 128, 128, device=dev)
+        k = torch.randn(16, 3, 3, 3, device=dev)
+        _ = torch.nn.functional.conv2d(w, k, padding=1)
+        torch.cuda.synchronize()
+    else:
+        x = np.random.randn(256, 256).astype(np.float32)
+        _ = x @ x.T
+
+    dt = time.time() - t0
+    print(f"[E2E] Warmup python ok in {dt:.3f}s")
+except Exception as e:
+    print(f"[E2E] Warmup warning: {e}")
+PY
+	then
+		echo "[E2E] Warmup warning: ${name} warmup command failed (ignored)."
+	fi
+}
+
+run_e2e_warmup_if_needed() {
+	if [[ "${E2E_WARMUP}" != "1" ]]; then
+		return 0
+	fi
+
+	local warmup_cache_root="${E2E_WARMUP_CACHE_ROOT}"
+	local warmup_marker="${warmup_cache_root}/warmup_${WHAM_ENV}_${GMR_ENV}.done"
+
+	if [[ "${E2E_WARMUP_ONCE}" == "1" && "${E2E_WARMUP_FORCE}" != "1" && -f "${warmup_marker}" ]]; then
+		echo "[E2E] Warmup already done before, skip (${warmup_marker})."
+		return 0
+	fi
+
+	echo "[E2E] Running warmup for ${WHAM_ENV}/${GMR_ENV} ..."
+	run_env_warmup "WHAM" "${WHAM_PYTHON}"
+	run_env_warmup "GMR" "${GMR_PYTHON}"
+
+	if [[ "${E2E_WARMUP_ONCE}" == "1" ]]; then
+		mkdir -p "${warmup_cache_root}"
+		date +%s > "${warmup_marker}" || true
+		echo "[E2E] Warmup marker written: ${warmup_marker}"
+	fi
+}
+
+run_e2e_warmup_if_needed
 
 echo "[E2E] Starting GMR consumer (${GMR_ENV}) with ${GMR_PYTHON} ..."
 if [[ "${RECORD_GMRVIDEO}" == "1" && "${USE_XVFB_GMR}" == "1" ]]; then

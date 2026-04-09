@@ -2,7 +2,7 @@
 
 根据 [GMR](docs/gmr.md) 和 [WHAM](docs/wham.md) 配好环境，创建 `gmr` 和 `wham` 两个 conda 虚拟环境。
 
-`checkpoints`和`dataset`可在[链接](https://pan.baidu.com/s/1fVf2eA1OzdRv70M4gm2wSA?pwd=8pnu) 下载
+`checkpoints`,`dataset`和`assets/body_models`可在[链接](https://pan.baidu.com/s/1fVf2eA1OzdRv70M4gm2wSA?pwd=8pnu) 下载
 
 ## 运行
 
@@ -31,6 +31,10 @@ WHAM_INPUT_SCALE=0.5 \
 GMR_TORCH_DEVICE=cuda \
 bash run.sh
 ```
+
+第一次运行可能会出现加载慢，报错，效果不理想等问题
+
+默认已开启一次性热启动（`E2E_WARMUP=1`）：首次运行会先做轻量 CUDA/PyTorch 预热，后续会自动跳过。
 
 ## 参数解释
 
@@ -73,6 +77,14 @@ bash run.sh
 - `WHAM_INPUT_SCALE`：默认 `1.0`。输入缩放比例（`0.1~1.0`），越小越快。
 
 - `GMR_TORCH_DEVICE`：默认 `cpu`。控制 GMR 后处理/FK 的 torch 设备（`cpu`/`cuda`/`auto`）。
+
+- `E2E_WARMUP`：默认 `1`。是否在流程启动前执行热启动预热（建议保留开启）。
+
+- `E2E_WARMUP_ONCE`：默认 `1`。仅首次预热一次，写入 `E2E_WARMUP_CACHE_ROOT` 标记，后续自动跳过。
+
+- `E2E_WARMUP_FORCE`：默认 `0`。设为 `1` 可强制本次重新预热（即使已有标记）。
+
+- `E2E_WARMUP_CACHE_ROOT`：默认 `${PWD}/.cache/wham-gmr`。预热标记目录（建议保持默认，便于 docker `--rm` 场景复用标记）。
 
 ## docker配置
 
@@ -149,7 +161,6 @@ xhost -local:docker
 docker compose -f docker/compose.yml run --rm \
   -e USE_XVFB_GMR=1 \
   -e VIDEO=0 \
-  -e TIME=10 \
   -e RECORD_GMRVIDEO=1 \
   -e RECORD_WHAMVIDEO=1 \
   -e OUTPUT_ROOT=output/my_run \
