@@ -86,6 +86,8 @@ def run_stream_mt(
     webcam_start_ts = None
     preview_window_name = 'WHAM Stream'
     preview_window_enabled = bool(record_whamvideo)
+    preview_max_w = max(320, int(os.environ.get('WHAM_PREVIEW_MAX_WIDTH', '960')))
+    preview_max_h = max(240, int(os.environ.get('WHAM_PREVIEW_MAX_HEIGHT', '540')))
     logger.info(
         f"Perf opts: amp={int(use_amp)} detect_interval={detect_interval} "
         f"infer_interval={infer_interval} seq_len={stream_seq_len} device={device} "
@@ -161,20 +163,7 @@ def run_stream_mt(
     logger.info(f"Effective input size: {width}x{height} (scale={input_scale:.3f})")
 
     if preview_window_enabled:
-        try:
-            preview_max_w = max(320, int(os.environ.get('WHAM_PREVIEW_MAX_WIDTH', '960')))
-            preview_max_h = max(240, int(os.environ.get('WHAM_PREVIEW_MAX_HEIGHT', '540')))
-            init_w, init_h = init_preview_window(
-                preview_window_name,
-                width,
-                height,
-                preview_max_w,
-                preview_max_h,
-            )
-            logger.info(f"WHAM preview window initialized at {init_w}x{init_h}.")
-        except Exception as e:
-            logger.warning(f"Failed to initialize preview window ({e}); preview disabled.")
-            preview_window_enabled = False
+        logger.info("WHAM preview window will be initialized in render thread.")
     
     from lib.utils.imutils import compute_cam_intrinsics
     res = torch.tensor([width, height]).float()
@@ -184,10 +173,7 @@ def run_stream_mt(
     import lib.utils.transforms as pt_transforms
 
     renderer = None
-    writer = None
     wham_video_path = os.path.join(output_dir, 'output.mp4')
-    writer_buffer = []
-    writer_buffer_ts = []
     if record_whamvideo:
         if Renderer is None:
             logger.warning(f"pytorch3d renderer unavailable ({RENDERER_IMPORT_ERROR}); continue without mesh overlay.")
@@ -198,15 +184,7 @@ def run_stream_mt(
             except Exception as e:
                 logger.warning(f"Failed to initialize renderer ({e}); continue without mesh overlay.")
                 renderer = None
-        if not is_webcam:
-            writer = imageio.get_writer(
-                wham_video_path,
-                fps=float(fps),
-                mode='I',
-                format='FFMPEG',
-                macro_block_size=1,
-            )
-        else:
+        if is_webcam:
             logger.info("Webcam WHAM writer will use measured runtime FPS for output video.")
 
     tail_writer = None
@@ -220,32 +198,9 @@ def run_stream_mt(
     det_Q = Queue(maxsize=10)
     ext_Q = Queue(maxsize=10)
     wham_Q = Queue(maxsize=10)
-
-    def ensure_webcam_writer(force=False):
-        nonlocal writer, writer_buffer, writer_buffer_ts
-        if (not record_whamvideo) or (not is_webcam):
-            return
-        if writer is not None:
-            return
-        if len(writer_buffer) == 0:
-            return
-        # Wait for enough samples to estimate stable FPS unless we are forcing a flush.
-        if (not force) and len(writer_buffer) < 15:
-            return
-
-        est_fps = estimate_fps_from_timestamps(writer_buffer_ts, fallback_fps=max(1.0, float(fps)))
-        writer = imageio.get_writer(
-            wham_video_path,
-            fps=float(est_fps),
-            mode='I',
-            format='FFMPEG',
-            macro_block_size=1,
-        )
-        for f in writer_buffer:
-            writer.append_data(f)
-        logger.info(f"Initialized webcam WHAM writer at {est_fps:.2f} FPS.")
-        writer_buffer = []
-        writer_buffer_ts = []
+    render_Q = Queue(maxsize=max(8, int(os.environ.get('WHAM_RENDER_QUEUE_SIZE', '120'))))
+    render_thread = None
+    render_drop_count = 0
 
     def extract_latest_vertices(pred):
         verts = pred['verts_cam']
@@ -347,7 +302,7 @@ def run_stream_mt(
             pass
         # Wake up any thread blocked on queue.get(). If a queue is full,
         # drop one item to make room for the sentinel so stop can propagate.
-        for q in (read_Q, det_Q, ext_Q, wham_Q):
+        for q in (read_Q, det_Q, ext_Q, wham_Q, render_Q):
             injected = False
             for _ in range(3):
                 try:
@@ -404,6 +359,115 @@ def run_stream_mt(
                 termios.tcsetattr(fd, termios.TCSADRAIN, old_attr)
             except Exception:
                 pass
+
+    def render_thread_worker():
+        nonlocal render_drop_count
+        writer_local = None
+        writer_buffer = []
+        writer_buffer_ts = []
+        local_preview_enabled = bool(preview_window_enabled)
+
+        if local_preview_enabled:
+            try:
+                cv2.startWindowThread()
+            except Exception:
+                pass
+            try:
+                init_w, init_h = init_preview_window(
+                    preview_window_name,
+                    width,
+                    height,
+                    preview_max_w,
+                    preview_max_h,
+                )
+                logger.info(f"WHAM preview window initialized at {init_w}x{init_h}.")
+            except Exception as e:
+                logger.warning(f"Failed to initialize preview window ({e}); preview disabled.")
+                local_preview_enabled = False
+
+        def ensure_webcam_writer_local(force=False):
+            nonlocal writer_local, writer_buffer, writer_buffer_ts
+            if (not record_whamvideo) or (not is_webcam):
+                return
+            if writer_local is not None:
+                return
+            if len(writer_buffer) == 0:
+                return
+            if (not force) and len(writer_buffer) < 15:
+                return
+
+            est_fps = estimate_fps_from_timestamps(writer_buffer_ts, fallback_fps=max(1.0, float(fps)))
+            writer_local = imageio.get_writer(
+                wham_video_path,
+                fps=float(est_fps),
+                mode='I',
+                format='FFMPEG',
+                macro_block_size=1,
+            )
+            for f in writer_buffer:
+                writer_local.append_data(f)
+            logger.info(f"Initialized webcam WHAM writer at {est_fps:.2f} FPS.")
+            writer_buffer = []
+            writer_buffer_ts = []
+
+        if record_whamvideo and (not is_webcam):
+            writer_local = imageio.get_writer(
+                wham_video_path,
+                fps=float(fps),
+                mode='I',
+                format='FFMPEG',
+                macro_block_size=1,
+            )
+
+        while not stop_event.is_set():
+            try:
+                data = render_Q.get(timeout=0.1)
+            except Empty:
+                continue
+            if data is None:
+                break
+
+            frame, frame_ts = data
+            frame = sanitize_preview_frame(frame)
+            frame_rgb_out = np.ascontiguousarray(frame[..., ::-1])
+
+            if is_webcam:
+                if writer_local is None:
+                    writer_buffer.append(frame_rgb_out.copy())
+                    writer_buffer_ts.append(float(frame_ts))
+                    ensure_webcam_writer_local(force=False)
+                else:
+                    writer_local.append_data(frame_rgb_out)
+            elif writer_local is not None:
+                writer_local.append_data(frame_rgb_out)
+
+            if local_preview_enabled:
+                try:
+                    cv2.imshow(preview_window_name, frame)
+                    key = cv2.waitKey(1) & 0xFF
+                except Exception as e:
+                    logger.warning(f"OpenCV preview failed: {e}")
+                    key = -1
+
+                if key == 27 or key == ord('q'):
+                    logger.info("User requested exit from preview window.")
+                    terminal_stop_event.set()
+                    request_stop()
+                    break
+
+        if record_whamvideo and is_webcam:
+            ensure_webcam_writer_local(force=True)
+        if writer_local is not None:
+            writer_local.close()
+
+        if local_preview_enabled:
+            try:
+                cv2.destroyWindow(preview_window_name)
+            except Exception:
+                try:
+                    cv2.destroyAllWindows()
+                except Exception:
+                    pass
     
     def reader_thread():
         frame_id = 0
@@ -720,6 +784,9 @@ def run_stream_mt(
     t4.start()
     if terminal_listener is not None:
         terminal_listener.start()
+    if record_whamvideo:
+        render_thread = threading.Thread(target=render_thread_worker, daemon=True, name='wham-render')
+        render_thread.start()
     
 
     
@@ -789,38 +856,26 @@ def run_stream_mt(
                 cv2.putText(frame, f"Frame {frame_id} | FPS: {avg_fps:.1f} | Latency: {latency:.2f}s", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
             else:
                 cv2.putText(frame, f"Frame {frame_id} | FPS: {avg_fps:.1f} | Latency: {latency:.2f}s", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
-
-            frame = sanitize_preview_frame(frame)
-            frame_rgb_out = np.ascontiguousarray(frame[..., ::-1])
-            if is_webcam:
-                if writer is None:
-                    writer_buffer.append(frame_rgb_out.copy())
-                    writer_buffer_ts.append(float(curr_time))
-                    ensure_webcam_writer(force=False)
-                else:
-                    writer.append_data(frame_rgb_out)
-            elif writer is not None:
-                writer.append_data(frame_rgb_out)
-
-            if preview_window_enabled:
-                cv2.imshow(preview_window_name, frame)
-                key = cv2.waitKey(1) & 0xFF
-                if key == 27 or key == ord('q'):
-                    logger.info("User requested exit from preview window.")
-                    terminal_stop_event.set()
-                    request_stop()
-                    break
+            frame_out = sanitize_preview_frame(frame)
+            packet = (frame_out.copy(), float(curr_time))
+            try:
+                render_Q.put(packet, timeout=0.01)
+            except Full:
+                try:
+                    _ = render_Q.get_nowait()
+                    render_drop_count += 1
+                except Empty:
+                    pass
+                try:
+                    render_Q.put_nowait(packet)
+                except Full:
+                    render_drop_count += 1
 
         if frame_id % 10 == 0:
             logger.info(f"Frame {frame_id} processed | FPS: {avg_fps:.1f} | Latency: {latency:.3f} s")
             
     if tail_writer is not None:
         tail_writer.close(frame_count=len(frame_param_map))
-
-    if record_whamvideo and is_webcam:
-        ensure_webcam_writer(force=True)
-    if writer is not None:
-        writer.close()
 
     request_stop()
     join_timeout = max(1.0, float(os.environ.get('WHAM_THREAD_JOIN_TIMEOUT', '3.0')))
@@ -834,6 +889,13 @@ def run_stream_mt(
     if terminal_listener is not None and terminal_listener.is_alive():
         stop_event.set()
         terminal_listener.join(timeout=0.5)
+
+    if render_thread is not None:
+        render_thread.join(timeout=join_timeout)
+        if render_thread.is_alive():
+            logger.warning("render thread did not exit in time; continue shutdown.")
+        if render_drop_count > 0:
+            logger.info(f"Render queue dropped {render_drop_count} frame(s) to keep low latency.")
 
     if len(frame_param_map) == 0 or max_frame_id < 0:
         logger.warning("No valid WHAM predictions were collected. Skip GMR SMPL-X npz save.")
@@ -849,8 +911,6 @@ def run_stream_mt(
         if first_valid is None:
             logger.warning("No valid WHAM parameters were collected. Skip GMR SMPL-X npz save.")
             cap.release()
-            if preview_window_enabled:
-                cv2.destroyAllWindows()
             logger.info("Stream processing finished.")
             return
 
@@ -904,8 +964,6 @@ def run_stream_mt(
         logger.info(f"Saved GMR SMPL-X npz to {gmr_smplx_npz} (frames={n_frames}, fps={output_fps:.2f})")
 
     cap.release()
-    if preview_window_enabled:
-        cv2.destroyAllWindows()
     logger.info("Stream processing finished.")
 
 if __name__ == '__main__':

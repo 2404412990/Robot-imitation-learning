@@ -5,6 +5,7 @@ import os
 import pickle
 import pathlib
 import sys
+import threading
 import time
 import warnings
 from collections import deque
@@ -247,22 +248,22 @@ if __name__ == "__main__":
         help="Optional file path to touch when consumer startup is ready.",
     )
     parser.add_argument(
-        "--viewer_startup_buffer_sec",
-        type=float,
-        default=0.8,
-        help="Pre-buffer this many seconds before starting viewer playback.",
-    )
-    parser.add_argument(
-        "--viewer_max_buffer_sec",
-        type=float,
-        default=1.5,
-        help="Max buffered seconds for viewer; older frames are dropped when exceeded.",
-    )
-    parser.add_argument(
         "--viewer_drop_old_frames",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Drop oldest buffered viewer frames when lagging to keep playback responsive.",
+    )
+    parser.add_argument(
+        "--viewer_ready_timeout_sec",
+        type=float,
+        default=8.0,
+        help="Max wait time for async viewer initialization before continuing.",
+    )
+    parser.add_argument(
+        "--viewer_thread_join_timeout_sec",
+        type=float,
+        default=10.0,
+        help="Timeout when waiting async viewer thread to flush queue and exit.",
     )
     parser.add_argument(
         "--done_grace_sec",
@@ -288,6 +289,10 @@ if __name__ == "__main__":
 
     record_gmrvideo = bool(args.record_gmrvideo or args.record_video)
     robot_path = args.robot_path if args.robot_path is not None and str(args.robot_path).strip() != "" else None
+    viewer_async = True
+    viewer_rate_limit = False
+    viewer_startup_buffer_sec = 0.2
+    viewer_max_buffer_sec = 0.6
 
     gmr_init_params = set(inspect.signature(GMR.__init__).parameters.keys())
     viewer_init_params = set(inspect.signature(RobotMotionViewer.__init__).parameters.keys())
@@ -330,6 +335,12 @@ if __name__ == "__main__":
     viewer_queue = deque()
     viewer_started = [False]
     viewer_drop_count = [0]
+    viewer_queue_lock = threading.Lock()
+    viewer_stop_event = threading.Event()
+    viewer_ready_event = threading.Event()
+    viewer_thread = [None]
+    viewer_failed = [False]
+    viewer_error = [None]
 
     def _align_tail_betas(raw_betas, body_model):
         betas = np.asarray(raw_betas, dtype=np.float32).reshape(-1)
@@ -405,15 +416,7 @@ if __name__ == "__main__":
 
         return result, betas
 
-    def init_viewer_if_needed(motion_fps):
-        if not record_gmrvideo:
-            return
-        if state["viewer"] is not None:
-            return
-        if viewer_init_attempted[0]:
-            return
-
-        viewer_init_attempted[0] = True
+    def _build_viewer_kwargs(motion_fps):
         viewer_kwargs = dict(
             robot_type=args.robot,
             motion_fps=float(max(1.0, motion_fps)),
@@ -433,10 +436,26 @@ if __name__ == "__main__":
             viewer_kwargs["camera_distance_scale"] = args.camera_distance_scale
         if "camera_azimuth" in viewer_init_params:
             viewer_kwargs["camera_azimuth"] = args.camera_azimuth
+        return viewer_kwargs
+
+    def _viewer_target_fps():
+        return float(max(1.0, aligned_fps_holder[0]))
+
+    def _viewer_required_frames():
+        return max(0, int(round(max(0.0, viewer_startup_buffer_sec) * _viewer_target_fps())))
+
+    def _viewer_worker_loop(initial_motion_fps):
+        viewer = None
         try:
-            state["viewer"] = RobotMotionViewer(**viewer_kwargs)
-            print(f"[Stream] MuJoCo viewer enabled (DISPLAY={os.environ.get('DISPLAY', '<unset>')})")
+            viewer = RobotMotionViewer(**_build_viewer_kwargs(initial_motion_fps))
+            state["viewer"] = viewer
+            print(
+                "[Stream] MuJoCo viewer enabled in async thread "
+                f"(DISPLAY={os.environ.get('DISPLAY', '<unset>')}, rate_limit={int(bool(viewer_rate_limit))})"
+            )
         except Exception as e:
+            viewer_failed[0] = True
+            viewer_error[0] = str(e)
             state["viewer"] = None
             print(
                 "[Stream] Warning: failed to initialize MuJoCo viewer "
@@ -445,6 +464,112 @@ if __name__ == "__main__":
                 "If you expect a window: ensure DISPLAY is valid, run `xhost +local:docker` for Docker, "
                 "and avoid USE_XVFB_GMR=1."
             )
+            viewer_ready_event.set()
+            return
+
+        viewer_ready_event.set()
+
+        try:
+            while True:
+                qpos = None
+                with viewer_queue_lock:
+                    qlen = len(viewer_queue)
+                    required = _viewer_required_frames()
+                    if not viewer_started[0] and (qlen >= required or (viewer_stop_event.is_set() and qlen > 0)):
+                        viewer_started[0] = True
+                        print(
+                            f"[Stream] Viewer playback starts (buffer={qlen}, required={required}, "
+                            f"drop_old={int(bool(args.viewer_drop_old_frames))}, async=1)"
+                        )
+                    if viewer_started[0] and qlen > 0:
+                        qpos = viewer_queue.popleft()
+
+                if qpos is None:
+                    if viewer_stop_event.is_set():
+                        with viewer_queue_lock:
+                            if len(viewer_queue) == 0:
+                                break
+                    time.sleep(0.001)
+                    continue
+
+                viewer.step(
+                    root_pos=qpos[:3],
+                    root_rot=qpos[3:7],
+                    dof_pos=qpos[7:],
+                    human_motion_data=None,
+                    human_pos_offset=np.array([0.0, 0.0, 0.0]),
+                    show_human_body_name=False,
+                    rate_limit=bool(viewer_rate_limit),
+                    follow_camera=args.camera_follow,
+                )
+        except Exception as e:
+            viewer_failed[0] = True
+            viewer_error[0] = str(e)
+            print(f"[Stream] Warning: async viewer loop stopped due to error: {e}")
+        finally:
+            try:
+                viewer.close()
+            except Exception as e:
+                print(f"[Stream] Warning: closing viewer failed: {e}")
+            state["viewer"] = None
+
+    def init_viewer_if_needed(motion_fps):
+        if not record_gmrvideo:
+            return
+        if state["viewer"] is not None:
+            return
+        if viewer_thread[0] is not None and viewer_thread[0].is_alive():
+            return
+        if viewer_init_attempted[0]:
+            return
+
+        viewer_init_attempted[0] = True
+        viewer_failed[0] = False
+        viewer_error[0] = None
+        viewer_started[0] = False
+        viewer_ready_event.clear()
+        viewer_stop_event.clear()
+
+        initial_motion_fps = float(max(1.0, motion_fps))
+        if viewer_async:
+            t = threading.Thread(
+                target=_viewer_worker_loop,
+                args=(initial_motion_fps,),
+                daemon=True,
+                name="gmr-viewer-thread",
+            )
+            viewer_thread[0] = t
+            t.start()
+
+            ready_timeout = max(1.0, float(args.viewer_ready_timeout_sec))
+            if not viewer_ready_event.wait(timeout=ready_timeout):
+                viewer_failed[0] = True
+                viewer_error[0] = f"viewer init timeout ({ready_timeout:.1f}s)"
+                print(
+                    "[Stream] Warning: async MuJoCo viewer init timeout; "
+                    "continue pipeline without waiting for on-screen viewer."
+                )
+            return
+
+        try:
+            state["viewer"] = RobotMotionViewer(**_build_viewer_kwargs(initial_motion_fps))
+            print(
+                "[Stream] MuJoCo viewer enabled in main thread "
+                f"(DISPLAY={os.environ.get('DISPLAY', '<unset>')}, rate_limit={int(bool(viewer_rate_limit))})"
+            )
+        except Exception as e:
+            state["viewer"] = None
+            viewer_failed[0] = True
+            viewer_error[0] = str(e)
+            print(
+                "[Stream] Warning: failed to initialize MuJoCo viewer "
+                f"(DISPLAY={os.environ.get('DISPLAY', '<unset>')}): {e}. "
+                "Continue without on-screen window. "
+                "If you expect a window: ensure DISPLAY is valid, run `xhost +local:docker` for Docker, "
+                "and avoid USE_XVFB_GMR=1."
+            )
+        finally:
+            viewer_ready_event.set()
 
     def init_retarget_if_needed(actual_human_height=None):
         if state["retarget"] is not None:
@@ -469,60 +594,23 @@ if __name__ == "__main__":
 
         init_viewer_if_needed(aligned_fps_holder[0])
 
-    def _viewer_target_fps():
-        return float(max(1.0, aligned_fps_holder[0]))
-
-    def _viewer_required_frames():
-        return max(0, int(round(max(0.0, args.viewer_startup_buffer_sec) * _viewer_target_fps())))
-
-    def _ensure_viewer_started(force=False):
-        if state["viewer"] is None:
-            return False
-        if viewer_started[0]:
-            return True
-
-        qlen = len(viewer_queue)
-        required = _viewer_required_frames()
-        if qlen >= required or (force and qlen > 0):
-            viewer_started[0] = True
-            print(
-                f"[Stream] Viewer playback starts (buffer={qlen}, required={required}, "
-                f"drop_old={int(bool(args.viewer_drop_old_frames))})"
-            )
-        return viewer_started[0]
-
-    def play_one_viewer_frame(force_start=False):
-        if state["viewer"] is None:
-            return False
-        if not _ensure_viewer_started(force=force_start):
-            return False
-        if len(viewer_queue) == 0:
-            return False
-
-        qpos = viewer_queue.popleft()
-        state["viewer"].step(
-            root_pos=qpos[:3],
-            root_rot=qpos[3:7],
-            dof_pos=qpos[7:],
-            human_motion_data=state["retarget"].scaled_human_data,
-            human_pos_offset=np.array([0.0, 0.0, 0.0]),
-            show_human_body_name=False,
-            rate_limit=True,
-            follow_camera=args.camera_follow,
-        )
-        return True
-
     def enqueue_viewer_qpos(qpos):
-        if state["viewer"] is None:
+        if not record_gmrvideo:
             return
-        viewer_queue.append(np.asarray(qpos, dtype=np.float32).copy())
-        if args.viewer_drop_old_frames:
-            max_frames = max(1, int(round(max(0.1, args.viewer_max_buffer_sec) * _viewer_target_fps())))
-            overflow = len(viewer_queue) - max_frames
-            if overflow > 0:
-                for _ in range(overflow):
-                    viewer_queue.popleft()
-                viewer_drop_count[0] += int(overflow)
+        if viewer_failed[0]:
+            return
+        if state["viewer"] is None and (viewer_thread[0] is None or not viewer_thread[0].is_alive()):
+            return
+        qpos_copy = np.asarray(qpos, dtype=np.float32).copy()
+        with viewer_queue_lock:
+            viewer_queue.append(qpos_copy)
+            if args.viewer_drop_old_frames:
+                max_frames = max(1, int(round(max(0.1, viewer_max_buffer_sec) * _viewer_target_fps())))
+                overflow = len(viewer_queue) - max_frames
+                if overflow > 0:
+                    for _ in range(overflow):
+                        viewer_queue.popleft()
+                    viewer_drop_count[0] += int(overflow)
 
     def process_chunk(chunk_path):
         smplx_data, body_model, smplx_output, actual_human_height = load_smplx_file(
@@ -545,9 +633,8 @@ if __name__ == "__main__":
             row = np.concatenate([qpos[:3], qpos[3:7][[1, 2, 3, 0]], qpos[7:]], axis=0)
             csv_writer.writerow(row.tolist())
 
-            if state["viewer"] is not None and (len(qpos_history) - 1) >= max(0, int(args.viewer_warmup_frames)):
+            if record_gmrvideo and (len(qpos_history) - 1) >= max(0, int(args.viewer_warmup_frames)):
                 enqueue_viewer_qpos(qpos)
-                play_one_viewer_frame(force_start=False)
 
         csv_file.flush()
 
@@ -572,9 +659,8 @@ if __name__ == "__main__":
         row = np.concatenate([qpos[:3], qpos[3:7][[1, 2, 3, 0]], qpos[7:]], axis=0)
         csv_writer.writerow(row.tolist())
 
-        if state["viewer"] is not None and (len(qpos_history) - 1) >= max(0, int(args.viewer_warmup_frames)):
+        if record_gmrvideo and (len(qpos_history) - 1) >= max(0, int(args.viewer_warmup_frames)):
             enqueue_viewer_qpos(qpos)
-            play_one_viewer_frame(force_start=False)
 
         csv_file.flush()
         return frame_id
@@ -761,19 +847,51 @@ if __name__ == "__main__":
     else:
         print(f"[Stream] Summary: processed_tail_frames={len(processed)} qpos_frames={len(qpos_history)}")
 
-    if state["viewer"] is not None:
-        drain_timeout = max(2.0, float(args.viewer_max_buffer_sec) + float(args.done_grace_sec) + 2.0)
-        drain_deadline = time.time() + drain_timeout
-        while len(viewer_queue) > 0 and time.time() < drain_deadline:
-            played = play_one_viewer_frame(force_start=True)
-            if not played:
-                time.sleep(0.001)
-        if len(viewer_queue) > 0:
-            print(
-                "[Stream] Warning: viewer queue did not fully drain before timeout; "
-                f"remaining={len(viewer_queue)}"
-            )
-        print(f"[Stream] Viewer playback stopped. dropped_frames={viewer_drop_count[0]}")
+    if record_gmrvideo:
+        viewer_stop_event.set()
+        if viewer_async and viewer_thread[0] is not None:
+            join_timeout = max(1.0, float(args.viewer_thread_join_timeout_sec))
+            viewer_thread[0].join(timeout=join_timeout)
+            if viewer_thread[0].is_alive():
+                with viewer_queue_lock:
+                    remaining = len(viewer_queue)
+                print(
+                    "[Stream] Warning: async viewer thread did not exit before timeout; "
+                    f"remaining_queue={remaining}"
+                )
+        elif state["viewer"] is not None:
+            while True:
+                qpos = None
+                with viewer_queue_lock:
+                    qlen = len(viewer_queue)
+                    required = _viewer_required_frames()
+                    if not viewer_started[0] and (qlen >= required or qlen > 0):
+                        viewer_started[0] = True
+                    if viewer_started[0] and qlen > 0:
+                        qpos = viewer_queue.popleft()
+                if qpos is None:
+                    break
+                state["viewer"].step(
+                    root_pos=qpos[:3],
+                    root_rot=qpos[3:7],
+                    dof_pos=qpos[7:],
+                    human_motion_data=None,
+                    human_pos_offset=np.array([0.0, 0.0, 0.0]),
+                    show_human_body_name=False,
+                    rate_limit=bool(viewer_rate_limit),
+                    follow_camera=args.camera_follow,
+                )
+            state["viewer"].close()
+            state["viewer"] = None
+
+        with viewer_queue_lock:
+            remaining = len(viewer_queue)
+        print(
+            f"[Stream] Viewer playback stopped. dropped_frames={viewer_drop_count[0]} "
+            f"remaining_queue={remaining} async={int(bool(viewer_async))}"
+        )
+        if viewer_failed[0] and viewer_error[0] is not None:
+            print(f"[Stream] Viewer warning: {viewer_error[0]}")
 
     if len(qpos_history) > 0 and args.save_path:
         write_motion_pkl(
@@ -786,9 +904,6 @@ if __name__ == "__main__":
         print(f"[Stream] Saved motion pkl: {args.save_path}")
     else:
         print("[Stream] No qpos generated; skip pkl save.")
-
-    if state["viewer"] is not None:
-        state["viewer"].close()
 
     if fatal_error is not None:
         print(f"[Stream] Exit with error: {fatal_error}")

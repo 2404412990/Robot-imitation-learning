@@ -72,6 +72,8 @@ bash run.sh
 
 - `GMR_TORCH_DEVICE`：默认 `cpu`。控制 GMR 后处理/FK 的 torch 设备（`cpu`/`cuda`/`auto`）。
 
+- GMR 窗口渲染默认启用异步线程与低延迟策略（固定：`async=1`、`rate_limit=0`、启动缓冲 `0.2s`、最大缓冲 `0.6s`），无需额外配置这些参数。
+
 ## docker配置
 
 下面这套配置已对齐当前仓库的 `run.sh`（WHAM + GMR 流式链路）。
