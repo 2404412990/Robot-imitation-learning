@@ -4,10 +4,13 @@
 姿势识别控制系统 UI 模块 (Pose Recognition Control System UI)
 <img width="1002" height="497" alt="屏幕截图 2026-04-16 143036" src="https://github.com/user-attachments/assets/662335a4-59fc-45a2-b9f2-35a4f962bf47" />
 已完成的工作
-模块	内容	状态
+
 UI界面设计	Canvas + 2个下拉列表 + 4个按钮 + 状态文本	 完成
+
 脚本编写	UIManager、PoseRecognitionController、PoseRecognitionEngine、VideoPlayerManager	 完成
+
 事件绑定	UI组件与脚本的事件关联	 完成
+
 功能接口	机器人选择、CSV路径选择、导入视频、重放、开始/停止识别	 完成
 
 
