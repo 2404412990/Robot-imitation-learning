@@ -1,3 +1,18 @@
+4月16号
+
+姿势识别控制系统 UI 模块 (Pose Recognition Control System UI)
+
+已完成的工作
+模块	内容	状态
+UI界面设计	Canvas + 2个下拉列表 + 4个按钮 + 状态文本	 完成
+脚本编写	UIManager、PoseRecognitionController、PoseRecognitionEngine、VideoPlayerManager	 完成
+事件绑定	UI组件与脚本的事件关联	 完成
+功能接口	机器人选择、CSV路径选择、导入视频、重放、开始/停止识别	 完成
+
+
+
+
+
 一、项目简介
 GVHMR + GMR 是一个三维人体姿态估计与运动重建项目。
 
