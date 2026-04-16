@@ -1,8 +1,8 @@
-<img width="1002" height="497" alt="屏幕截图 2026-04-16 143036" src="https://github.com/user-attachments/assets/662335a4-59fc-45a2-b9f2-35a4f962bf47" />
+
 # 4.16
 
 姿势识别控制系统 UI 模块 (Pose Recognition Control System UI)
-
+<img width="1002" height="497" alt="屏幕截图 2026-04-16 143036" src="https://github.com/user-attachments/assets/662335a4-59fc-45a2-b9f2-35a4f962bf47" />
 已完成的工作
 模块	内容	状态
 UI界面设计	Canvas + 2个下拉列表 + 4个按钮 + 状态文本	 完成
