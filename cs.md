@@ -1,3 +1,6 @@
+# 4.17 进行方法探索
+我使用RTMpose3d进行姿态映射到GMR转换为机器人的实时映射，但是效果很差，可能是由于RTMpose3d输出的不是smpl参数，而是17个关键点，并且缺少人体姿态估计，直接将17个点转为机器人的关节，因此效果没有WHAM+GMR的好，但是速度却比较快，并且延迟很低。下周计划采用[TRACE](https://github.com/Arthur151/ROMP)，这个模型可以直接输出SMPL的 24 个高精度三维物理关节，外加真实的根节点全局旋转角，并且自带时序平滑，可以减少动作的畸变。
+
 # 4.3 进行方法探索和试错
 我们先是将GVHMR的输入转化为一帧一帧的视频来模仿实时输入，并且维护一个10帧大小的窗口来输入给模型进行姿态提取，目前速度较慢，一秒处理一帧，还没有算上GMR进行重映射的时间，所以放弃GVHMR模型改用更加轻量的[WHAM](https://github.com/yohanshin/WHAM)模型；此外我们又尝试了[mediapipe](https://medium.com/@riddhisi238/real-time-pose-estimation-from-video-using-mediapipe-and-opencv-in-python-20f9f19c77a6)进行直接端到端动作映射，但其由于是单眼摄像头映射，所以精度很差，虽然帧率较高也不会考虑。使用WHAM模型帧率达到了10帧左右，虽然较慢，但还有优化空间，可以使用[RTMpose](https://github.com/open-mmlab/mmpose/tree/main/projects/rtmpose)替代姿态提取模型进一步提高速度。
 
