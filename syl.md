@@ -1,3 +1,13 @@
+# 2026/4/17
+在windows服务器administrator@10.60.244.142里面部署了gewu平台。进行了初步的ui设计。
+<img width="1286" height="1470" alt="1921777525638_ pic" src="https://github.com/user-attachments/assets/a686e0de-c39b-46f8-b5f9-6c841e218a31" />
+
+
+
+# 2026/4/10
+在4060 Laptop上对最新版本的retarget进行测试
+成果：基本验证实时性。
+
 # 2026/4/3
 对GVHMR进行实时化改造
 
