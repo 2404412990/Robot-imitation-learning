@@ -1,6 +1,6 @@
 # Robot-imitation-learning
 
-根据 [集成安装指南](docs/INSTALL.md) 配置环境，创建一个名为 `wham_gmr` 的单虚拟环境。
+根据 [集成安装指南](docs/INSTALL_WIN.md) 配置环境，创建一个名为 `wham_gmr` 的单虚拟环境。（windows下该环境的安装很困难，主要是pytorch3d和dpvo）
 
 `checkpoints`,`dataset`和`assets/body_models`可在[链接](https://pan.baidu.com/s/1fVf2eA1OzdRv70M4gm2wSA?pwd=8pnu) 下载
 
@@ -11,28 +11,30 @@ https://borealisdata.ca/dataset.xhtml?persistentId=doi:10.5683/SP2/JRHDRN
 示例命令：
 
 ```bash
-OUTPUT_ROOT=output/my_run \
-ROBOT=unitree_h1 \
-RECORD_GMRVIDEO=1 \
-RECORD_WHAMVIDEO=1 \
-VIDEO=examples/drone_video.mp4 \
-bash run.sh
+$env:OUTPUT_ROOT='output/my_run' 
+$env:ROBOT='unitree_h1' 
+$env:RECORD_GMRVIDEO=1 
+$env:RECORD_WHAMVIDEO=1 
+$env:VIDEO='examples/drone_video.mp4' 
+./run.ps1
 ```
 
 或者
 
 ```bash
-OUTPUT_ROOT=output/faster_run \
-RECORD_WHAMVIDEO=1 \
-RECORD_GMRVIDEO=1 \
-VIDEO=examples/drone_video.mp4 \
-WHAM_DETECT_INTERVAL=2 \
-WHAM_INFER_INTERVAL=2 \
-WHAM_STREAM_SEQ_LEN=12 \
-WHAM_INPUT_SCALE=0.5 \
-GMR_TORCH_DEVICE=cuda \
-bash run.sh
+$env:OUTPUT_ROOT='output/faster_run' 
+$env:RECORD_WHAMVIDEO=1 
+$env:RECORD_GMRVIDEO=1 
+$env:VIDEO='examples/drone_video.mp4' 
+$env:WHAM_DETECT_INTERVAL=2 
+$env:WHAM_INFER_INTERVAL=2 
+$env:WHAM_STREAM_SEQ_LEN=12 
+$env:WHAM_INPUT_SCALE=0.5 
+$env:GMR_TORCH_DEVICE=cuda 
+./run.ps1
 ```
+
+
 
 第一次运行可能会出现加载慢，报错，效果不理想等问题
 

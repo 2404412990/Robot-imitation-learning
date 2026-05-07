@@ -129,3 +129,5 @@ wham-gmr_local.tar.gz
 .claude
 
 *.meta
+
+*.cmake.meta
