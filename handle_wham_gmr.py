@@ -1287,7 +1287,7 @@ def run_stream_mt(
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--video', type=str, default='examples/demo_video.mp4')
+    parser.add_argument('--video', type=str, default='examples/drone_video.mp4')
     parser.add_argument('--output_dir', type=str, default='output/stream_demo')
     parser.add_argument('--record_whamvideo', action='store_true',
                         help='Enable WHAM mesh rendering and write WHAM output video.')
