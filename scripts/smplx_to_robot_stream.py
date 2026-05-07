@@ -412,7 +412,7 @@ if __name__ == "__main__":
             else:
                 rot = joint_orientations[parents[i]] * R.from_rotvec(single_full_body_pose[i].squeeze())
             joint_orientations.append(rot)
-            result[joint_name] = (single_joints[i], rot.as_quat(scalar_first=True))
+            result[joint_name] = (single_joints[i], rot.as_quat())
 
         return result, betas
 

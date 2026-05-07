@@ -260,7 +260,7 @@ class XsensToGMR:
         # Capture initial yaw on first frame
         if not self.initial_yaw_captured:
             # Extract yaw from pelvis quaternion
-            pelvis_rot = R.from_quat(pelvis_quat, scalar_first=True)
+            pelvis_rot = R.from_quat(pelvis_quat)
             # Get euler angles (ZYX convention: yaw, pitch, roll)
             euler = pelvis_rot.as_euler('ZYX')
             yaw = euler[0]
@@ -279,9 +279,9 @@ class XsensToGMR:
             new_pos = self.initial_yaw_inv.apply(pos)
 
             # Rotate orientation (pre-multiply: new_rot = yaw_inv * body_rot)
-            body_rot = R.from_quat(quat, scalar_first=True)
+            body_rot = R.from_quat(quat)
             new_rot = self.initial_yaw_inv * body_rot
-            new_quat = new_rot.as_quat(scalar_first=True)
+            new_quat = new_rot.as_quat()
 
             normalized_frame[body_name] = (new_pos, new_quat)
 

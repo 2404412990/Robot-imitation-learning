@@ -434,7 +434,7 @@ Retarget a single motion:
 Use the following command to extract motion data from your `.fbx` file:
 
 ```bash
-cd third_party
+cd third-party
 python poselib/fbx_importer.py --input <path_to_fbx_file.fbx> --output <path_to_save_motion_data.pkl> --root-joint <root_joint_name> --fps <fps>
 ```
 

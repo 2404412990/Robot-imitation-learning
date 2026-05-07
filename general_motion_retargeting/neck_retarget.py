@@ -30,8 +30,8 @@ def human_head_to_robot_neck(smplx_data=None):
     head_rotation = smplx_data['Head'][1] # wxyz
 
     # Convert to rotation objects
-    spine_rotation = R.from_quat(spine_rotation, scalar_first=True)
-    head_rotation = R.from_quat(head_rotation, scalar_first=True)
+    spine_rotation = R.from_quat(spine_rotation)
+    head_rotation = R.from_quat(head_rotation)
     
     # compute the rpy of the head in local frame (relative to spine)
     # Get the relative rotation: head relative to spine

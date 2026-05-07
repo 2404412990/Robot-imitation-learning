@@ -18,7 +18,7 @@ def load_bvh_file(bvh_file, format="lafan1"):
     global_data = utils.quat_fk(data.quats, data.pos, data.parents)
 
     rotation_matrix = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]])
-    rotation_quat = R.from_matrix(rotation_matrix).as_quat(scalar_first=True)
+    rotation_quat = R.from_matrix(rotation_matrix).as_quat()
 
     frames = []
     for frame in range(data.pos.shape[0]):

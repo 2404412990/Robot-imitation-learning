@@ -128,7 +128,7 @@ def load_gvhmr_pred_file(gvhmr_pred_file, smplx_body_model_path):
     
     # correct rotations
     # rotation_matrix = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]])
-    # rotation_quat = R.from_matrix(rotation_matrix).as_quat(scalar_first=True)
+    # rotation_quat = R.from_matrix(rotation_matrix).as_quat()
     
     # smpl_params_global['body_pose'] = smpl_params_global['body_pose'] @ rotation_matrix
     # smpl_params_global['global_orient'] = smpl_params_global['global_orient'] @ rotation_quat
@@ -186,7 +186,7 @@ def get_smplx_data(smplx_data, body_model, smplx_output, curr_frame):
                 full_body_pose[i].squeeze()
             )
         joint_orientations.append(rot)
-        result[joint_name] = (joints[i], rot.as_quat(scalar_first=True))
+        result[joint_name] = (joints[i], rot.as_quat())
 
   
     return result
@@ -311,7 +311,7 @@ def get_smplx_data_offline_fast(smplx_data, body_model, smplx_output, tgt_fps=30
                     single_full_body_pose[i].squeeze()
                 )
             joint_orientations.append(rot)
-            result[joint_name] = (single_joints[i], rot.as_quat(scalar_first=True))
+            result[joint_name] = (single_joints[i], rot.as_quat())
 
 
         smplx_data_frames.append(result)
@@ -405,14 +405,14 @@ def get_gvhmr_data_offline_fast(smplx_data, body_model, smplx_output, tgt_fps=30
                     single_full_body_pose[i].squeeze()
                 )
             joint_orientations.append(rot)
-            result[joint_name] = (single_joints[i], rot.as_quat(scalar_first=True))
+            result[joint_name] = (single_joints[i], rot.as_quat())
 
 
         smplx_data_frames.append(result)
         
     # add correct rotations
     rotation_matrix = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]])
-    rotation_quat = R.from_matrix(rotation_matrix).as_quat(scalar_first=True)
+    rotation_quat = R.from_matrix(rotation_matrix).as_quat()
     for result in smplx_data_frames:
         for joint_name in result.keys():
             orientation = utils.quat_mul(rotation_quat, result[joint_name][1])

@@ -1,8 +1,10 @@
 import os
+import subprocess
 import time
 import mujoco as mj
 import mujoco.viewer as mjv
 import imageio
+import glfw
 from scipy.spatial.transform import Rotation as R
 from general_motion_retargeting import ROBOT_XML_DICT, ROBOT_BASE_DICT, VIEWER_CAM_DISTANCE_DICT
 from loop_rate_limiters import RateLimiter
@@ -79,16 +81,44 @@ class RobotMotionViewer:
         self.camera_azimuth = camera_azimuth
         self.record_video = record_video
 
+        # --- Fix HiDPI + fullscreen issues on Linux ---
+        # On Wayland / X11, tell GLFW to respect the requested window size
+        # rather than auto-scaling to the monitor's content scale.
+        for _k in ("GDK_SCALE", "GDK_DPI_SCALE", "QT_AUTO_SCREEN_SCALE_FACTOR",
+                    "QT_SCALE_FACTOR", "ELM_SCALE"):
+            os.environ.setdefault(_k, "1")
+        os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "0")
+
+        # MuJoCoʼs render_loop may call glfwDefaultWindowHints() internally,
+        # which would wipe all our hints.  Neutralise it so our settings stick.
+        _orig_default_hints = glfw.default_window_hints
+        def _patched_default_hints():
+            print("[viewer] glfw.default_window_hints() called — blocked to preserve our hints")
+        glfw.default_window_hints = _patched_default_hints
+
+        glfw.init()
+        glfw.window_hint(glfw.SCALE_TO_MONITOR, glfw.FALSE)
+        glfw.window_hint(glfw.MAXIMIZED, glfw.FALSE)
+        glfw.window_hint(glfw.RESIZABLE, glfw.TRUE)
+        glfw.window_hint(glfw.VISIBLE, glfw.TRUE)
+        glfw.window_hint(glfw.FOCUSED, glfw.TRUE)
+        glfw.window_hint(glfw.FLOATING, glfw.FALSE)
+        glfw.window_hint(glfw.AUTO_ICONIFY, glfw.FALSE)
 
         self.viewer = mjv.launch_passive(
             model=self.model,
             data=self.data,
             show_left_ui=False,
-            show_right_ui=False, 
+            show_right_ui=False,
             key_callback=keyboard_callback
-            )      
+            )
+
+        glfw.default_window_hints = _orig_default_hints
 
         self.viewer.opt.flags[mj.mjtVisFlag.mjVIS_TRANSPARENT] = transparent_robot
+
+        # Best-effort window resize via X11 tools (no-op on pure Wayland).
+        self._fix_window_size(1200, 900)
         
         if self.record_video:
             assert video_path is not None, "Please provide video path for recording"
@@ -103,18 +133,49 @@ class RobotMotionViewer:
             # Initialize renderer for video recording
             self.renderer = mj.Renderer(self.model, height=video_height, width=video_width)
         
-    def step(self, 
+    @staticmethod
+    def _fix_window_size(width, height):
+        """Try to resize the MuJoCo viewer window to *width* x *height*.
+
+        On HiDPI Linux the initial window can be much larger than the
+        requested dimensions because of display-server scaling.  This
+        helper attempts to shrink it with X11 command-line tools (best
+        effort — failures are silent).
+        """
+        time.sleep(0.2)  # let the window manager settle
+        for tool, args in (
+            ("xdotool", [
+                "search", "--sync", "--name", "MuJoCo",
+                "windowsize", "--usehints", str(width), str(height),
+            ]),
+            ("wmctrl", [
+                "-r", "MuJoCo", "-e",
+                "0,-1,-1,{w},{h}".format(w=width, h=height),
+            ]),
+        ):
+            try:
+                subprocess.run(
+                    [tool] + args,
+                    timeout=2,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                break  # first successful tool wins
+            except Exception:
+                continue
+
+    def step(self,
             # robot data
-            root_pos, root_rot, dof_pos, 
+            root_pos, root_rot, dof_pos,
             # human data
-            human_motion_data=None, 
+            human_motion_data=None,
             show_human_body_name=False,
             # scale for human point visualization
             human_point_scale=0.1,
-            # human pos offset add for visualization    
+            # human pos offset add for visualization
             human_pos_offset=np.array([0.0, 0.0, 0]),
             # rate limit
-            rate_limit=True, 
+            rate_limit=True,
             follow_camera=True,
             ):
         """
@@ -152,7 +213,7 @@ class RobotMotionViewer:
             for human_body_name, (pos, rot) in human_motion_data.items():
                 draw_frame(
                     pos,
-                    R.from_quat(rot, scalar_first=True).as_matrix(),
+                    R.from_quat(np.asarray(rot)[[1, 2, 3, 0]]).as_matrix(),  # wxyz -> xyzw
                     self.viewer,
                     human_point_scale,
                     pos_offset=human_pos_offset,

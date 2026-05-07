@@ -18,8 +18,8 @@ export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
 #   OUTPUT_ROOT=outputs/run1 RECORD_GMRVIDEO=0 VIDEO=0 bash run.sh
 #   VIDEO=0 TIME=10 RECORD_GMRVIDEO=1 RECORD_WHAMVIDEO=1 bash run.sh
 
-WHAM_ENV=${WHAM_ENV:-wham}
-GMR_ENV=${GMR_ENV:-gmr}
+WHAM_ENV=${WHAM_ENV:-wham_gmr}
+GMR_ENV=${GMR_ENV:-wham_gmr}
 WHAM_PYTHON=${WHAM_PYTHON:-/home/shaochang/anaconda3/envs/${WHAM_ENV}/bin/python}
 GMR_PYTHON=${GMR_PYTHON:-/home/shaochang/anaconda3/envs/${GMR_ENV}/bin/python}
 
@@ -96,7 +96,8 @@ CAMERA_ELEVATION=${CAMERA_ELEVATION:-12.0}
 CAMERA_DISTANCE_SCALE=${CAMERA_DISTANCE_SCALE:-0.85}
 CAMERA_AZIMUTH=${CAMERA_AZIMUTH:-}
 
-mkdir -p "${OUTPUT_DIR}" "${STREAM_NPZ_DIR}" "$(dirname "${PKL_PATH}")" "$(dirname "${CSV_PATH}")" "$(dirname "${GMR_VIDEO_PATH}")"
+mkdir -p "${OUTPUT_DIR}" "$(dirname "${PKL_PATH}")" "$(dirname "${CSV_PATH}")" "$(dirname "${GMR_VIDEO_PATH}")"
+mkdir -p "${OUTPUT_DIR}" "$(dirname "${PKL_PATH}")" "$(dirname "${CSV_PATH}")" "$(dirname "${GMR_VIDEO_PATH}")"
 
 GMR_READY_FLAG=${GMR_READY_FLAG:-${STREAM_NPZ_DIR}/gmr_ready.flag}
 STREAM_TAIL_PATH=${STREAM_TAIL_PATH:-${STREAM_NPZ_DIR}/stream_tail.pkl}
@@ -105,72 +106,6 @@ STARTUP_DELAY_SEC=0.5
 
 # Clean stream artifacts before launching consumer to avoid mixing stale chunks from prior runs.
 rm -f "${STREAM_NPZ_DIR}"/chunk_*.npz "${STREAM_NPZ_DIR}"/stream_done.flag "${GMR_READY_FLAG}" "${STREAM_TAIL_PATH}"
-
-WHAM_CMD=(
-	"${WHAM_PYTHON}" demo_stream_mt.py
-	--video "${VIDEO}"
-	--time "${TIME}"
-	--output_dir "${OUTPUT_DIR}"
-	--stream_npz_dir "${STREAM_NPZ_DIR}"
-)
-
-GMR_CMD=(
-	"${GMR_PYTHON}" scripts/smplx_to_robot_stream.py
-	--stream_npz_dir "${STREAM_NPZ_DIR}"
-	--stream_mode tail
-	--stream_tail_path "${STREAM_TAIL_PATH}"
-	--torch_device "${GMR_TORCH_DEVICE}"
-	--ready_flag_path "${GMR_READY_FLAG}"
-	--robot "${ROBOT}"
-	--coord_fix yup_to_zup
-	--save_path "${PKL_PATH}"
-	--csv_path "${CSV_PATH}"
-	--smooth_alpha "${SMOOTH_ALPHA}"
-	--viewer_warmup_frames "${VIEWER_WARMUP_FRAMES}"
-	--camera_lookat_height_offset "${CAMERA_LOOKAT_HEIGHT_OFFSET}"
-	--camera_elevation "${CAMERA_ELEVATION}"
-	--camera_distance_scale "${CAMERA_DISTANCE_SCALE}"
-	--poll_interval "${POLL_INTERVAL}"
-	--idle_timeout "${IDLE_TIMEOUT}"
-	--done_grace_sec "${DONE_GRACE_SEC}"
-)
-
-if [[ -n "${CUSTOM_ROBOT_XML}" ]]; then
-	GMR_CMD+=(--robot_path "${CUSTOM_ROBOT_XML}")
-fi
-
-if [[ "${CAMERA_FOLLOW}" == "1" ]]; then
-	GMR_CMD+=(--camera_follow)
-else
-	GMR_CMD+=(--no-camera_follow)
-fi
-
-if [[ -n "${CAMERA_AZIMUTH}" ]]; then
-	GMR_CMD+=(--camera_azimuth "${CAMERA_AZIMUTH}")
-fi
-
-GMR_CMD+=(--viewer_ready_timeout_sec "${GMR_VIEWER_READY_TIMEOUT_SEC}")
-GMR_CMD+=(--viewer_thread_join_timeout_sec "${GMR_VIEWER_THREAD_JOIN_TIMEOUT_SEC}")
-
-if [[ "${HEIGHT_ADJUST}" == "1" ]]; then
-	GMR_CMD+=(--height_adjust)
-else
-	GMR_CMD+=(--no-height_adjust)
-fi
-
-if [[ "${ROOT_ORIGIN_OFFSET}" == "1" ]]; then
-	GMR_CMD+=(--root_origin_offset)
-else
-	GMR_CMD+=(--no-root_origin_offset)
-fi
-
-if [[ "${RECORD_WHAMVIDEO}" == "1" ]]; then
-	WHAM_CMD+=(--record_whamvideo)
-fi
-
-if [[ "${RECORD_GMRVIDEO}" == "1" ]]; then
-	GMR_CMD+=(--record_gmrvideo --video_path "${GMR_VIDEO_PATH}")
-fi
 
 echo "[E2E] Render flags: RECORD_WHAMVIDEO=${RECORD_WHAMVIDEO} RECORD_GMRVIDEO=${RECORD_GMRVIDEO} USE_XVFB_GMR=${USE_XVFB_GMR} DISPLAY=${DISPLAY:-<unset>}"
 echo "[E2E] Camera params: follow=${CAMERA_FOLLOW} lookat_h=${CAMERA_LOOKAT_HEIGHT_OFFSET} elev=${CAMERA_ELEVATION} dist_scale=${CAMERA_DISTANCE_SCALE} azimuth=${CAMERA_AZIMUTH:-<auto>}"
@@ -250,66 +185,69 @@ run_e2e_warmup_if_needed() {
 
 run_e2e_warmup_if_needed
 
-echo "[E2E] Starting GMR consumer (${GMR_ENV}) with ${GMR_PYTHON} ..."
-if [[ "${RECORD_GMRVIDEO}" == "1" && "${USE_XVFB_GMR}" == "1" ]]; then
-	xvfb-run -a "${GMR_CMD[@]}" &
+echo "[E2E] Starting integrated WHAM + GMR producer/consumer with ${WHAM_PYTHON} ..."
+INTEGRATED_CMD=(
+	"${WHAM_PYTHON}" handle_wham_gmr.py
+	--video "${VIDEO}"
+	--time "${TIME}"
+	--output_dir "${OUTPUT_DIR}"
+	--robot "${ROBOT}"
+	--coord_fix yup_to_zup
+	--save_path "${PKL_PATH}"
+	--csv_path "${CSV_PATH}"
+	--smooth_alpha "${SMOOTH_ALPHA}"
+	--viewer_warmup_frames "${VIEWER_WARMUP_FRAMES}"
+	--camera_lookat_height_offset "${CAMERA_LOOKAT_HEIGHT_OFFSET}"
+	--camera_elevation "${CAMERA_ELEVATION}"
+	--camera_distance_scale "${CAMERA_DISTANCE_SCALE}"
+	--poll_interval "${POLL_INTERVAL}"
+	--idle_timeout "${IDLE_TIMEOUT}"
+	--done_grace_sec "${DONE_GRACE_SEC}"
+	--torch_device "${GMR_TORCH_DEVICE}"
+)
+
+if [[ -n "${CUSTOM_ROBOT_XML}" ]]; then
+	INTEGRATED_CMD+=(--robot_path "${CUSTOM_ROBOT_XML}")
+fi
+
+if [[ "${CAMERA_FOLLOW}" == "1" ]]; then
+	INTEGRATED_CMD+=(--camera_follow)
 else
-	"${GMR_CMD[@]}" &
-fi
-GMR_PID=$!
-
-# Fast-fail if consumer exits immediately (e.g., import errors) to avoid wasting
-# time running WHAM producer while GMR is already dead.
-GMR_START_WAIT_SEC=${GMR_START_WAIT_SEC:-2}
-sleep "${GMR_START_WAIT_SEC}"
-if ! kill -0 "${GMR_PID}" 2>/dev/null; then
-	echo "[E2E] GMR consumer exited during startup. Check the error above."
-	wait "${GMR_PID}" || true
-	exit 1
+	INTEGRATED_CMD+=(--no-camera_follow)
 fi
 
-# Wait for consumer readiness marker so producer starts only after GMR is ready.
-echo "[E2E] Waiting GMR ready flag: ${GMR_READY_FLAG} (timeout=${READY_TIMEOUT_SEC}s) ..."
-ready_start_ts=$(date +%s)
-while [[ ! -f "${GMR_READY_FLAG}" ]]; do
-	if ! kill -0 "${GMR_PID}" 2>/dev/null; then
-		echo "[E2E] GMR consumer exited before ready flag was created."
-		wait "${GMR_PID}" || true
-		exit 1
-	fi
-	now_ts=$(date +%s)
-	elapsed=$(( now_ts - ready_start_ts ))
-	if [[ ${elapsed} -ge ${READY_TIMEOUT_SEC} ]]; then
-		echo "[E2E] Warning: timed out waiting for ready flag; continue startup."
-		break
-	fi
-	sleep 0.1
-done
-
-if [[ -f "${GMR_READY_FLAG}" ]]; then
-	echo "[E2E] GMR ready flag detected."
+if [[ -n "${CAMERA_AZIMUTH}" ]]; then
+	INTEGRATED_CMD+=(--camera_azimuth "${CAMERA_AZIMUTH}")
 fi
 
-if [[ "${STARTUP_DELAY_SEC}" != "0" ]]; then
-	echo "[E2E] Additional startup delay before WHAM: ${STARTUP_DELAY_SEC}s"
-	sleep "${STARTUP_DELAY_SEC}"
+INTEGRATED_CMD+=(--viewer_ready_timeout_sec "${GMR_VIEWER_READY_TIMEOUT_SEC}")
+INTEGRATED_CMD+=(--viewer_thread_join_timeout_sec "${GMR_VIEWER_THREAD_JOIN_TIMEOUT_SEC}")
+
+if [[ "${HEIGHT_ADJUST}" == "1" ]]; then
+	INTEGRATED_CMD+=(--height_adjust)
+else
+	INTEGRATED_CMD+=(--no-height_adjust)
 fi
 
-cleanup() {
-	if [[ -n "${GMR_PID:-}" ]] && kill -0 "${GMR_PID}" 2>/dev/null; then
-		echo "[E2E] Stopping GMR consumer (pid=${GMR_PID}) ..."
-		kill "${GMR_PID}" 2>/dev/null || true
-		wait "${GMR_PID}" 2>/dev/null || true
-	fi
-}
-trap cleanup EXIT INT TERM
+if [[ "${ROOT_ORIGIN_OFFSET}" == "1" ]]; then
+	INTEGRATED_CMD+=(--root_origin_offset)
+else
+	INTEGRATED_CMD+=(--no-root_origin_offset)
+fi
 
-echo "[E2E] Starting WHAM producer (${WHAM_ENV}) with ${WHAM_PYTHON} ..."
-"${WHAM_CMD[@]}"
+if [[ "${RECORD_WHAMVIDEO}" == "1" ]]; then
+	INTEGRATED_CMD+=(--record_whamvideo)
+fi
 
-echo "[E2E] Waiting GMR consumer to finish ..."
-wait "${GMR_PID}"
-trap - EXIT INT TERM
+if [[ "${RECORD_GMRVIDEO}" == "1" ]]; then
+	INTEGRATED_CMD+=(--record_gmrvideo --video_path "${GMR_VIDEO_PATH}")
+fi
+
+if [[ "${RECORD_GMRVIDEO}" == "1" && "${USE_XVFB_GMR}" == "1" ]]; then
+	xvfb-run -a "${INTEGRATED_CMD[@]}"
+else
+	"${INTEGRATED_CMD[@]}"
+fi
 
 echo "[E2E] Done."
 echo "  CSV: ${CSV_PATH}"
@@ -317,3 +255,4 @@ echo "  PKL: ${PKL_PATH}"
 if [[ "${RECORD_GMRVIDEO}" == "1" ]]; then
 	echo "  GMR video: ${GMR_VIDEO_PATH}"
 fi
+

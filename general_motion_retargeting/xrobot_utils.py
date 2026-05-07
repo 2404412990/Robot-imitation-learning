@@ -180,7 +180,7 @@ class XRobotStreamer:
 
                 # from unity coordinate to right-hand coordinate
                 rotation_matrix = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]])
-                rotation_quat = R.from_matrix(rotation_matrix).as_quat(scalar_first=True)
+                rotation_quat = R.from_matrix(rotation_matrix).as_quat()
                 orientation = quat_mul_np(rotation_quat, np.array([qw, qx, qy, qz]), scalar_first=True)
                 position = np.array([x, y, z]) @ rotation_matrix.T  # cm to m
 
@@ -688,7 +688,7 @@ class XRobotRecorder:
 
             # from unity coordinate to right-hand coordinate
             rotation_matrix = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]])
-            rotation_quat = R.from_matrix(rotation_matrix).as_quat(scalar_first=True)
+            rotation_quat = R.from_matrix(rotation_matrix).as_quat()
             orientation = quat_mul_np(rotation_quat, np.array([qw, qx, qy, qz]), scalar_first=True)
             position = np.array([x, y, z]) @ rotation_matrix.T
 

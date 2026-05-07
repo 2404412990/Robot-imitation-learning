@@ -150,14 +150,12 @@ def euler_from_quaternion_np(quat, scalar_first=True):
     return roll_x, pitch_y, yaw_z
 
 
-def quat_diff_np(q1, q2, scalar_first=True):
-    # Ensure quaternions are numpy arrays
+def quat_diff_np(q1, q2):
     q1 = np.array(q1)
     q2 = np.array(q2)
 
-    # Convert to scipy Rotation object (scalar-first)
-    r1 = R.from_quat(q1, scalar_first=scalar_first)
-    r2 = R.from_quat(q2, scalar_first=scalar_first)
+    r1 = R.from_quat(q1)
+    r2 = R.from_quat(q2)
 
     # Relative rotation
     r_rel = r2 * r1.inv()

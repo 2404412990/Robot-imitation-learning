@@ -12,7 +12,7 @@ This repository is the official [Pytorch](https://pytorch.org/) implementation o
 
 
 ## Installation
-Please see [Installation](docs/INSTALL.md) for details.
+Please see [Installation](INSTALL.md) for details.
 
 
 ## Quick Demo

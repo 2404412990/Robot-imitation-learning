@@ -51,7 +51,7 @@ def euler_to_quat(euler):
     mujoco_euler_rad = np.deg2rad(np.array(euler))
     # mujoco_euler_rad = euler
     rot = R.from_euler("xyz", mujoco_euler_rad, degrees=False)
-    quat = rot.as_quat(scalar_first=True)
+    quat = rot.as_quat()
     return quat
 
 

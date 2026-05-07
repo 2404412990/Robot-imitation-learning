@@ -132,7 +132,7 @@ class GeneralMotionRetargeting:
                 self.human_body_to_task1[body_name] = task
                 self.pos_offsets1[body_name] = np.array(pos_offset) - self.ground
                 self.rot_offsets1[body_name] = R.from_quat(
-                    rot_offset, scalar_first=True
+                    np.asarray(rot_offset)[[1, 2, 3, 0]]  # wxyz -> xyzw
                 )
                 self.tasks1.append(task)
                 self.task_errors1[task] = []
@@ -150,7 +150,7 @@ class GeneralMotionRetargeting:
                 self.human_body_to_task2[body_name] = task
                 self.pos_offsets2[body_name] = np.array(pos_offset) - self.ground
                 self.rot_offsets2[body_name] = R.from_quat(
-                    rot_offset, scalar_first=True
+                    np.asarray(rot_offset)[[1, 2, 3, 0]]  # wxyz -> xyzw
                 )
                 self.tasks2.append(task)
                 self.task_errors2[task] = []
@@ -279,14 +279,19 @@ class GeneralMotionRetargeting:
         offset_human_data = {}
         for body_name in human_data.keys():
             pos, quat = human_data[body_name]
+            if body_name not in rot_offsets or body_name not in pos_offsets:
+                offset_human_data[body_name] = [pos, quat]
+                continue
             offset_human_data[body_name] = [pos, quat]
             # apply rotation offset first
-            updated_quat = (R.from_quat(quat, scalar_first=True) * rot_offsets[body_name]).as_quat(scalar_first=True)
+            r_quat = R.from_quat(np.asarray(quat)[[1, 2, 3, 0]])  # wxyz -> xyzw
+            q_xyzw = (r_quat * rot_offsets[body_name]).as_quat()
+            updated_quat = q_xyzw[[3, 0, 1, 2]]  # xyzw -> wxyz
             offset_human_data[body_name][1] = updated_quat
-            
+
             local_offset = pos_offsets[body_name]
             # compute the global position offset using the updated rotation
-            global_pos_offset = R.from_quat(updated_quat, scalar_first=True).apply(local_offset)
+            global_pos_offset = R.from_quat(np.asarray(updated_quat)[[1, 2, 3, 0]]).apply(local_offset)
             
             offset_human_data[body_name][0] = pos + global_pos_offset
            
