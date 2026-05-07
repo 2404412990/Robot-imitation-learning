@@ -15,7 +15,7 @@ OUTPUT_ROOT=output/my_run \
 ROBOT=unitree_h1 \
 RECORD_GMRVIDEO=1 \
 RECORD_WHAMVIDEO=1 \
-VIDEO=examples/IMG_9732.mov \
+VIDEO=examples/drone_video.mp4 \
 bash run.sh
 ```
 
@@ -25,7 +25,7 @@ bash run.sh
 OUTPUT_ROOT=output/faster_run \
 RECORD_WHAMVIDEO=1 \
 RECORD_GMRVIDEO=1 \
-VIDEO=0 \
+VIDEO=examples/drone_video.mp4 \
 WHAM_DETECT_INTERVAL=2 \
 WHAM_INFER_INTERVAL=2 \
 WHAM_STREAM_SEQ_LEN=12 \
