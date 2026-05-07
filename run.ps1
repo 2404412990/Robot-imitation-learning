@@ -114,9 +114,10 @@ $E2E_WARMUP_CACHE_ROOT= _env E2E_WARMUP_CACHE_ROOT "$PWD\.cache\wham-gmr"
 
 # GMR viewer camera controls.
 $CAMERA_FOLLOW               = _env CAMERA_FOLLOW               "0"
+$TRACK                       = _env TRACK                       "0"
 $CAMERA_LOOKAT_HEIGHT_OFFSET = _env CAMERA_LOOKAT_HEIGHT_OFFSET "0.45"
 $CAMERA_ELEVATION            = _env CAMERA_ELEVATION            "12.0"
-$CAMERA_DISTANCE_SCALE       = _env CAMERA_DISTANCE_SCALE       "0.85"
+$CAMERA_DISTANCE_SCALE       = _env CAMERA_DISTANCE_SCALE       "1.3"
 $CAMERA_AZIMUTH              = _env CAMERA_AZIMUTH              ""
 
 # Create output directories.
@@ -142,7 +143,7 @@ Remove-Item -Force -ErrorAction SilentlyContinue $STREAM_TAIL_PATH
 
 $_display = if ($env:DISPLAY) { $env:DISPLAY } else { '<unset>' }
 Write-Host "[E2E] Render flags: RECORD_WHAMVIDEO=$RECORD_WHAMVIDEO RECORD_GMRVIDEO=$RECORD_GMRVIDEO USE_XVFB_GMR=$USE_XVFB_GMR DISPLAY=$_display"
-Write-Host "[E2E] Camera params: follow=$CAMERA_FOLLOW lookat_h=$CAMERA_LOOKAT_HEIGHT_OFFSET elev=$CAMERA_ELEVATION dist_scale=$CAMERA_DISTANCE_SCALE azimuth=$(if ($CAMERA_AZIMUTH) { $CAMERA_AZIMUTH } else { '<auto>' })"
+Write-Host "[E2E] Camera params: follow=$CAMERA_FOLLOW track=$TRACK lookat_h=$CAMERA_LOOKAT_HEIGHT_OFFSET elev=$CAMERA_ELEVATION dist_scale=$CAMERA_DISTANCE_SCALE azimuth=$(if ($CAMERA_AZIMUTH) { $CAMERA_AZIMUTH } else { '<auto>' })"
 Write-Host "[E2E] WHAM perf params: amp=$WHAM_USE_AMP detect_interval=$WHAM_DETECT_INTERVAL infer_interval=$WHAM_INFER_INTERVAL seq_len=$WHAM_STREAM_SEQ_LEN input_scale=$WHAM_INPUT_SCALE"
 Write-Host "[E2E] WHAM stream mode=tail (fixed)"
 Write-Host "[E2E] GMR torch_device=$GMR_TORCH_DEVICE"
@@ -259,6 +260,12 @@ if ($CAMERA_FOLLOW -eq "1") {
     $INTEGRATED_CMD += "--camera_follow"
 } else {
     $INTEGRATED_CMD += "--no-camera_follow"
+}
+
+if ($TRACK -eq "1") {
+    $INTEGRATED_CMD += "--track"
+} else {
+    $INTEGRATED_CMD += "--no-track"
 }
 
 if ($CAMERA_AZIMUTH) {

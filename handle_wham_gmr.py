@@ -7,6 +7,7 @@ import csv
 import smplx
 from scipy.spatial.transform import Rotation as R
 from smplx.joint_names import JOINT_NAMES
+import socket, struct, threading
 
 import pathlib
 HERE = pathlib.Path(__file__).resolve().parent
@@ -37,13 +38,69 @@ def _tail_apply_yup_to_zup(root_orient, trans):
     trans = trans @ rotation_matrix.T
     return root_orient, trans
 
+
+class TcpStreamSender:
+    """Send JPEG frames to Unity StreamReceiver via TCP (127.0.0.1:9876)."""
+
+    def __init__(self, host: str = "127.0.0.1", port: int = 9876):
+        self._host = host
+        self._port = port
+        self._sock: socket.socket | None = None
+        self._lock = threading.Lock()
+
+    def connect(self) -> bool:
+        try:
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self._sock.settimeout(3.0)
+            self._sock.connect((self._host, self._port))
+            self._sock.settimeout(5.0)
+            logger.info(f"[TCP] Connected to Unity at {self._host}:{self._port}")
+            return True
+        except Exception as e:
+            logger.warning(f"[TCP] Cannot connect to Unity ({e}), will retry")
+            self._sock = None
+            return False
+
+    def send_frame(self, stream_id: int, bgr: "np.ndarray", quality: int = 80) -> bool:
+        with self._lock:
+            if self._sock is None:
+                return False
+            try:
+                ok, jpg = cv2.imencode('.jpg', bgr, [cv2.IMWRITE_JPEG_QUALITY, quality])
+                if not ok:
+                    return False
+                data = jpg.tobytes()
+                header = struct.pack('>II', stream_id, len(data))
+                self._sock.sendall(header + data)
+                return True
+            except (socket.error, BrokenPipeError, ConnectionResetError, OSError):
+                try:
+                    self._sock.close()
+                except Exception:
+                    pass
+                self._sock = None
+                return False
+
+    def close(self):
+        with self._lock:
+            if self._sock:
+                try:
+                    self._sock.close()
+                except Exception:
+                    pass
+                self._sock = None
+
+    @property
+    def connected(self) -> bool:
+        return self._sock is not None
+
+
 import sys
 import select
 import signal
 import torch
 import numpy as np
 from loguru import logger
-import threading
 from queue import Queue, Full, Empty
 from contextlib import nullcontext
 
@@ -54,6 +111,7 @@ except Exception:
     termios = None
     tty = None
 
+import mujoco as mj
 from configs.config import get_cfg_defaults
 try:
     from lib.vis.renderer import Renderer
@@ -951,7 +1009,7 @@ def run_stream_mt(
                 record_video=True,
                 video_path=gmr_args.video_path,
             )
-            v_kws["camera_follow"] = getattr(gmr_args, "camera_follow", False)
+            v_kws["camera_follow"] = getattr(gmr_args, "camera_follow", False) or getattr(gmr_args, "track", False)
             if hasattr(gmr_args, 'camera_lookat_height_offset'):
                 v_kws["camera_lookat_height_offset"] = gmr_args.camera_lookat_height_offset
             if hasattr(gmr_args, 'camera_elevation'):
@@ -966,9 +1024,18 @@ def run_stream_mt(
             try:
                 gmr_state["viewer"] = RobotMotionViewer(**v_kws)
                 logger.info(f"Initialized GMR viewer for {gmr_args.robot}")
+
+                # Offscreen renderer for TCP streaming to Unity (streamId=1)
+                v = gmr_state["viewer"]
+                gmr_state["renderer"] = mj.Renderer(v.model, height=240, width=320)
+                logger.info("Initialized GMR offscreen renderer (240x320) for Unity streaming")
             except Exception as e:
                 logger.error(f"Failed to initialize GMR viewer: {e}")
                 gmr_state["viewer"] = None
+
+    # TCP sender for streaming WHAM (streamId=0) and GMR (streamId=1) frames to Unity
+    tcp_sender = TcpStreamSender()
+    gmr_state["tcp_sender"] = tcp_sender
 
     frame_times = deque(maxlen=30)
     last_frame_time = time.time()
@@ -1130,8 +1197,17 @@ def run_stream_mt(
                             human_pos_offset=np.array([0.0, 0.0, 0.0]),
                             show_human_body_name=False,
                             rate_limit=False,
-                            follow_camera=gmr_args.camera_follow,
+                            follow_camera=(gmr_args.camera_follow or gmr_args.track),
                         )
+
+                        # Capture GMR offscreen frame for Unity (streamId=1)
+                        gmr_renderer = gmr_state.get("renderer")
+                        tcp = gmr_state.get("tcp_sender")
+                        if gmr_renderer is not None and tcp is not None:
+                            gmr_renderer.update_scene(gmr_state["viewer"].data, camera=gmr_state["viewer"].viewer.cam)
+                            gmr_rgb = gmr_renderer.render()
+                            gmr_bgr = cv2.cvtColor(gmr_rgb, cv2.COLOR_RGB2BGR)
+                            tcp.send_frame(1, gmr_bgr)
                     except Exception as e:
                         logger.error(f"GMR viewer error: {e}")
         
@@ -1176,6 +1252,13 @@ def run_stream_mt(
                 except Full:
                     render_drop_count += 1
 
+        # Send WHAM frame to Unity via TCP (streamId=0)
+        tcp = gmr_state.get("tcp_sender")
+        if tcp is not None and not tcp.connected:
+            tcp.connect()
+        if tcp is not None and frame is not None:
+            tcp.send_frame(0, frame)
+
         if frame_id % 10 == 0:
             logger.info(f"Frame {frame_id} processed | FPS: {avg_fps:.1f} | Latency: {latency:.3f} s")
             
@@ -1192,6 +1275,12 @@ def run_stream_mt(
             try:
                 gmr_state["viewer"].close()
             except:
+                pass
+        if gmr_state.get("tcp_sender") is not None:
+            try:
+                gmr_state["tcp_sender"].close()
+                logger.info("[TCP] Disconnected from Unity")
+            except Exception:
                 pass
         if tail_writer is not None:
             tail_writer.close(frame_count=len(frame_param_map))
@@ -1313,9 +1402,12 @@ if __name__ == '__main__':
     parser.add_argument("--camera_follow", action="store_true")
     parser.add_argument("--no-camera_follow", dest="camera_follow", action="store_false")
     parser.set_defaults(camera_follow=False)
-    parser.add_argument("--camera_lookat_height_offset", type=float, default=0.45)
+    parser.add_argument("--track", action="store_true", help="Alias for --camera_follow (GMR view follows robot)")
+    parser.add_argument("--no-track", dest="track", action="store_false")
+    parser.set_defaults(track=False)
+    parser.add_argument("--camera_lookat_height_offset", type=float, default=0.25)
     parser.add_argument("--camera_elevation", type=float, default=12.0)
-    parser.add_argument("--camera_distance_scale", type=float, default=0.85)
+    parser.add_argument("--camera_distance_scale", type=float, default=4.0)
     parser.add_argument("--camera_azimuth", type=float, default=None)
     parser.add_argument("--smooth_alpha", type=float, default=0.35)
     parser.add_argument("--height_adjust", action="store_true")
@@ -1336,6 +1428,8 @@ if __name__ == '__main__':
     cfg.merge_from_file('configs/yamls/demo.yaml')
     
     record_whamvideo = bool(args.record_whamvideo or args.record_video)
+
+
 
     run_stream_mt(
         cfg,
