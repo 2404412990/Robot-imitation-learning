@@ -1,3 +1,43 @@
+# 2026.5.8
+
+适配windows系统，最主要是dpvo（slam估计）和pytorch3d（wham窗口渲染时的那个小人）的编译，然后也改了下windows下的格物平台，现在windows的格物平台和ubuntu 格物平台的功能差不多，我在windows下加个两个Raw image组件，可以抓取wham和gmr两个窗口并输出到unity世界内
+
+现在还存在一些bug，比如在unity窗口内重定向过程中会非常卡，视角乱飞
+
+之后的工作：格物平台可以再加一点新东西，可以再对wham和gmr进行一些修改，提升效果
+
+
+
+https://github.com/user-attachments/assets/87b28df1-bd3f-4556-831c-10a8a914bc81
+
+
+
+
+
+# 2026.5.1
+解决了wham_gmr里gmr重定向后的机器人一直停在原地的问题，因为wham输出的是累加的全局根方向和全局根坐标，gmr本身不知道这是累加值，导致全局坐标没法累计
+
+把wham_gmr完整串起来，之前wham和gmr是有两个wham和gmr的conda环境，而且它们之间交流也是通过磁盘IO。我把它们集成为一个conda环境，直接在内存内进行这两个流程
+
+
+# 2026.4.24
+稍微修复了一下ubuntu内格物平台imitation的一些bug
+
+
+# 2026.4.17
+格物平台集成，replay按钮以及旁边的动作csv下拉列表可以进行离线csv重定向操作，start按钮可以开始实时重定向,stop按钮终止重定向，下面两个层级表可以调整属性
+
+
+
+https://github.com/user-attachments/assets/d5c057e6-5253-42d9-9c71-3027380cb572
+
+
+
+https://github.com/user-attachments/assets/eec3391d-6220-4771-a2b4-1c8a6c9096e3
+
+
+
+
 # 2026.4.10
 在本地安装ubuntu系统，将前一周的代码下载到本地运行
 
