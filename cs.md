@@ -1,6 +1,6 @@
 # 5.15 进行多机器人定向
 我将wham+gmr在win上进行环境配置并验证，但由于环境配置bug较多，还未完全跑通流程，所以仅在unity中实现多机器人的切换，机器人切换时应当处于stop状态，并且配有mimic agent来接收实时csv文件进行重定向。
-https://github.com/user-attachments/assets/6416208d-94b7-42b5-9819-7c58e32f8a8d
+![Video Project](https://github.com/user-attachments/assets/6416208d-94b7-42b5-9819-7c58e32f8a8d)
 
 
 # 4.17 进行方法探索
