@@ -1026,16 +1026,21 @@ def run_stream_mt(
                 logger.info(f"Initialized GMR viewer for {gmr_args.robot}")
 
                 # Offscreen renderer for TCP streaming to Unity (streamId=1)
-                v = gmr_state["viewer"]
-                gmr_state["renderer"] = mj.Renderer(v.model, height=240, width=320)
-                logger.info("Initialized GMR offscreen renderer (240x320) for Unity streaming")
+                if gmr_args.tcp:
+                    v = gmr_state["viewer"]
+                    gmr_state["renderer"] = mj.Renderer(v.model, height=240, width=320)
+                    logger.info("Initialized GMR offscreen renderer (240x320) for Unity streaming")
             except Exception as e:
                 logger.error(f"Failed to initialize GMR viewer: {e}")
                 gmr_state["viewer"] = None
 
     # TCP sender for streaming WHAM (streamId=0) and GMR (streamId=1) frames to Unity
-    tcp_sender = TcpStreamSender()
-    gmr_state["tcp_sender"] = tcp_sender
+    if gmr_args.tcp:
+        tcp_sender = TcpStreamSender()
+        gmr_state["tcp_sender"] = tcp_sender
+    else:
+        gmr_state["tcp_sender"] = None
+        logger.info("TCP streaming disabled (use --tcp to enable)")
 
     frame_times = deque(maxlen=30)
     last_frame_time = time.time()
@@ -1405,6 +1410,9 @@ if __name__ == '__main__':
     parser.add_argument("--track", action="store_true", help="Alias for --camera_follow (GMR view follows robot)")
     parser.add_argument("--no-track", dest="track", action="store_false")
     parser.set_defaults(track=False)
+    parser.add_argument("--tcp", action="store_true", help="Enable TCP streaming to Unity (default: off)")
+    parser.add_argument("--no-tcp", dest="tcp", action="store_false")
+    parser.set_defaults(tcp=False)
     parser.add_argument("--camera_lookat_height_offset", type=float, default=0.25)
     parser.add_argument("--camera_elevation", type=float, default=12.0)
     parser.add_argument("--camera_distance_scale", type=float, default=4.0)

@@ -11,7 +11,7 @@ https://borealisdata.ca/dataset.xhtml?persistentId=doi:10.5683/SP2/JRHDRN
 示例命令：
 
 ```bash
-$env:OUTPUT_ROOT='output/my_run' 
+$env:OUTPUT_ROOT='output/h1_run' 
 $env:ROBOT='unitree_h1' 
 $env:RECORD_GMRVIDEO=1 
 $env:RECORD_WHAMVIDEO=1 
@@ -31,6 +31,7 @@ $env:WHAM_INFER_INTERVAL=2
 $env:WHAM_STREAM_SEQ_LEN=12 
 $env:WHAM_INPUT_SCALE=0.5 
 $env:GMR_TORCH_DEVICE='cuda' 
+$env:--no-tcp
 ./run.ps1
 ```
 

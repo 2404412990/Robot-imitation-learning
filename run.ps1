@@ -119,6 +119,7 @@ $CAMERA_LOOKAT_HEIGHT_OFFSET = _env CAMERA_LOOKAT_HEIGHT_OFFSET "0.45"
 $CAMERA_ELEVATION            = _env CAMERA_ELEVATION            "12.0"
 $CAMERA_DISTANCE_SCALE       = _env CAMERA_DISTANCE_SCALE       "1.3"
 $CAMERA_AZIMUTH              = _env CAMERA_AZIMUTH              ""
+$TCP                         = _env TCP                         "0"
 
 # Create output directories.
 foreach ($d in @(
@@ -266,6 +267,10 @@ if ($TRACK -eq "1") {
     $INTEGRATED_CMD += "--track"
 } else {
     $INTEGRATED_CMD += "--no-track"
+}
+
+if ($TCP -eq "1") {
+    $INTEGRATED_CMD += "--tcp"
 }
 
 if ($CAMERA_AZIMUTH) {
