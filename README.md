@@ -15,6 +15,7 @@ OUTPUT_ROOT=output/my_run \
 ROBOT=unitree_h1 \
 RECORD_GMRVIDEO=1 \
 RECORD_WHAMVIDEO=1 \
+USE_XVFB_GMR=1 \
 VIDEO=examples/drone_video.mp4 \
 bash run.sh
 ```
@@ -22,15 +23,20 @@ bash run.sh
 或者
 
 ```bash
-OUTPUT_ROOT=output/faster_run \
-RECORD_WHAMVIDEO=1 \
-RECORD_GMRVIDEO=1 \
-VIDEO=examples/drone_video.mp4 \
+OUTPUT_ROOT=output/test \
+WHAM_PYTHON=$(which python) \
+GMR_PYTHON=$(which python) \
+GMR_MAX_ITER=5 \
+RECORD_WHAMVIDEO=0 \
+RECORD_GMRVIDEO=0 \
+USE_XVFB_GMR=0 \
+VIDEO=examples/Walking.mp4 \
 WHAM_DETECT_INTERVAL=2 \
 WHAM_INFER_INTERVAL=2 \
-WHAM_STREAM_SEQ_LEN=12 \
+WHAM_STREAM_SEQ_LEN=8 \
 WHAM_INPUT_SCALE=0.5 \
 GMR_TORCH_DEVICE=cuda \
+WHAM_USE_AMP=1 \
 bash run.sh
 ```
 
@@ -188,3 +194,9 @@ gzip -dc wham-gmr_local.tar.gz | docker load
 
 - 当前 Dockerfile 默认优先覆盖 `run.sh` 所需链路；`demo.py` 完整 SLAM 路径若需 DPVO CUDA 编译，可在镜像内按 `third-party/DPVO` 的官方步骤补装。
 - 项目目录通过 volume 挂载到容器 `/workspace`
+
+
+
+## 自主测试
+
+使用`run_all_benchmarks.sh`完成所有消融实验，绘制效果图等测试，

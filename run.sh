@@ -78,6 +78,8 @@ WHAM_INPUT_SCALE=${WHAM_INPUT_SCALE:-1.0}
 export WHAM_USE_AMP WHAM_DETECT_INTERVAL WHAM_INFER_INTERVAL WHAM_STREAM_SEQ_LEN WHAM_INPUT_SCALE
 
 GMR_TORCH_DEVICE=${GMR_TORCH_DEVICE:-cpu}
+GMR_MAX_ITER=${GMR_MAX_ITER:-5}      # IK max iterations per stage (default reduced to 5 for real-time)
+export GMR_MAX_ITER
 
 GMR_VIEWER_READY_TIMEOUT_SEC=${GMR_VIEWER_READY_TIMEOUT_SEC:-8}
 GMR_VIEWER_THREAD_JOIN_TIMEOUT_SEC=${GMR_VIEWER_THREAD_JOIN_TIMEOUT_SEC:-10}
@@ -111,7 +113,7 @@ echo "[E2E] Render flags: RECORD_WHAMVIDEO=${RECORD_WHAMVIDEO} RECORD_GMRVIDEO=$
 echo "[E2E] Camera params: follow=${CAMERA_FOLLOW} lookat_h=${CAMERA_LOOKAT_HEIGHT_OFFSET} elev=${CAMERA_ELEVATION} dist_scale=${CAMERA_DISTANCE_SCALE} azimuth=${CAMERA_AZIMUTH:-<auto>}"
 echo "[E2E] WHAM perf params: amp=${WHAM_USE_AMP} detect_interval=${WHAM_DETECT_INTERVAL} infer_interval=${WHAM_INFER_INTERVAL} seq_len=${WHAM_STREAM_SEQ_LEN} input_scale=${WHAM_INPUT_SCALE}"
 echo "[E2E] WHAM stream mode=tail (fixed)"
-echo "[E2E] GMR torch_device=${GMR_TORCH_DEVICE}"
+echo "[E2E] GMR torch_device=${GMR_TORCH_DEVICE}  max_iter=${GMR_MAX_ITER}"
 echo "[E2E] GMR viewer mode: async thread + low-latency fixed profile (ready_timeout=${GMR_VIEWER_READY_TIMEOUT_SEC}s, join_timeout=${GMR_VIEWER_THREAD_JOIN_TIMEOUT_SEC}s)"
 echo "[E2E] Warmup: enabled=${E2E_WARMUP} once=${E2E_WARMUP_ONCE} force=${E2E_WARMUP_FORCE}"
 if [[ "${RECORD_GMRVIDEO}" == "1" && "${USE_XVFB_GMR}" == "1" ]]; then

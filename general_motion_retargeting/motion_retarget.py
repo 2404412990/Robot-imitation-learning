@@ -183,6 +183,9 @@ class GeneralMotionRetargeting:
         # Update the task targets
         self.update_targets(human_data, offset_to_ground)
 
+        final_error1 = 0.0
+        final_error2 = 0.0
+
         if self.use_ik_match_table1:
             # Solve the IK problem
             curr_error = self.error1()
@@ -202,6 +205,7 @@ class GeneralMotionRetargeting:
                 self.configuration.integrate_inplace(vel1, dt)
                 next_error = self.error1()
                 num_iter += 1
+            final_error1 = next_error
 
         if self.use_ik_match_table2:
             curr_error = self.error2()
@@ -220,12 +224,33 @@ class GeneralMotionRetargeting:
                     self.configuration, self.tasks2, dt, self.solver, self.damping, self.ik_limits
                 )
                 self.configuration.integrate_inplace(vel2, dt)
-                
+
                 next_error = self.error2()
                 num_iter += 1
-                
-            
-        return self.configuration.data.qpos.copy()
+            final_error2 = next_error
+
+        return self.configuration.data.qpos.copy(), (final_error1, final_error2)
+
+    def decomposed_position_error_mm(self):
+        """Return mean position error across all active tasks in mm.
+
+        Each mink.FrameTask.compute_error returns a 6D vector
+        [pos_x, pos_y, pos_z, rot_x, rot_y, rot_z]; we take the norm
+        of the first 3 components as the position error.
+        """
+        all_tasks = []
+        if self.use_ik_match_table1:
+            all_tasks.extend(self.tasks1)
+        if self.use_ik_match_table2:
+            all_tasks.extend(self.tasks2)
+        if not all_tasks:
+            return 0.0
+        pos_errors = []
+        for task in all_tasks:
+            err = task.compute_error(self.configuration)
+            pos_err = float(np.linalg.norm(err[:3]))  # position component in metres
+            pos_errors.append(pos_err * 1000.0)        # convert to mm
+        return float(np.mean(pos_errors))
 
 
     def error1(self):

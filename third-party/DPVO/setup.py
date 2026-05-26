@@ -6,7 +6,7 @@ ROOT = osp.dirname(osp.abspath(__file__))
 
 # Use g++-10 as host compiler (nvcc --ccbin).
 # CUDA 11.x only supports GCC <= 10; GCC 11 headers are incompatible.
-_NVCC_ARGS = ['-O3', '-allow-unsupported-compiler', '-ccbin', '/usr/bin/g++-10']
+_NVCC_ARGS = ['-O3', '-allow-unsupported-compiler', '-ccbin', '/usr/bin/g++-9']
 
 
 setup(

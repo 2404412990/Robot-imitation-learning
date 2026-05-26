@@ -39,6 +39,7 @@ conda install pytorch-scatter=2.0.9 -c rusty1s -y
 # setup.py is patched to use g++-10 via -ccbin flag.
 sudo apt install gcc-10 g++-10 -y
 # Install DPVO (disable build isolation so setup.py can use torch from current env)
+
 python -m pip install --no-build-isolation .
 cd ../..
 
