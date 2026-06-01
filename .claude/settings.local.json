@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir /s /b \"e:\\\\Unity-RL-Playground-main\\\\gewu\\\\Assets\\\\Scripts\\\\*.cs\")",
+      "Bash(dir /s /b /a:d \"e:\\\\Unity-RL-Playground-main\\\\gewu\\\\Assets\\\\unity_UI\")",
+      "Bash(/d/anaconda3_envs/envs/wham_gmr/python.exe -c ' *)"
+    ],
+    "additionalDirectories": [
+      "E:\\Unity-RL-Playground-main\\gewu\\Assets"
+    ]
+  }
+}
