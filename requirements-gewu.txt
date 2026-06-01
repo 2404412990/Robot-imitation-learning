@@ -1,0 +1,16 @@
+# Unity ML-Agents imitation learning — `gewu` conda environment
+# Usage:
+#   conda create -n gewu python=3.10.12 -y
+#   conda activate gewu
+#   pip3 install torch~=2.2.1 --index-url https://download.pytorch.org/whl/cu121
+#   pip install -r requirements.txt
+
+# Core ML-Agents training (注意: gewu 环境专用，wham_gmr 环境不要装这个)
+mlagents==1.1.0
+
+# H1 dataset utilities (StreamingAssets/h1_dataset/)
+numpy
+joblib
+pandas
+matplotlib
+scipy

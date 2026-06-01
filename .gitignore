@@ -1,0 +1,28 @@
+# Unity generated
+*.meta
+*.unity
+
+# Python generated
+__pycache__/
+*.pyc
+*.egg-info/
+
+# WHAM+GMR pipeline (单独 clone，不随 Unity 项目上传)
+Robot-imitation-learning/
+
+# Cache & output
+.cache/
+results/
+models/
+summaries/
+pkl_outputs/
+videos/
+output/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
