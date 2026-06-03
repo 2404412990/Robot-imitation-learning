@@ -43,6 +43,7 @@ Imitation/
 - Unity 2022.3+（项目使用 ArticulationBody，需要较新的 PhysX）
 - ML-Agents Package 2.0+
 - TextMeshPro Package
+-
 - Windows 10/11（脚本里的 PowerShell 子进程启动只在 Windows 上验证过；Linux 走 bash 路径理论可行但本仓库默认配置是 Windows）
 
 ### 仅运行回放（最简路径）

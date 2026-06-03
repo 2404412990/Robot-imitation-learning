@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
@@ -30,6 +31,11 @@ public class StreamReceiver : MonoBehaviour
     [SerializeField] private RawImage gmrRawImage;
     [SerializeField] private Color placeholderColor = new Color(0.15f, 0.15f, 0.15f);
 
+    [Header("Aspect")]
+    [SerializeField] private bool preserveIncomingAspect = true;
+    [SerializeField] private bool resizeRawImageRect = true;
+    [SerializeField] private float maxTextureApplyFps = 30f;
+
     [Header("调试")]
     [SerializeField] private bool logFrameReceive;
 
@@ -47,6 +53,36 @@ public class StreamReceiver : MonoBehaviour
 
     private Texture2D _whamTex;
     private Texture2D _gmrTex;
+    private float _nextWhamApplyTime;
+    private float _nextGmrApplyTime;
+    private readonly Dictionary<RawImage, Vector2> _initialImageSizes = new Dictionary<RawImage, Vector2>();
+    private readonly ConcurrentQueue<QueuedStreamLog> _logQueue = new ConcurrentQueue<QueuedStreamLog>();
+
+    private enum QueuedStreamLogType
+    {
+        Log,
+        Warning,
+        Error
+    }
+
+    private struct QueuedStreamLog
+    {
+        public readonly string Message;
+        public readonly QueuedStreamLogType Type;
+
+        public QueuedStreamLog(string message, QueuedStreamLogType type)
+        {
+            Message = message;
+            Type = type;
+        }
+    }
+
+    void Awake()
+    {
+        CacheInitialRawImageSize(whamRawImage);
+        CacheInitialRawImageSize(gmrRawImage);
+        ShowPlaceholder();
+    }
 
     /// <summary>当前是否有客户端连着。</summary>
     public bool HasClient
@@ -60,6 +96,7 @@ public class StreamReceiver : MonoBehaviour
     void OnEnable()
     {
         _running = true;
+        ShowPlaceholder();
         StartListener();
     }
 
@@ -71,25 +108,44 @@ public class StreamReceiver : MonoBehaviour
 
     void Update()
     {
+        FlushLogQueue();
+
+        byte[] whamToApply = null;
+        byte[] gmrToApply = null;
+        float now = Time.unscaledTime;
+        float interval = maxTextureApplyFps > 0.0f ? 1.0f / maxTextureApplyFps : 0.0f;
+
         lock (_lock)
         {
-            if (_whamDirty && _pendingWham != null)
+            if (_whamDirty && _pendingWham != null && now >= _nextWhamApplyTime)
             {
-                ApplyJpg(ref _whamTex, _pendingWham, whamRawImage);
+                whamToApply = _pendingWham;
                 _pendingWham = null;
                 _whamDirty = false;
+                _nextWhamApplyTime = now + interval;
             }
-            if (_gmrDirty && _pendingGmr != null)
+            if (_gmrDirty && _pendingGmr != null && now >= _nextGmrApplyTime)
             {
-                ApplyJpg(ref _gmrTex, _pendingGmr, gmrRawImage);
+                gmrToApply = _pendingGmr;
                 _pendingGmr = null;
                 _gmrDirty = false;
+                _nextGmrApplyTime = now + interval;
             }
         }
 
-        // 清理断开的客户端
+        if (whamToApply != null)
+        {
+            ApplyJpg(ref _whamTex, whamToApply, whamRawImage);
+        }
+        if (gmrToApply != null)
+        {
+            ApplyJpg(ref _gmrTex, gmrToApply, gmrRawImage);
+        }
+
         lock (_lock)
+        {
             _activeClients.RemoveAll(c => !c.Connected);
+        }
     }
 
     // ── 监听 ──────────────────────────────────────────────────────────────
@@ -98,7 +154,9 @@ public class StreamReceiver : MonoBehaviour
     {
         try
         {
+            StopListener();
             _listener = new TcpListener(IPAddress.Parse(bindAddress), port);
+            _listener.Server.NoDelay = true;
             _listener.Start();
             Debug.Log($"[StreamRecv] 开始监听 {bindAddress}:{port}");
 
@@ -120,6 +178,16 @@ public class StreamReceiver : MonoBehaviour
         lock (_lock) _activeClients.Clear();
         try { _listener?.Stop(); } catch { }
         _listener = null;
+        if (_acceptThread != null)
+        {
+            try
+            {
+                if (_acceptThread.IsAlive)
+                    _acceptThread.Join(500);
+            }
+            catch { }
+            _acceptThread = null;
+        }
     }
 
     void AcceptLoop()
@@ -140,7 +208,7 @@ public class StreamReceiver : MonoBehaviour
                 };
                 t.Start();
 
-                Debug.Log($"[StreamRecv] 客户端已连接 ({client.Client.RemoteEndPoint})");
+                EnqueueLog($"[StreamRecv] client connected ({client.Client.RemoteEndPoint})");
             }
             catch (SocketException)
             {
@@ -150,7 +218,7 @@ public class StreamReceiver : MonoBehaviour
             catch (ObjectDisposedException) { break; }
             catch (Exception e)
             {
-                Debug.LogWarning($"[StreamRecv] Accept 异常: {e.Message}");
+                EnqueueLog($"[StreamRecv] Accept error: {e.Message}", QueuedStreamLogType.Warning);
                 Thread.Sleep(200);
             }
         }
@@ -190,13 +258,13 @@ public class StreamReceiver : MonoBehaviour
                 }
 
                 if (logFrameReceive)
-                    Debug.Log($"[StreamRecv] #{streamId} {jpgLen}B");
+                    EnqueueLog($"[StreamRecv] #{streamId} {jpgLen}B");
             }
             catch (IOException) { break; }
             catch (SocketException) { break; }
             catch (Exception e)
             {
-                Debug.LogWarning($"[StreamRecv] 客户端读取异常: {e.Message}");
+                EnqueueLog($"[StreamRecv] client read error: {e.Message}", QueuedStreamLogType.Warning);
                 break;
             }
         }
@@ -205,7 +273,7 @@ public class StreamReceiver : MonoBehaviour
         lock (_lock) _activeClients.Remove(client);
         try { stream?.Close(); } catch { }
         try { client.Close(); } catch { }
-        Debug.Log("[StreamRecv] 客户端已断开");
+        EnqueueLog("[StreamRecv] client disconnected");
     }
 
     // ── 辅助 ──────────────────────────────────────────────────────────────
@@ -222,14 +290,76 @@ public class StreamReceiver : MonoBehaviour
         return true;
     }
 
-    static void ApplyJpg(ref Texture2D tex, byte[] jpg, RawImage image)
+    void ApplyJpg(ref Texture2D tex, byte[] jpg, RawImage image)
     {
         if (image == null) return;
         if (tex == null)
             tex = new Texture2D(2, 2, TextureFormat.RGB24, false);
 
         if (tex.LoadImage(jpg))
+        {
             image.texture = tex;
+            image.color = Color.white;
+            FitRawImageToTexture(image, tex.width, tex.height);
+        }
+    }
+
+    private void EnqueueLog(string message, QueuedStreamLogType type = QueuedStreamLogType.Log)
+    {
+        _logQueue.Enqueue(new QueuedStreamLog(message, type));
+    }
+
+    private void FlushLogQueue()
+    {
+        for (int i = 0; i < 50 && _logQueue.TryDequeue(out QueuedStreamLog item); i++)
+        {
+            switch (item.Type)
+            {
+                case QueuedStreamLogType.Warning:
+                    Debug.LogWarning(item.Message);
+                    break;
+                case QueuedStreamLogType.Error:
+                    Debug.LogError(item.Message);
+                    break;
+                default:
+                    Debug.Log(item.Message);
+                    break;
+            }
+        }
+    }
+
+    void CacheInitialRawImageSize(RawImage image)
+    {
+        if (image == null || image.rectTransform == null) return;
+        if (_initialImageSizes.ContainsKey(image)) return;
+
+        Vector2 size = image.rectTransform.sizeDelta;
+        if (size.x > 0.0f && size.y > 0.0f)
+        {
+            _initialImageSizes.Add(image, size);
+        }
+    }
+
+    void FitRawImageToTexture(RawImage image, int width, int height)
+    {
+        if (!preserveIncomingAspect || !resizeRawImageRect) return;
+        if (image == null || image.rectTransform == null || width <= 0 || height <= 0) return;
+
+        CacheInitialRawImageSize(image);
+        Vector2 box;
+        if (!_initialImageSizes.TryGetValue(image, out box) || box.x <= 0.0f || box.y <= 0.0f)
+        {
+            box = new Vector2(width, height);
+        }
+
+        float frameAspect = width / (float)height;
+        float boxAspect = box.x / box.y;
+        Vector2 fittedSize = frameAspect >= boxAspect
+            ? new Vector2(box.x, box.x / frameAspect)
+            : new Vector2(box.y * frameAspect, box.y);
+
+        image.rectTransform.SetSizeWithCurrentAnchors(RectTransform.Axis.Horizontal, fittedSize.x);
+        image.rectTransform.SetSizeWithCurrentAnchors(RectTransform.Axis.Vertical, fittedSize.y);
     }
 
     public void ShowPlaceholder()

@@ -1,8 +1,11 @@
 using System.Collections;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.Text;
+using System.Threading;
 using TMPro;
 using UnityEngine;
 using UnityEngine.UI;
@@ -32,6 +35,10 @@ public class StartInput : MonoBehaviour
     [SerializeField] private bool recordGmrVideo = true;
     [SerializeField] private bool recordWhamVideo = true;
     [SerializeField] private bool track = true;  // Alias for --camera_follow
+    [SerializeField] private bool enableTcpStreaming = true;
+    [Tooltip("When TCP streaming is enabled, do not also open/write WHAM/GMR preview videos. TCP frames still render offscreen for Unity.")]
+    [SerializeField] private bool disablePreviewVideoWhenTcpStreaming = true;
+    [Tooltip("Input video path passed to run.ps1. Defaults to an examples video instead of webcam input.")]
     [SerializeField] private string videoPath = "examples/IMG_9732.mov";
 
     [Header("WHAM Performance")]
@@ -62,6 +69,12 @@ public class StartInput : MonoBehaviour
     [SerializeField] private TMP_Dropdown roboListDropdown;
     [SerializeField] private FileBrowser roboListFileBrowser;
     [SerializeField] private string roboListObjectName = "RoboList";
+
+    [Header("CsvList")]
+    [SerializeField] private TMP_Dropdown csvListDropdown;
+    [SerializeField] private FileBrowser csvListFileBrowser;
+    [SerializeField] private string csvListObjectName = "CsvList";
+    [SerializeField] private bool filterCsvListByRobot = true;
 
     [Tooltip("When the RoboList dropdown selection changes at runtime, stop the running " +
              "WHAM/GMR pipeline (the CSV format is robot-specific so it must be restarted) " +
@@ -102,7 +115,21 @@ public class StartInput : MonoBehaviour
     [SerializeField] private bool monitorCsvOnClick = true;
     [SerializeField] private float csvPollInterval = 0.1f;
     [SerializeField] private bool restartEpisodeOnFirstCsv = true;
-    [SerializeField] private bool keepReplayProgressOnCsvUpdate = true;
+    [Tooltip("Wait for this many 30fps source rows before starting live Unity playback.")]
+    [SerializeField] private int realtimeWarmupSourceRows = 6;
+    [Tooltip("Maximum realtime CSV batches applied on the Unity main thread per frame.")]
+    [SerializeField] private int maxRealtimeCsvBatchesPerFrame = 4;
+    [Tooltip("Maximum queued pipeline log lines emitted to the Unity console per frame.")]
+    [SerializeField] private int maxUnityLogMessagesPerFrame = 80;
+
+    [Header("Debug")]
+    [SerializeField] private bool verboseDebugLogging = true;
+    [SerializeField] private bool logCsvChangeEvents = true;
+    [SerializeField] private bool logReferenceResolution = false;
+    [SerializeField] private bool writeDebugLogFile = true;
+    [SerializeField] private string debugLogFileName = "unity_startinput.log";
+    [Tooltip("Warn if the Python pipeline has started but live_motion.csv remains empty for this many seconds.")]
+    [SerializeField] private float csvNoDataWarningSeconds = 10f;
 
     [Tooltip("Optional explicit target. When left empty, the agent matching the currently selected " +
              "robot in the RoboList dropdown is looked up from MimicAgentRegistry at runtime.")]
@@ -120,6 +147,29 @@ public class StartInput : MonoBehaviour
     private string resolvedCsvPath = string.Empty;
     private string resolvedOutputRootPath = string.Empty;
     private bool csvMissingLogged;
+    private System.DateTime csvMonitorStartUtc = System.DateTime.MinValue;
+    private System.DateTime lastCsvNoDataWarningUtc = System.DateTime.MinValue;
+    private bool firstNonEmptyCsvLogged;
+    private bool initialRobotSelectionApplied;
+    private long csvReadOffset;
+    private string csvPendingText = string.Empty;
+    private int realtimeSourceRowsRead;
+    private readonly List<float[]> pendingRealtimeRows = new List<float[]>();
+    private IRealtimeCsvMimicAgent activeRealtimeCsvAgent;
+    private IMimicAgent activeRealtimeMimicAgent;
+    private Thread csvWorkerThread;
+    private volatile bool csvWorkerRunning;
+    private volatile bool isStoppingPipeline;
+    private readonly object processStateLock = new object();
+    private readonly ConcurrentQueue<List<float[]>> realtimeCsvRowsQueue = new ConcurrentQueue<List<float[]>>();
+    private readonly ConcurrentQueue<string> realtimeCsvResetQueue = new ConcurrentQueue<string>();
+    private readonly ConcurrentQueue<QueuedUnityLog> unityLogQueue = new ConcurrentQueue<QueuedUnityLog>();
+    private readonly ConcurrentQueue<string> debugLogQueue = new ConcurrentQueue<string>();
+    private readonly object debugLogWriterLock = new object();
+    private readonly AutoResetEvent debugLogSignal = new AutoResetEvent(false);
+    private Thread debugLogWriterThread;
+    private volatile bool debugLogWriterRunning;
+    private string resolvedDebugLogPath = string.Empty;
 
     private static readonly HashSet<string> SupportedRobotNames = new HashSet<string>
     {
@@ -138,6 +188,7 @@ public class StartInput : MonoBehaviour
         "berkeley_humanoid_lite",
         "booster_k1",
         "pnd_adam_lite",
+        "x02lite",
         "openloong",
         "tienkung",
         "fourier_gr3",
@@ -151,8 +202,30 @@ public class StartInput : MonoBehaviour
         { "G1H",  "unitree_g1_with_hands" },
         { "H1",   "unitree_h1" },
         { "H1_2", "unitree_h1_2" },
+        { "X02", "x02lite" },
+        { "X02Lite", "x02lite" },
+        { "OpenLoong", "openloong" },
         { "T1",   "booster_t1" },
     };
+
+    private enum QueuedUnityLogType
+    {
+        Log,
+        Warning,
+        Error,
+    }
+
+    private struct QueuedUnityLog
+    {
+        public readonly string Message;
+        public readonly QueuedUnityLogType Type;
+
+        public QueuedUnityLog(string message, QueuedUnityLogType type)
+        {
+            Message = message;
+            Type = type;
+        }
+    }
 
     public string BashWorkingDirectory
     {
@@ -160,22 +233,343 @@ public class StartInput : MonoBehaviour
         set => bashWorkingDirectory = value ?? string.Empty;
     }
 
+    private void LogVerbose(string message)
+    {
+        if (!verboseDebugLogging) return;
+        string line = "[StartInput/Debug] " + message;
+        Debug.Log(line);
+        AppendDebugLogLine(line);
+    }
+
+    private void QueueUnityLog(string message, QueuedUnityLogType type = QueuedUnityLogType.Log)
+    {
+        unityLogQueue.Enqueue(new QueuedUnityLog(message, type));
+        AppendDebugLogLine(message);
+    }
+
+    private void FlushUnityLogQueue()
+    {
+        int maxLogs = Mathf.Max(1, maxUnityLogMessagesPerFrame);
+        for (int i = 0; i < maxLogs && unityLogQueue.TryDequeue(out QueuedUnityLog item); i++)
+        {
+            switch (item.Type)
+            {
+                case QueuedUnityLogType.Warning:
+                    Debug.LogWarning(item.Message);
+                    break;
+                case QueuedUnityLogType.Error:
+                    Debug.LogError(item.Message);
+                    break;
+                default:
+                    Debug.Log(item.Message);
+                    break;
+            }
+        }
+    }
+
+    private void AppendDebugLogLine(string message)
+    {
+        if (!writeDebugLogFile)
+        {
+            return;
+        }
+
+        try
+        {
+            if (string.IsNullOrWhiteSpace(resolvedDebugLogPath))
+            {
+                resolvedDebugLogPath = ResolveDebugLogPath();
+                if (string.IsNullOrWhiteSpace(resolvedDebugLogPath))
+                {
+                    return;
+                }
+            }
+
+            EnsureDebugLogWriter();
+            debugLogQueue.Enqueue($"{System.DateTime.Now:O} {message}");
+            debugLogSignal.Set();
+        }
+        catch
+        {
+            // Logging must never break Start/Stop.
+        }
+    }
+
+    private void EnsureDebugLogWriter()
+    {
+        if (!writeDebugLogFile || string.IsNullOrWhiteSpace(resolvedDebugLogPath))
+        {
+            return;
+        }
+
+        lock (debugLogWriterLock)
+        {
+            if (debugLogWriterThread != null && debugLogWriterThread.IsAlive)
+            {
+                return;
+            }
+
+            debugLogWriterRunning = true;
+            debugLogWriterThread = new Thread(DebugLogWriterLoop)
+            {
+                Name = "StartInput-DebugLogWriter",
+                IsBackground = true
+            };
+            debugLogWriterThread.Start();
+        }
+    }
+
+    private void DebugLogWriterLoop()
+    {
+        var batch = new List<string>(128);
+        while (debugLogWriterRunning || !debugLogQueue.IsEmpty)
+        {
+            batch.Clear();
+            while (batch.Count < 128 && debugLogQueue.TryDequeue(out string line))
+            {
+                batch.Add(line);
+            }
+
+            if (batch.Count > 0)
+            {
+                try
+                {
+                    string path = resolvedDebugLogPath;
+                    if (!string.IsNullOrWhiteSpace(path))
+                    {
+                        string dir = Path.GetDirectoryName(path);
+                        if (!string.IsNullOrWhiteSpace(dir))
+                        {
+                            Directory.CreateDirectory(dir);
+                        }
+
+                        File.AppendAllLines(path, batch, Encoding.UTF8);
+                    }
+                }
+                catch
+                {
+                    // Logging must never break Start/Stop.
+                }
+
+                continue;
+            }
+
+            debugLogSignal.WaitOne(250);
+        }
+    }
+
+    private void StopDebugLogWriter()
+    {
+        debugLogWriterRunning = false;
+        debugLogSignal.Set();
+        Thread writer = debugLogWriterThread;
+        if (writer != null && writer.IsAlive)
+        {
+            try { writer.Join(500); } catch { }
+        }
+        debugLogWriterThread = null;
+    }
+
+    private void ResetDebugLogFile()
+    {
+        if (!writeDebugLogFile)
+        {
+            return;
+        }
+
+        try
+        {
+            string path = ResolveDebugLogPath();
+            if (string.IsNullOrWhiteSpace(path))
+            {
+                return;
+            }
+
+            resolvedDebugLogPath = path;
+            string dir = Path.GetDirectoryName(path);
+            if (!string.IsNullOrWhiteSpace(dir))
+            {
+                Directory.CreateDirectory(dir);
+            }
+
+            File.WriteAllText(path, $"{System.DateTime.Now:O} [StartInput] debug log reset{System.Environment.NewLine}", Encoding.UTF8);
+            EnsureDebugLogWriter();
+        }
+        catch
+        {
+            // Logging must never break Start/Stop.
+        }
+    }
+
+    private string ResolveDebugLogPath()
+    {
+        string logName = string.IsNullOrWhiteSpace(debugLogFileName)
+            ? "unity_startinput.log"
+            : debugLogFileName.Trim();
+
+        if (Path.IsPathRooted(logName))
+        {
+            return Path.GetFullPath(logName);
+        }
+
+        string outputRootPath = resolvedOutputRootPath;
+        if (string.IsNullOrWhiteSpace(outputRootPath))
+        {
+            string workingDir = ResolveWorkingDirectoryPath();
+            outputRootPath = ResolveOutputRootAbsolutePath(workingDir);
+        }
+
+        if (string.IsNullOrWhiteSpace(outputRootPath))
+        {
+            return string.Empty;
+        }
+
+        return ResolvePathFromBaseDirectory(logName, outputRootPath);
+    }
+
+    [ContextMenu("Dump StartInput Debug State")]
+    private void DumpDebugState()
+    {
+        ResolveRoboListReferences();
+        ResolveCsvListReferences();
+
+        string selectedRaw = ResolveSelectedRobotName();
+        string selectedKey = TryResolveRobotKeyQuiet(selectedRaw);
+        string workingDir = ResolveWorkingDirectoryPath();
+        string outputRootAbs = ResolveOutputRootAbsolutePath(workingDir);
+        string csvAbs = ResolveCsvAbsolutePath();
+        string resolvedVideo = ResolveVideoPath(workingDir);
+
+        IMimicAgent resolvedAgent = null;
+        if (!string.IsNullOrWhiteSpace(selectedKey) && MimicAgentRegistry.Instance != null)
+        {
+            resolvedAgent = MimicAgentRegistry.Instance.FindByKey(selectedKey);
+        }
+
+        var sb = new StringBuilder();
+        sb.AppendLine("[StartInput/Debug] State Snapshot");
+        sb.AppendLine($"  GameObject: {gameObject.name}");
+        sb.AppendLine($"  enabled: {enabled}, activeInHierarchy: {gameObject.activeInHierarchy}");
+        sb.AppendLine($"  selectedRaw: '{selectedRaw}'");
+        sb.AppendLine($"  selectedKey: '{selectedKey}'");
+        sb.AppendLine($"  defaultRobotName: '{defaultRobotName}'");
+        sb.AppendLine($"  runBashOnClick: {runBashOnClick}, monitorCsvOnClick: {monitorCsvOnClick}, tcp: {enableTcpStreaming}");
+        sb.AppendLine($"  bashExecutable: {bashExecutable}");
+        sb.AppendLine($"  bashScriptPath: {bashScriptPath}");
+        sb.AppendLine($"  bashWorkingDirectory: {bashWorkingDirectory}");
+        sb.AppendLine($"  resolvedWorkingDirectory: {workingDir}");
+        sb.AppendLine($"  outputRoot: {outputRoot}");
+        sb.AppendLine($"  resolvedOutputRootPath: {resolvedOutputRootPath}");
+        sb.AppendLine($"  resolvedOutputRootAbsolute: {outputRootAbs}");
+        sb.AppendLine($"  outputCsvFileName: {outputCsvFileName}");
+        sb.AppendLine($"  resolvedCsvPath: {resolvedCsvPath}");
+        sb.AppendLine($"  resolvedCsvAbsolute: {csvAbs}");
+        sb.AppendLine($"  videoPath: {videoPath}");
+        sb.AppendLine($"  resolvedVideoPath: {resolvedVideo}");
+        sb.AppendLine($"  monitorRunning: {monitorCoroutine != null}");
+        sb.AppendLine($"  csvExists: {!string.IsNullOrWhiteSpace(csvAbs) && File.Exists(csvAbs)}");
+        sb.AppendLine($"  csvNoDataWarningSeconds: {csvNoDataWarningSeconds}");
+        sb.AppendLine($"  replayBootstrapped: {replayBootstrapped}");
+        sb.AppendLine($"  lastCsvLength: {lastCsvLength}");
+        sb.AppendLine($"  lastCsvWriteTimeUtc: {lastCsvWriteTimeUtc:O}");
+        sb.AppendLine($"  startButtonBound: {startButton != null}, runtimeListenerAdded: {addedRuntimeListener}");
+        bool processAlive = false;
+        string processIdText = "<null>";
+        if (pythonProcess != null)
+        {
+            try
+            {
+                processAlive = !pythonProcess.HasExited;
+                processIdText = pythonProcess.Id.ToString();
+            }
+            catch (System.Exception e)
+            {
+                processIdText = "<unavailable: " + e.Message + ">";
+            }
+        }
+        sb.AppendLine($"  processAlive: {processAlive}");
+        sb.AppendLine($"  processId: {processIdText}");
+        sb.AppendLine($"  resolvedAgent: {(resolvedAgent != null ? resolvedAgent.RobotKey + " / " + resolvedAgent.AgentGameObject?.name : "<null>")}");
+        sb.AppendLine($"  targetAgentField: {(targetAgent != null ? targetAgent.RobotKey + " / " + targetAgent.AgentGameObject?.name : "<null>")}");
+        sb.AppendLine($"  registryAvailable: {MimicAgentRegistry.Instance != null}");
+
+        if (roboListDropdown != null && roboListDropdown.options != null)
+        {
+            sb.AppendLine($"  roboList options: {roboListDropdown.options.Count}, value: {roboListDropdown.value}");
+        }
+
+        if (csvListDropdown != null && csvListDropdown.options != null)
+        {
+            sb.AppendLine($"  csvList options: {csvListDropdown.options.Count}, value: {csvListDropdown.value}");
+        }
+
+        if (csvListFileBrowser != null)
+        {
+            sb.AppendLine($"  csvList selectedPath: {csvListFileBrowser.GetSelectedCsvPath()}");
+        }
+
+        Debug.Log(sb.ToString());
+    }
+
     void Awake()
     {
-        startButton = GetComponent<Button>();
-        if (startButton != null && !HasPersistentStartHandler(startButton))
-        {
-            startButton.onClick.AddListener(OnStartButtonClicked);
-            addedRuntimeListener = true;
-        }
+        EnsureStartButtonListener();
+        LogVerbose($"Awake: runBashOnClick={runBashOnClick}, monitorCsvOnClick={monitorCsvOnClick}, defaultRobotName='{defaultRobotName}', tcp={enableTcpStreaming}");
 
         // Attach onValueChanged on the RoboList dropdown so switching the
         // selection mid-session retargets to the newly chosen robot.
         ResolveRoboListReferences();
-        if (roboListDropdown != null && switchActiveRobotOnDropdownChange)
+        if (roboListDropdown != null && (switchActiveRobotOnDropdownChange || filterCsvListByRobot))
         {
             roboListDropdown.onValueChanged.RemoveListener(OnRoboListChanged);
             roboListDropdown.onValueChanged.AddListener(OnRoboListChanged);
+        }
+
+        RefreshCsvListForSelectedRobot();
+    }
+
+    private IEnumerator Start()
+    {
+        LogVerbose("Start coroutine entered; waiting one frame before applying initial robot selection.");
+        yield return null;
+        ApplyInitialRobotSelectionState();
+    }
+
+    void OnEnable()
+    {
+        EnsureStartButtonListener();
+        LogVerbose($"OnEnable: initialRobotSelectionApplied={initialRobotSelectionApplied}, activeInHierarchy={gameObject.activeInHierarchy}");
+
+        if (!initialRobotSelectionApplied && isActiveAndEnabled)
+        {
+            StartCoroutine(ApplyInitialRobotSelectionStateNextFrame());
+        }
+    }
+
+    void Update()
+    {
+        FlushUnityLogQueue();
+        ConsumeRealtimeCsvQueues();
+    }
+
+    private void ConsumeRealtimeCsvQueues()
+    {
+        bool resetSeen = false;
+        while (realtimeCsvResetQueue.TryDequeue(out string reason))
+        {
+            resetSeen = true;
+            ResetRealtimeCsvReader(reason);
+        }
+
+        if (resetSeen)
+        {
+            while (realtimeCsvRowsQueue.TryDequeue(out _)) { }
+        }
+
+        int maxBatches = Mathf.Max(1, maxRealtimeCsvBatchesPerFrame);
+        for (int i = 0; i < maxBatches && realtimeCsvRowsQueue.TryDequeue(out List<float[]> rows); i++)
+        {
+            ApplyRealtimeCsvRows(rows);
         }
     }
 
@@ -192,12 +586,9 @@ public class StartInput : MonoBehaviour
         }
 
         StopCsvMonitor();
-        StopBashProcess();
+        StopBashProcessBlocking(clearCsvOnExit ? ResolveCsvAbsolutePath() : string.Empty);
 
-        if (clearCsvOnExit)
-        {
-            TryClearCsv("OnDestroy");
-        }
+        StopDebugLogWriter();
     }
 
     // -------------------------------------------------------------------------
@@ -213,12 +604,14 @@ public class StartInput : MonoBehaviour
     /// </summary>
     private void OnRoboListChanged(int newIndex)
     {
-        if (!switchActiveRobotOnDropdownChange) return;
         if (roboListDropdown == null || roboListDropdown.options == null) return;
         if (newIndex < 0 || newIndex >= roboListDropdown.options.Count) return;
 
         string newLabel = roboListDropdown.options[newIndex].text;
         string newKey   = TryResolveRobotKeyQuiet(newLabel);
+        RefreshCsvListForSelectedRobot(newKey, newLabel);
+
+        if (!switchActiveRobotOnDropdownChange) return;
         if (string.IsNullOrWhiteSpace(newKey))
         {
             // Label is not a WHAM/GMR-supported robot key. We still apply the
@@ -490,38 +883,183 @@ public class StartInput : MonoBehaviour
         Debug.Log($"[StartInput] 可见性切换 (Renderer mode)：显示 {shown} 个，隐藏 {hidden} 个 → 当前 '{selectedLabel}'。");
     }
 
+    private IEnumerator ApplyInitialRobotSelectionStateNextFrame()
+    {
+        yield return null;
+        ApplyInitialRobotSelectionState();
+    }
+
+    private void ApplyInitialRobotSelectionState()
+    {
+        if (initialRobotSelectionApplied)
+        {
+            return;
+        }
+
+        ResolveRoboListReferences();
+        ResolveCsvListReferences();
+
+        if (roboListFileBrowser != null)
+        {
+            roboListFileBrowser.PopulateDropdown();
+        }
+
+        string selectedLabel = ResolveSelectedRobotName();
+        string selectedKey = TryResolveRobotKeyQuiet(selectedLabel);
+
+        if ((string.IsNullOrWhiteSpace(selectedLabel) || string.IsNullOrWhiteSpace(selectedKey)) &&
+            TrySelectRoboListOption(defaultRobotName))
+        {
+            selectedLabel = ResolveSelectedRobotName();
+            selectedKey = TryResolveRobotKeyQuiet(selectedLabel);
+        }
+
+        if (string.IsNullOrWhiteSpace(selectedLabel))
+        {
+            selectedLabel = defaultRobotName.Trim();
+        }
+
+        if (string.IsNullOrWhiteSpace(selectedKey))
+        {
+            selectedKey = TryResolveRobotKeyQuiet(defaultRobotName);
+        }
+
+        RefreshCsvListForSelectedRobot(selectedKey, selectedLabel);
+
+        if (!string.IsNullOrWhiteSpace(selectedLabel) || !string.IsNullOrWhiteSpace(selectedKey))
+        {
+            ApplyRobotVisibility(selectedLabel, selectedKey);
+            Debug.Log($"[StartInput] Initial robot selection applied: label='{selectedLabel}', key='{selectedKey}'.");
+        }
+        else
+        {
+            LogVerbose("ApplyInitialRobotSelectionState: no label/key resolved.");
+        }
+
+        initialRobotSelectionApplied = true;
+    }
+
+    private bool TrySelectRoboListOption(string robotKeyOrLabel)
+    {
+        if (roboListDropdown == null || roboListDropdown.options == null || roboListDropdown.options.Count == 0)
+        {
+            return false;
+        }
+
+        string desired = (robotKeyOrLabel ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(desired))
+        {
+            return false;
+        }
+
+        string desiredKey = TryResolveRobotKeyQuiet(desired);
+        for (int i = 0; i < roboListDropdown.options.Count; i++)
+        {
+            string optionText = roboListDropdown.options[i].text?.Trim() ?? string.Empty;
+            if (string.Equals(optionText, desired, System.StringComparison.OrdinalIgnoreCase))
+            {
+                roboListDropdown.SetValueWithoutNotify(i);
+                roboListDropdown.RefreshShownValue();
+                LogVerbose($"TrySelectRoboListOption: matched desired='{desired}' with option='{optionText}' at index={i}");
+                return true;
+            }
+
+            string optionKey = TryResolveRobotKeyQuiet(optionText);
+            if (!string.IsNullOrWhiteSpace(desiredKey) &&
+                string.Equals(optionKey, desiredKey, System.StringComparison.OrdinalIgnoreCase))
+            {
+                roboListDropdown.SetValueWithoutNotify(i);
+                roboListDropdown.RefreshShownValue();
+                LogVerbose($"TrySelectRoboListOption: matched desiredKey='{desiredKey}' with option='{optionText}' at index={i}");
+                return true;
+            }
+        }
+
+        LogVerbose($"TrySelectRoboListOption: no match for '{desired}' (desiredKey='{desiredKey}').");
+        return false;
+    }
+
     // Called by Unity when the application is quitting (covers editor Stop, build exit, and
     // OS-level termination signals that Unity intercepts).
     void OnApplicationQuit()
     {
         StopCsvMonitor();
-        StopBashProcess();
-
-        if (clearCsvOnExit)
-        {
-            TryClearCsv("OnApplicationQuit");
-        }
+        StopBashProcessBlocking(clearCsvOnExit ? ResolveCsvAbsolutePath() : string.Empty);
+        StopDebugLogWriter();
     }
 
     public void OnStartButtonClicked()
     {
-        if (runBashOnClick)
+        if (isStoppingPipeline)
         {
-            StartOrRestartBashProcess();
+            Debug.LogWarning("[StartInput] Start ignored because the previous retargeting pipeline is still stopping.");
+            return;
         }
 
-        if (monitorCsvOnClick)
+        ApplyInitialRobotSelectionState();
+        string selectedRaw = ResolveSelectedRobotName();
+        string selectedKey = TryResolveRobotKeyQuiet(selectedRaw);
+        Debug.LogWarning("[StartInput] Start button clicked.");
+        AppendDebugLogLine("[StartInput] Start button clicked.");
+        LogVerbose($"Start click: selectedRaw='{selectedRaw}', selectedKey='{selectedKey}', runBashOnClick={runBashOnClick}, monitorCsvOnClick={monitorCsvOnClick}");
+
+        bool launchOk = true;
+        if (runBashOnClick)
         {
-            StartCsvMonitor();
+            launchOk = StartOrRestartBashProcess();
         }
+
+        bool monitorOk = true;
+        if (monitorCsvOnClick && (!runBashOnClick || launchOk))
+        {
+            monitorOk = StartCsvMonitor();
+        }
+        else if (monitorCsvOnClick && !launchOk)
+        {
+            monitorOk = false;
+        }
+
+        if (launchOk && monitorOk && monitorCsvOnClick)
+        {
+            SetRealtimeDropdownsInteractable(false);
+        }
+        else
+        {
+            SetRealtimeDropdownsInteractable(true);
+            if (launchOk && runBashOnClick && !monitorOk)
+            {
+                StopBashProcessAsync(null);
+            }
+        }
+    }
+
+    private void EnsureStartButtonListener()
+    {
+        if (startButton == null)
+        {
+            startButton = GetComponent<Button>();
+        }
+
+        if (startButton == null || HasPersistentStartHandler(startButton))
+        {
+            return;
+        }
+
+        startButton.onClick.RemoveListener(OnStartButtonClicked);
+        startButton.onClick.AddListener(OnStartButtonClicked);
+        addedRuntimeListener = true;
+        LogVerbose($"EnsureStartButtonListener: listener bound on '{gameObject.name}'.");
     }
 
     public void StopStartPipeline()
     {
         StopCsvMonitor();
-        StopBashProcess();
+        EndActiveRealtimeCsv();
+        SetRealtimeDropdownsInteractable(true);
 
-        if (clearCsvOnExit)
+        string csvToClear = clearCsvOnExit ? ResolveCsvAbsolutePath() : string.Empty;
+        bool stopStarted = StopBashProcessAsync(csvToClear);
+        if (!stopStarted && clearCsvOnExit)
         {
             TryClearCsv("StopStartPipeline");
         }
@@ -603,24 +1141,27 @@ public class StartInput : MonoBehaviour
         return false;
     }
 
-    private void StartOrRestartBashProcess()
+    private bool StartOrRestartBashProcess()
     {
         if (pythonProcess != null && !pythonProcess.HasExited)
         {
+            LogVerbose($"StartOrRestartBashProcess: existing process alive pid={pythonProcess.Id}, restartBashIfRunning={restartBashIfRunning}");
             if (!restartBashIfRunning)
             {
                 Debug.Log("Bash 进程已在运行，跳过重复启动。");
-                return;
+                return true;
+
             }
 
-            StopBashProcess();
+            StopBashProcessBlocking(null);
         }
 
         string resolvedWorkingDir = ResolveWorkingDirectoryPath();
         if (string.IsNullOrWhiteSpace(resolvedWorkingDir) || !Directory.Exists(resolvedWorkingDir))
         {
             Debug.LogError($"Bash 工作目录无效: {resolvedWorkingDir}");
-            return;
+            return false;
+
         }
 
         string executable = (bashExecutable ?? string.Empty).Trim();
@@ -630,7 +1171,8 @@ public class StartInput : MonoBehaviour
         if (string.IsNullOrWhiteSpace(executable))
         {
             Debug.LogError("bashExecutable 为空，无法启动 Bash 命令。");
-            return;
+            return false;
+
         }
 
         string selectedRobot = ResolveSelectedRobotName();
@@ -642,21 +1184,24 @@ public class StartInput : MonoBehaviour
         if (string.IsNullOrWhiteSpace(selectedRobot))
         {
             Debug.LogError("未能解析 RoboList 当前机器人名称，请检查下拉列表配置。");
-            return;
+            return false;
+
         }
 
         string resolvedRobot = ResolveRobotNameForWham(selectedRobot);
         if (string.IsNullOrWhiteSpace(resolvedRobot))
         {
             Debug.LogError($"当前机器人不受 WHAM 支持: {selectedRobot}");
-            return;
+            return false;
+
         }
 
         resolvedOutputRootPath = ResolveOutputRootAbsolutePath(resolvedWorkingDir);
         if (string.IsNullOrWhiteSpace(resolvedOutputRootPath))
         {
             Debug.LogError("OUTPUT_ROOT 无效，无法启动 Bash 命令。");
-            return;
+            return false;
+
         }
 
         Directory.CreateDirectory(resolvedOutputRootPath);
@@ -672,7 +1217,27 @@ public class StartInput : MonoBehaviour
         }
 
         string resolvedScriptPath = ResolveScriptPath(resolvedWorkingDir);
+        string resolvedVideoPath = ResolveVideoPath(resolvedWorkingDir);
         string commandArguments = BuildCommandArguments(executablePrefixArgs, resolvedScriptPath);
+        ResetDebugLogFile();
+        bool effectiveRecordGmrVideo = recordGmrVideo && !(enableTcpStreaming && disablePreviewVideoWhenTcpStreaming);
+        bool effectiveRecordWhamVideo = recordWhamVideo && !(enableTcpStreaming && disablePreviewVideoWhenTcpStreaming);
+        string requestedGmrTorchDevice = string.IsNullOrWhiteSpace(gmrTorchDevice) ? "cpu" : gmrTorchDevice.Trim();
+        string launchGmrTorchDevice = "cpu";
+        if (!string.Equals(requestedGmrTorchDevice, "cpu", System.StringComparison.OrdinalIgnoreCase))
+        {
+            Debug.LogWarning(
+                $"[StartInput] GMR_TORCH_DEVICE requested '{requestedGmrTorchDevice}', forcing 'cpu' for GMR postprocessing " +
+                "to avoid CUDA NVRTC architecture errors. WHAM still uses its configured CUDA device.");
+            AppendDebugLogLine($"[StartInput] GMR_TORCH_DEVICE forced cpu (requested {requestedGmrTorchDevice}).");
+        }
+
+        LogVerbose(
+            $"Resolved launch config: selectedRobot='{selectedRobot}', resolvedRobot='{resolvedRobot}', " +
+            $"workingDir='{resolvedWorkingDir}', script='{resolvedScriptPath}', outputRoot='{resolvedOutputRootPath}', " +
+            $"csv='{resolvedCsvPath}', video='{resolvedVideoPath}', tcp={enableTcpStreaming}, track={track}, " +
+            $"recordGmr={effectiveRecordGmrVideo} (raw={recordGmrVideo}), recordWham={effectiveRecordWhamVideo} (raw={recordWhamVideo}), " +
+            $"gmrTorchDevice='{launchGmrTorchDevice}' (requested='{requestedGmrTorchDevice}')");
 
         try
         {
@@ -702,9 +1267,8 @@ public class StartInput : MonoBehaviour
 
             startInfo.EnvironmentVariables["OUTPUT_ROOT"] = resolvedOutputRootPath;
             startInfo.EnvironmentVariables["ROBOT"] = resolvedRobot;
-            startInfo.EnvironmentVariables["RECORD_GMRVIDEO"] = recordGmrVideo ? "1" : "0";
-            startInfo.EnvironmentVariables["RECORD_WHAMVIDEO"] = recordWhamVideo ? "1" : "0";
-            string resolvedVideoPath = ResolveVideoPath(resolvedWorkingDir);
+            startInfo.EnvironmentVariables["RECORD_GMRVIDEO"] = effectiveRecordGmrVideo ? "1" : "0";
+            startInfo.EnvironmentVariables["RECORD_WHAMVIDEO"] = effectiveRecordWhamVideo ? "1" : "0";
             if (!string.IsNullOrWhiteSpace(resolvedVideoPath))
             {
                 startInfo.EnvironmentVariables["VIDEO"] = resolvedVideoPath;
@@ -716,53 +1280,337 @@ public class StartInput : MonoBehaviour
             startInfo.EnvironmentVariables["WHAM_INFER_INTERVAL"] = whamInferInterval.ToString();
             startInfo.EnvironmentVariables["WHAM_STREAM_SEQ_LEN"] = whamStreamSeqLen.ToString();
             startInfo.EnvironmentVariables["WHAM_INPUT_SCALE"] = whamInputScale.ToString("F3", CultureInfo.InvariantCulture);
-            startInfo.EnvironmentVariables["GMR_TORCH_DEVICE"] = string.IsNullOrWhiteSpace(gmrTorchDevice) ? "cpu" : gmrTorchDevice.Trim();
+            startInfo.EnvironmentVariables["GMR_TORCH_DEVICE"] = launchGmrTorchDevice;
             startInfo.EnvironmentVariables["TRACK"] = track ? "1" : "0";
-            pythonProcess = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
-            pythonProcess.Exited += (_, __) => Debug.Log($"Bash 进程退出，ExitCode={pythonProcess.ExitCode}");
+            startInfo.EnvironmentVariables["TCP"] = enableTcpStreaming ? "1" : "0";
+            Process process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
+            lock (processStateLock)
+            {
+                pythonProcess = process;
+            }
+
+            process.Exited += (sender, __) =>
+            {
+                var exitedProcess = sender as Process;
+                string exitCode = "<unknown>";
+                try
+                {
+                    if (exitedProcess != null)
+                    {
+                        exitCode = exitedProcess.ExitCode.ToString(CultureInfo.InvariantCulture);
+                    }
+                }
+                catch
+                {
+                    // ExitCode can throw if the process object is already disposed.
+                }
+
+                QueueUnityLog($"Bash process exited, ExitCode={exitCode}");
+            };
 
             if (logBashOutput)
             {
-                pythonProcess.OutputDataReceived += (_, args) =>
+                process.OutputDataReceived += (_, args) =>
                 {
                     if (!string.IsNullOrWhiteSpace(args.Data))
                     {
-                        Debug.Log($"[Pipeline] {args.Data}");
+                        string line = $"[Pipeline] {args.Data}";
+                        QueueUnityLog(line);
                     }
                 };
 
-                pythonProcess.ErrorDataReceived += (_, args) =>
+                process.ErrorDataReceived += (_, args) =>
                 {
                     if (!string.IsNullOrWhiteSpace(args.Data))
                     {
-                        Debug.Log($"[Pipeline-ERR] {args.Data}");
+                        string line = $"[Pipeline-ERR] {args.Data}";
+                        QueueUnityLog(line, QueuedUnityLogType.Warning);
                     }
                 };
             }
 
-            pythonProcess.Start();
+            process.Start();
+            LogVerbose($"Python process started successfully. pid={process.Id}");
 
             if (logBashOutput)
             {
-                pythonProcess.BeginOutputReadLine();
-                pythonProcess.BeginErrorReadLine();
+                process.BeginOutputReadLine();
+                process.BeginErrorReadLine();
             }
 
             Debug.Log($"已启动 Bash 命令: {executable} {commandArguments}");
-            Debug.Log("运行参数: ROBOT=" + resolvedRobot + " (raw=" + selectedRobot + "), OUTPUT_ROOT=" + resolvedOutputRootPath + ", TRACK=" + (track ? "1" : "0"));
+            string pipelineEnvLine =
+                "[StartInput] Pipeline env: " +
+                "ROBOT=" + resolvedRobot +
+                " (raw=" + selectedRobot + ")" +
+                ", VIDEO=" + (string.IsNullOrWhiteSpace(resolvedVideoPath) ? "<run.ps1 default>" : resolvedVideoPath) +
+                ", OUTPUT_ROOT=" + resolvedOutputRootPath +
+                ", CSV=" + resolvedCsvPath +
+                ", TCP=" + (enableTcpStreaming ? "1" : "0") +
+                ", TRACK=" + (track ? "1" : "0") +
+                ", RECORD_WHAMVIDEO=" + (effectiveRecordWhamVideo ? "1" : "0") +
+                ", RECORD_GMRVIDEO=" + (effectiveRecordGmrVideo ? "1" : "0");
+            Debug.LogWarning(pipelineEnvLine);
+            AppendDebugLogLine(pipelineEnvLine);
+            return true;
         }
         catch (System.Exception e)
         {
             Debug.LogError($"启动 Bash 命令失败: {e.Message}");
+            return false;
         }
     }
 
-    private void StopBashProcess()
+    private Process DetachPythonProcess()
+    {
+        lock (processStateLock)
+        {
+            Process process = pythonProcess;
+            pythonProcess = null;
+            return process;
+        }
+    }
+
+    private bool StopBashProcessAsync(string csvToClearAfterStop = null)
+    {
+        Process processToStop = DetachPythonProcess();
+        if (processToStop == null)
+        {
+            return false;
+        }
+
+        isStoppingPipeline = true;
+        QueueUnityLog($"[StopBash] Background stop started for pid={SafeProcessId(processToStop)}.");
+
+        var stopThread = new Thread(() =>
+        {
+            try
+            {
+                StopBashProcessCore(processToStop);
+                TryClearCsvPath(csvToClearAfterStop, "StopStartPipeline/background");
+            }
+            finally
+            {
+                isStoppingPipeline = false;
+                QueueUnityLog("[StopBash] Background stop completed.");
+            }
+        })
+        {
+            Name = "StartInput-StopPipeline",
+            IsBackground = true
+        };
+        stopThread.Start();
+        return true;
+    }
+
+    private void StopBashProcessBlocking(string csvToClearAfterStop = null)
+    {
+        Process processToStop = DetachPythonProcess();
+        if (processToStop == null)
+        {
+            TryClearCsvPath(csvToClearAfterStop, "StopBashProcessBlocking");
+            return;
+        }
+
+        isStoppingPipeline = true;
+        try
+        {
+            StopBashProcessCore(processToStop);
+            TryClearCsvPath(csvToClearAfterStop, "StopBashProcessBlocking");
+        }
+        finally
+        {
+            isStoppingPipeline = false;
+        }
+    }
+
+    private void StopBashProcessCore(Process processToStop)
+    {
+        if (processToStop == null)
+        {
+            return;
+        }
+
+        try
+        {
+            if (!processToStop.HasExited)
+            {
+                int pid = processToStop.Id;
+                if (System.Environment.OSVersion.Platform == System.PlatformID.Unix)
+                {
+                    KillProcessGroupLinuxQueued(pid);
+                }
+                else
+                {
+                    KillProcessTreeWindowsQueued(pid);
+                }
+
+                processToStop.WaitForExit(2000);
+            }
+        }
+        catch (System.Exception e)
+        {
+            QueueUnityLog($"[StopBash] Stop process failed: {e.Message}", QueuedUnityLogType.Warning);
+        }
+        finally
+        {
+            try { processToStop.Dispose(); } catch { }
+        }
+
+        if (System.Environment.OSVersion.Platform == System.PlatformID.Unix)
+        {
+            KillOrphansByNameQueued("demo_stream_mt");
+            KillOrphansByNameQueued("smplx_to_robot_stream");
+        }
+        else
+        {
+            KillOrphansByNameQueued("handle_wham_gmr");
+        }
+    }
+
+    private static int SafeProcessId(Process process)
+    {
+        try { return process != null ? process.Id : -1; }
+        catch { return -1; }
+    }
+
+    private void TryClearCsvPath(string csvPath, string caller)
+    {
+        if (string.IsNullOrWhiteSpace(csvPath) || !File.Exists(csvPath))
+        {
+            return;
+        }
+
+        try
+        {
+            File.Delete(csvPath);
+            QueueUnityLog($"[{caller}] live_motion.csv cleared: {csvPath}");
+        }
+        catch (System.Exception e)
+        {
+            QueueUnityLog($"[{caller}] Failed to clear live_motion.csv ({csvPath}): {e.Message}", QueuedUnityLogType.Warning);
+        }
+    }
+
+    private void KillProcessTreeWindowsQueued(int pid)
+    {
+        try
+        {
+            var killInfo = new ProcessStartInfo
+            {
+                FileName = "taskkill",
+                Arguments = $"/T /F /PID {pid}",
+                UseShellExecute = false,
+                RedirectStandardOutput = false,
+                RedirectStandardError = false,
+                CreateNoWindow = true
+            };
+
+            using (Process killer = Process.Start(killInfo))
+            {
+                killer?.WaitForExit(5000);
+            }
+
+            QueueUnityLog($"[StopBash] taskkill /T /F /PID {pid} executed");
+        }
+        catch (System.Exception e)
+        {
+            QueueUnityLog($"[StopBash] taskkill failed (pid={pid}): {e.Message}", QueuedUnityLogType.Warning);
+        }
+    }
+
+    private void KillProcessGroupLinuxQueued(int leaderPid)
+    {
+        try
+        {
+            var killInfo = new ProcessStartInfo
+            {
+                FileName = "kill",
+                Arguments = $"-9 -{leaderPid}",
+                UseShellExecute = false,
+                RedirectStandardOutput = false,
+                RedirectStandardError = false,
+                CreateNoWindow = true
+            };
+
+            using (Process killer = Process.Start(killInfo))
+            {
+                killer?.WaitForExit(3000);
+            }
+
+            QueueUnityLog($"[StopBash] kill -9 -{leaderPid} executed");
+        }
+        catch (System.Exception e)
+        {
+            QueueUnityLog($"[StopBash] kill process group failed (pgid={leaderPid}): {e.Message}", QueuedUnityLogType.Warning);
+        }
+    }
+
+    private void KillOrphansByNameQueued(string scriptNameFragment)
+    {
+        try
+        {
+            if (System.Environment.OSVersion.Platform == System.PlatformID.Unix)
+            {
+                var pkillInfo = new ProcessStartInfo
+                {
+                    FileName = "pkill",
+                    Arguments = $"-9 -f \"{scriptNameFragment}\"",
+                    UseShellExecute = false,
+                    RedirectStandardOutput = false,
+                    RedirectStandardError = false,
+                    CreateNoWindow = true
+                };
+
+                using (Process pkill = Process.Start(pkillInfo))
+                {
+                    pkill?.WaitForExit(3000);
+                }
+
+                QueueUnityLog($"[StopBash] pkill -9 -f \"{scriptNameFragment}\" executed");
+            }
+            else
+            {
+                string fragment = (scriptNameFragment ?? string.Empty).Replace("'", "''");
+                string psCommand =
+                    "$fragment = '" + fragment + "'; " +
+                    "Get-CimInstance Win32_Process -Filter \"Name = 'python.exe' OR Name = 'pythonw.exe'\" | " +
+                    "Where-Object { $_.CommandLine -like ('*' + $fragment + '*') } | " +
+                    "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }";
+                string encodedCommand = System.Convert.ToBase64String(Encoding.Unicode.GetBytes(psCommand));
+
+                var powershellInfo = new ProcessStartInfo
+                {
+                    FileName = "powershell",
+                    Arguments = "-NoProfile -ExecutionPolicy Bypass -EncodedCommand " + encodedCommand,
+                    UseShellExecute = false,
+                    RedirectStandardOutput = false,
+                    RedirectStandardError = false,
+                    CreateNoWindow = true
+                };
+
+                using (Process powershell = Process.Start(powershellInfo))
+                {
+                    powershell?.WaitForExit(5000);
+                }
+
+                QueueUnityLog($"[StopBash] PowerShell cleanup for python *{scriptNameFragment}* executed");
+            }
+        }
+        catch (System.Exception e)
+        {
+            QueueUnityLog($"[StopBash] orphan cleanup '{scriptNameFragment}': {e.Message}", QueuedUnityLogType.Warning);
+        }
+    }
+
+    private void StopBashProcessLegacy()
     {
         if (pythonProcess == null)
         {
             return;
         }
+
+        LogVerbose("StopBashProcess invoked.");
 
         try
         {
@@ -879,8 +1727,8 @@ public class StartInput : MonoBehaviour
     /// <summary>
     /// Kills any remaining processes whose command line contains
     /// <paramref name="scriptNameFragment"/>.
-    /// On Linux uses <c>pkill -9 -f</c>; on Windows uses <c>wmic</c> to
-    /// terminate python.exe instances matching the fragment.
+    /// On Linux uses <c>pkill -9 -f</c>; on Windows uses PowerShell/CIM to
+    /// terminate python.exe/pythonw.exe instances matching the fragment.
     /// </summary>
     private static void KillOrphansByName(string scriptNameFragment)
     {
@@ -907,25 +1755,33 @@ public class StartInput : MonoBehaviour
             }
             else
             {
-                // Windows: use wmic to find and kill python processes whose
-                // command line contains the script fragment.
-                string filter = $"name='python.exe' and commandline like '%{scriptNameFragment}%'";
-                var wmicInfo = new ProcessStartInfo
+                // WMIC is not installed on current Windows builds by default.
+                // Use PowerShell/CIM so stale WHAM/GMR workers do not keep the
+                // webcam or TCP port occupied after Stop.
+                string fragment = (scriptNameFragment ?? string.Empty).Replace("'", "''");
+                string psCommand =
+                    "$fragment = '" + fragment + "'; " +
+                    "Get-CimInstance Win32_Process -Filter \"Name = 'python.exe' OR Name = 'pythonw.exe'\" | " +
+                    "Where-Object { $_.CommandLine -like ('*' + $fragment + '*') } | " +
+                    "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }";
+                string encodedCommand = System.Convert.ToBase64String(Encoding.Unicode.GetBytes(psCommand));
+
+                var powershellInfo = new ProcessStartInfo
                 {
-                    FileName               = "wmic",
-                    Arguments              = $"process where \"{filter}\" call terminate",
+                    FileName               = "powershell",
+                    Arguments              = "-NoProfile -ExecutionPolicy Bypass -EncodedCommand " + encodedCommand,
                     UseShellExecute        = false,
                     RedirectStandardOutput = false,
                     RedirectStandardError  = false,
                     CreateNoWindow         = true
                 };
 
-                using (Process wmic = Process.Start(wmicInfo))
+                using (Process powershell = Process.Start(powershellInfo))
                 {
-                    wmic?.WaitForExit(5000);
+                    powershell?.WaitForExit(5000);
                 }
 
-                Debug.Log($"[StopBash] wmic terminate python.exe *{scriptNameFragment}* executed");
+                Debug.Log($"[StopBash] PowerShell cleanup for python *{scriptNameFragment}* executed");
             }
         }
         catch (System.Exception e)
@@ -934,7 +1790,7 @@ public class StartInput : MonoBehaviour
         }
     }
 
-    private void StartCsvMonitor()
+    private bool StartCsvMonitor()
     {
         if (string.IsNullOrWhiteSpace(resolvedOutputRootPath))
         {
@@ -945,7 +1801,7 @@ public class StartInput : MonoBehaviour
         if (string.IsNullOrWhiteSpace(resolvedOutputRootPath))
         {
             Debug.LogError("OUTPUT_ROOT 无效，无法开始监听实时 CSV。");
-            return;
+            return false;
         }
 
         string csvName = ResolveCsvRelativePath();
@@ -953,27 +1809,256 @@ public class StartInput : MonoBehaviour
         if (string.IsNullOrWhiteSpace(resolvedCsvPath))
         {
             Debug.LogError("实时 CSV 路径为空，无法开始监听。");
-            return;
+            return false;
         }
 
         StopCsvMonitor();
+        EndActiveRealtimeCsv();
+
+        activeRealtimeMimicAgent = ResolveActiveAgent();
+        activeRealtimeCsvAgent = activeRealtimeMimicAgent as IRealtimeCsvMimicAgent;
+        if (activeRealtimeMimicAgent == null || activeRealtimeCsvAgent == null)
+        {
+            Debug.LogError($"[StartInput] Selected robot '{ResolveSelectedRobotName()}' does not provide realtime CSV ingestion.");
+            activeRealtimeMimicAgent = null;
+            activeRealtimeCsvAgent = null;
+            return false;
+        }
 
         lastCsvLength = -1;
         lastCsvWriteTimeUtc = System.DateTime.MinValue;
         replayBootstrapped = false;
         csvMissingLogged = false;
-        monitorCoroutine = StartCoroutine(MonitorCsvCoroutine());
+        csvMonitorStartUtc = System.DateTime.UtcNow;
+        lastCsvNoDataWarningUtc = System.DateTime.MinValue;
+        firstNonEmptyCsvLogged = false;
+        csvReadOffset = 0;
+        csvPendingText = string.Empty;
+        realtimeSourceRowsRead = 0;
+        pendingRealtimeRows.Clear();
+        DrainRealtimeCsvQueues();
+        if (writeDebugLogFile && string.IsNullOrWhiteSpace(resolvedDebugLogPath))
+        {
+            resolvedDebugLogPath = ResolveDebugLogPath();
+            EnsureDebugLogWriter();
+        }
+
+        StartCsvWorker(resolvedCsvPath, activeRealtimeCsvAgent.ExpectedCsvColumns, activeRealtimeMimicAgent.RobotKey);
+        LogVerbose(
+            $"CSV worker started: pollInterval={csvPollInterval}, path='{resolvedCsvPath}', realtimeWarmupSourceRows={realtimeWarmupSourceRows}, " +
+            $"expectedColumns={activeRealtimeCsvAgent.ExpectedCsvColumns}, robot='{activeRealtimeMimicAgent.RobotKey}'");
 
         Debug.Log($"开始监听实时 CSV: {resolvedCsvPath}");
+        return true;
     }
+
 
     private void StopCsvMonitor()
     {
+        csvWorkerRunning = false;
+        Thread worker = csvWorkerThread;
+        if (worker != null && worker.IsAlive)
+        {
+            try { worker.Join(250); } catch { }
+        }
+        csvWorkerThread = null;
+
         if (monitorCoroutine != null)
         {
+            LogVerbose("CSV monitor stopped.");
             StopCoroutine(monitorCoroutine);
             monitorCoroutine = null;
         }
+
+        DrainRealtimeCsvQueues();
+    }
+
+    private void DrainRealtimeCsvQueues()
+    {
+        while (realtimeCsvRowsQueue.TryDequeue(out List<float[]> _)) { }
+        while (realtimeCsvResetQueue.TryDequeue(out string _)) { }
+    }
+
+    private void StartCsvWorker(string csvPath, int expectedColumns, string robotKey)
+    {
+        csvWorkerRunning = true;
+        int sleepMs = System.Math.Max(20, (int)System.Math.Round(csvPollInterval * 1000f));
+        float emptyWarningSeconds = System.Math.Max(1f, csvNoDataWarningSeconds);
+        bool logChanges = logCsvChangeEvents;
+
+        csvWorkerThread = new Thread(() => CsvWorkerLoop(csvPath, expectedColumns, robotKey, sleepMs, logChanges, emptyWarningSeconds))
+        {
+            Name = "StartInput-CsvWorker",
+            IsBackground = true
+        };
+        csvWorkerThread.Start();
+    }
+
+    private void CsvWorkerLoop(string csvPath, int expectedColumns, string robotKey, int sleepMs, bool logChanges, float emptyWarningSeconds)
+    {
+        bool missingLogged = false;
+        bool firstDataLogged = false;
+        string lastReadError = string.Empty;
+        long readOffset = 0L;
+        string pendingText = string.Empty;
+        long previousLength = -1L;
+        System.DateTime previousWriteTimeUtc = System.DateTime.MinValue;
+        System.DateTime monitorStartUtc = System.DateTime.UtcNow;
+        System.DateTime lastEmptyWarningUtc = System.DateTime.MinValue;
+
+        QueueUnityLog(
+            $"[StartInput] Realtime CSV worker active: robot='{robotKey}', expectedColumns={expectedColumns}, csv='{csvPath}', pollMs={sleepMs}");
+
+        while (csvWorkerRunning)
+        {
+            try
+            {
+                if (!File.Exists(csvPath))
+                {
+                    if (!missingLogged)
+                    {
+                        QueueUnityLog($"CSV file does not exist yet, waiting: {csvPath}", QueuedUnityLogType.Warning);
+                        missingLogged = true;
+                    }
+
+                    Thread.Sleep(sleepMs);
+                    continue;
+                }
+
+                missingLogged = false;
+                FileInfo info = new FileInfo(csvPath);
+                long currentLength = info.Length;
+                System.DateTime currentWriteTimeUtc = info.LastWriteTimeUtc;
+
+                if (currentLength < readOffset)
+                {
+                    readOffset = 0L;
+                    pendingText = string.Empty;
+                    firstDataLogged = false;
+                    monitorStartUtc = System.DateTime.UtcNow;
+                    realtimeCsvResetQueue.Enqueue("CSV truncated or recreated");
+                }
+
+                if (currentLength <= 0)
+                {
+                    if (currentLength != previousLength || currentWriteTimeUtc != previousWriteTimeUtc)
+                    {
+                        if (logChanges)
+                        {
+                            QueueUnityLog($"[StartInput] CSV exists but is empty: path='{csvPath}', writeTimeUtc={currentWriteTimeUtc:O}");
+                        }
+
+                        previousLength = currentLength;
+                        previousWriteTimeUtc = currentWriteTimeUtc;
+                    }
+
+                    System.DateTime nowUtc = System.DateTime.UtcNow;
+                    if ((nowUtc - monitorStartUtc).TotalSeconds >= emptyWarningSeconds &&
+                        (lastEmptyWarningUtc == System.DateTime.MinValue || (nowUtc - lastEmptyWarningUtc).TotalSeconds >= emptyWarningSeconds))
+                    {
+                        bool processAlive = false;
+                        int pid = -1;
+                        Process process = pythonProcess;
+                        try
+                        {
+                            processAlive = process != null && !process.HasExited;
+                            pid = process != null ? process.Id : -1;
+                        }
+                        catch { }
+
+                        QueueUnityLog(
+                            $"[StartInput] live_motion.csv is still empty. elapsed={(nowUtc - monitorStartUtc).TotalSeconds:F1}s, " +
+                            $"processAlive={processAlive}, pid={pid}, csv='{csvPath}'. Check [Pipeline]/[Pipeline-ERR] logs.",
+                            QueuedUnityLogType.Warning);
+                        lastEmptyWarningUtc = nowUtc;
+                    }
+
+                    Thread.Sleep(sleepMs);
+                    continue;
+                }
+
+                if (currentLength > readOffset)
+                {
+                    List<float[]> rows = ReadNewRealtimeCsvRowsFromPath(csvPath, currentLength, expectedColumns, ref readOffset, ref pendingText);
+                    if (rows.Count > 0)
+                    {
+                        if (!firstDataLogged)
+                        {
+                            firstDataLogged = true;
+                            QueueUnityLog($"[StartInput] Realtime CSV has data: {csvPath} ({currentLength} bytes)");
+                        }
+
+                        if (logChanges)
+                        {
+                            QueueUnityLog($"[StartInput] CSV appended: rows={rows.Count}, bytes={currentLength}, offset={readOffset}, path='{csvPath}'");
+                        }
+
+                        realtimeCsvRowsQueue.Enqueue(rows);
+                    }
+                }
+
+                previousLength = currentLength;
+                previousWriteTimeUtc = currentWriteTimeUtc;
+                lastReadError = string.Empty;
+            }
+            catch (System.Exception e)
+            {
+                string message = e.Message ?? string.Empty;
+                if (!string.Equals(message, lastReadError, System.StringComparison.Ordinal))
+                {
+                    QueueUnityLog($"[StartInput] CSV worker read failed: {message}", QueuedUnityLogType.Warning);
+                    lastReadError = message;
+                }
+            }
+
+            Thread.Sleep(sleepMs);
+        }
+    }
+
+    private List<float[]> ReadNewRealtimeCsvRowsFromPath(string csvPath, long currentLength, int expectedColumns, ref long readOffset, ref string pendingText)
+    {
+        var rows = new List<float[]>();
+        if (expectedColumns <= 0 || currentLength <= readOffset)
+        {
+            return rows;
+        }
+
+        long bytesToReadLong = currentLength - readOffset;
+        if (bytesToReadLong <= 0 || bytesToReadLong > int.MaxValue)
+        {
+            return rows;
+        }
+
+        byte[] buffer = new byte[(int)bytesToReadLong];
+        int bytesRead;
+        using (FileStream fs = new FileStream(csvPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+        {
+            fs.Seek(readOffset, SeekOrigin.Begin);
+            bytesRead = fs.Read(buffer, 0, buffer.Length);
+            readOffset += bytesRead;
+        }
+
+        if (bytesRead <= 0)
+        {
+            return rows;
+        }
+
+        string text = pendingText + Encoding.UTF8.GetString(buffer, 0, bytesRead);
+        text = text.Replace("\r\n", "\n").Replace('\r', '\n');
+        bool hasTrailingNewline = text.EndsWith("\n", System.StringComparison.Ordinal);
+        string[] lines = text.Split('\n');
+        int completeLineCount = hasTrailingNewline ? lines.Length : System.Math.Max(0, lines.Length - 1);
+        pendingText = hasTrailingNewline || lines.Length == 0 ? string.Empty : lines[lines.Length - 1];
+
+        for (int i = 0; i < completeLineCount; i++)
+        {
+            if (TryParseRealtimeCsvLine(lines[i], expectedColumns, out float[] row))
+            {
+                rows.Add(row);
+            }
+        }
+
+        return rows;
     }
 
     private IEnumerator MonitorCsvCoroutine()
@@ -984,7 +2069,7 @@ public class StartInput : MonoBehaviour
             {
                 if (!csvMissingLogged)
                 {
-                    Debug.LogWarning($"CSV 文件不存在，等待生成: {resolvedCsvPath}");
+                    Debug.LogWarning($"CSV file does not exist yet, waiting: {resolvedCsvPath}");
                     csvMissingLogged = true;
                 }
 
@@ -994,9 +2079,9 @@ public class StartInput : MonoBehaviour
 
             csvMissingLogged = false;
 
-            long currentLength;
-            System.DateTime currentWriteTimeUtc;
-            bool readFailed = false;
+            long currentLength = 0L;
+            System.DateTime currentWriteTimeUtc = System.DateTime.MinValue;
+            bool csvReadFailed = false;
             try
             {
                 FileInfo info = new FileInfo(resolvedCsvPath);
@@ -1005,86 +2090,280 @@ public class StartInput : MonoBehaviour
             }
             catch (System.Exception e)
             {
-                Debug.LogWarning($"读取 CSV 文件信息失败: {e.Message}");
-                currentLength = lastCsvLength;
-                currentWriteTimeUtc = lastCsvWriteTimeUtc;
-                readFailed = true;
+                Debug.LogWarning($"Failed to read CSV file info: {e.Message}");
+                csvReadFailed = true;
             }
 
-            if (readFailed)
+            if (csvReadFailed)
             {
                 yield return new WaitForSeconds(Mathf.Max(0.02f, csvPollInterval));
                 continue;
             }
 
-            bool isChanged = currentLength != lastCsvLength || currentWriteTimeUtc != lastCsvWriteTimeUtc;
-
-            if (isChanged)
+            if (currentLength < csvReadOffset)
             {
-                lastCsvLength = currentLength;
-                lastCsvWriteTimeUtc = currentWriteTimeUtc;
-                ApplyRealtimeCsvToAgent();
+                ResetRealtimeCsvReader("CSV truncated or recreated");
             }
 
+            if (currentLength <= 0)
+            {
+                if (currentLength != lastCsvLength || currentWriteTimeUtc != lastCsvWriteTimeUtc)
+                {
+                    if (logCsvChangeEvents)
+                    {
+                        LogVerbose($"CSV exists but is empty: path='{resolvedCsvPath}', writeTimeUtc={currentWriteTimeUtc:O}");
+                    }
+
+                    lastCsvLength = currentLength;
+                    lastCsvWriteTimeUtc = currentWriteTimeUtc;
+                }
+
+                MaybeWarnCsvStillEmpty();
+                yield return new WaitForSeconds(Mathf.Max(0.02f, csvPollInterval));
+                continue;
+            }
+
+            if (currentLength > csvReadOffset)
+            {
+                List<float[]> rows = ReadNewRealtimeCsvRows(currentLength);
+                if (rows.Count > 0)
+                {
+                    if (!firstNonEmptyCsvLogged)
+                    {
+                        firstNonEmptyCsvLogged = true;
+                        Debug.Log($"[StartInput] Realtime CSV has data: {resolvedCsvPath} ({currentLength} bytes)");
+                    }
+
+                    if (logCsvChangeEvents)
+                    {
+                        LogVerbose($"CSV appended: rows={rows.Count}, bytes={currentLength}, offset={csvReadOffset}, path='{resolvedCsvPath}'");
+                    }
+
+                    ApplyRealtimeCsvRows(rows);
+                }
+            }
+
+            lastCsvLength = currentLength;
+            lastCsvWriteTimeUtc = currentWriteTimeUtc;
             yield return new WaitForSeconds(Mathf.Max(0.02f, csvPollInterval));
         }
     }
 
-    private void ApplyRealtimeCsvToAgent()
+    private List<float[]> ReadNewRealtimeCsvRows(long currentLength)
     {
-        IMimicAgent agent = ResolveActiveAgent();
-        if (agent == null)
+        var rows = new List<float[]>();
+        if (activeRealtimeCsvAgent == null || currentLength <= csvReadOffset)
         {
-            Debug.LogWarning("未找到匹配当前机器人的 IMimicAgent，无法应用实时 CSV。\n" +
-                             "请确认场景里至少有一个机器人组件实现 IMimicAgent，且其 RobotKey 与 RoboList 选择一致。");
+            return rows;
+        }
+
+        long bytesToReadLong = currentLength - csvReadOffset;
+        if (bytesToReadLong <= 0 || bytesToReadLong > int.MaxValue)
+        {
+            return rows;
+        }
+
+        byte[] buffer = new byte[(int)bytesToReadLong];
+        int bytesRead;
+        using (FileStream fs = new FileStream(resolvedCsvPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+        {
+            fs.Seek(csvReadOffset, SeekOrigin.Begin);
+            bytesRead = fs.Read(buffer, 0, buffer.Length);
+            csvReadOffset += bytesRead;
+        }
+
+        if (bytesRead <= 0)
+        {
+            return rows;
+        }
+
+        string text = csvPendingText + Encoding.UTF8.GetString(buffer, 0, bytesRead);
+        text = text.Replace("\r\n", "\n").Replace('\r', '\n');
+        bool hasTrailingNewline = text.EndsWith("\n", System.StringComparison.Ordinal);
+        string[] lines = text.Split('\n');
+        int completeLineCount = hasTrailingNewline ? lines.Length : Mathf.Max(0, lines.Length - 1);
+        csvPendingText = hasTrailingNewline || lines.Length == 0 ? string.Empty : lines[lines.Length - 1];
+
+        for (int i = 0; i < completeLineCount; i++)
+        {
+            if (TryParseRealtimeCsvLine(lines[i], activeRealtimeCsvAgent.ExpectedCsvColumns, out float[] row))
+            {
+                rows.Add(row);
+            }
+        }
+
+        return rows;
+    }
+
+    private bool TryParseRealtimeCsvLine(string line, int expectedColumns, out float[] row)
+    {
+        row = null;
+        if (string.IsNullOrWhiteSpace(line) || expectedColumns <= 0)
+        {
+            return false;
+        }
+
+        string[] tokens = line.Split(',');
+        if (tokens.Length < expectedColumns)
+        {
+            return false;
+        }
+
+        row = new float[expectedColumns];
+        for (int i = 0; i < expectedColumns; i++)
+        {
+            string token = tokens[i].Trim();
+            if (!float.TryParse(token, NumberStyles.Float, CultureInfo.InvariantCulture, out float value) &&
+                !float.TryParse(token, out value))
+            {
+                row = null;
+                return false;
+            }
+
+            row[i] = value;
+        }
+
+        return true;
+    }
+
+    private void ApplyRealtimeCsvRows(List<float[]> rows)
+    {
+        if (rows == null || rows.Count == 0)
+        {
             return;
         }
 
-        bool loaded = agent.LoadReplayCsvFromPath(resolvedCsvPath, keepReplayProgressOnCsvUpdate);
-        if (!loaded)
+        if (activeRealtimeMimicAgent == null || activeRealtimeCsvAgent == null)
+        {
+            Debug.LogWarning("[StartInput] Realtime CSV rows arrived but no realtime-capable agent is active.");
+            return;
+        }
+
+        realtimeSourceRowsRead += rows.Count;
+
+        if (!replayBootstrapped)
+        {
+            pendingRealtimeRows.AddRange(rows);
+            int warmupRows = Mathf.Max(1, realtimeWarmupSourceRows);
+            if (pendingRealtimeRows.Count < warmupRows)
+            {
+                return;
+            }
+
+            activeRealtimeCsvAgent.BeginRealtimeCsv();
+            activeRealtimeMimicAgent.UseExternalReplayData = true;
+            activeRealtimeMimicAgent.ReplayMode = true;
+            if (!activeRealtimeCsvAgent.AppendRealtimeCsvRows(pendingRealtimeRows))
+            {
+                Debug.LogWarning("[StartInput] Initial realtime CSV append produced no frames.");
+                return;
+            }
+
+            pendingRealtimeRows.Clear();
+            if (MimicAgentRegistry.Instance != null)
+            {
+                MimicAgentRegistry.Instance.SetActiveTarget(activeRealtimeMimicAgent);
+            }
+
+            if (restartEpisodeOnFirstCsv)
+            {
+                activeRealtimeMimicAgent.RequestEndEpisode();
+            }
+
+            replayBootstrapped = true;
+            Debug.Log(
+                $"[StartInput] Realtime CSV playback started for '{activeRealtimeMimicAgent.RobotKey}' after {realtimeSourceRowsRead} source rows: {resolvedCsvPath}. " +
+                $"expectedColumns={activeRealtimeCsvAgent.ExpectedCsvColumns}, warmupRows={Mathf.Max(1, realtimeWarmupSourceRows)}, " +
+                $"selectedRobot='{ResolveSelectedRobotName()}', bufferedBatches={realtimeCsvRowsQueue.Count}, rootMapping=csv[0..2]->Unity(-y,z,x), quat=csv[3..6]->Unity(-y,z,x,-w)");
+            return;
+        }
+
+        activeRealtimeCsvAgent.AppendRealtimeCsvRows(rows);
+    }
+
+    private void ResetRealtimeCsvReader(string reason)
+    {
+        LogVerbose($"Reset realtime CSV reader: {reason}");
+        csvReadOffset = 0;
+        csvPendingText = string.Empty;
+        realtimeSourceRowsRead = 0;
+        replayBootstrapped = false;
+        firstNonEmptyCsvLogged = false;
+        pendingRealtimeRows.Clear();
+        activeRealtimeCsvAgent?.BeginRealtimeCsv();
+    }
+
+    private void EndActiveRealtimeCsv()
+    {
+        activeRealtimeCsvAgent?.EndRealtimeCsv();
+        activeRealtimeCsvAgent = null;
+        activeRealtimeMimicAgent = null;
+        pendingRealtimeRows.Clear();
+        csvPendingText = string.Empty;
+        csvReadOffset = 0;
+        realtimeSourceRowsRead = 0;
+        replayBootstrapped = false;
+    }
+
+    private void MaybeWarnCsvStillEmpty()
+    {
+        float threshold = Mathf.Max(1f, csvNoDataWarningSeconds);
+        System.DateTime now = System.DateTime.UtcNow;
+        if (csvMonitorStartUtc == System.DateTime.MinValue ||
+            (now - csvMonitorStartUtc).TotalSeconds < threshold)
         {
             return;
         }
 
-        agent.UseExternalReplayData = true;
-        agent.ReplayMode = true;
-
-        // Make sure the other registered robots are not still consuming an
-        // older live stream — only the active one should be in external-replay
-        // mode at a time.
-        if (MimicAgentRegistry.Instance != null)
+        if (lastCsvNoDataWarningUtc != System.DateTime.MinValue &&
+            (now - lastCsvNoDataWarningUtc).TotalSeconds < threshold)
         {
-            MimicAgentRegistry.Instance.SetActiveTarget(agent);
+            return;
         }
 
-        if (!replayBootstrapped && restartEpisodeOnFirstCsv)
+        lastCsvNoDataWarningUtc = now;
+
+        bool processAlive = false;
+        int processId = -1;
+        if (pythonProcess != null)
         {
-            agent.RequestEndEpisode();
+            try
+            {
+                processAlive = !pythonProcess.HasExited;
+                processId = pythonProcess.Id;
+            }
+            catch
+            {
+                processAlive = false;
+            }
         }
 
-        replayBootstrapped = true;
+        string warning =
+            "[StartInput] live_motion.csv is still empty. " +
+            $"elapsed={(now - csvMonitorStartUtc).TotalSeconds:F1}s, " +
+            $"processAlive={processAlive}, pid={(processId >= 0 ? processId.ToString() : "<none>")}, " +
+            $"csv='{resolvedCsvPath}'. " +
+            "Check [Pipeline]/[Pipeline-ERR] logs for [Input], [Detect], [WHAM], [GMR], and [TCP] messages.";
+        Debug.LogWarning(warning);
+        AppendDebugLogLine(warning);
     }
 
     /// <summary>
-    /// Resolve the agent that should receive live retargeting data. Resolution
-    /// order: inspector-assigned <c>targetAgentBehaviour</c>, then the agent
-    /// registered with a RobotKey matching the current RoboList selection,
-    /// then the first registered agent as a final fallback.
+    /// Resolve the agent that should receive live retargeting data. RoboList is
+    /// authoritative; a selected robot key must match the registered agent key.
     /// </summary>
     private IMimicAgent ResolveActiveAgent()
     {
-        // 1) Inspector-pinned target wins (preserves the legacy single-robot
-        //    scene setup where the agent is dragged directly into the field).
-        if (targetAgentBehaviour is IMimicAgent pinned && pinned.AgentGameObject != null)
+        string selectedRaw = ResolveSelectedRobotName();
+        string selectedKey = !string.IsNullOrWhiteSpace(selectedRaw)
+            ? ResolveRobotNameForWham(selectedRaw)
+            : string.Empty;
+        if (string.IsNullOrWhiteSpace(selectedKey))
         {
-            targetAgent = pinned;
-            return targetAgent;
+            selectedKey = ResolveRobotNameForWham(defaultRobotName);
         }
 
-        // 2) Match the registry by the robot key currently selected in the UI.
-        string selectedRaw = ResolveSelectedRobotName();
-        string selectedKey = ResolveRobotNameForWham(selectedRaw);
-        if (string.IsNullOrWhiteSpace(selectedKey)) selectedKey = (defaultRobotName ?? string.Empty).Trim();
+        LogVerbose($"ResolveActiveAgent: selectedRaw='{selectedRaw}', selectedKey='{selectedKey}', defaultRobotName='{defaultRobotName}'");
 
         if (!string.IsNullOrWhiteSpace(selectedKey) && MimicAgentRegistry.Instance != null)
         {
@@ -1099,23 +2378,36 @@ public class StartInput : MonoBehaviour
                 targetAgent = byKey;
                 return targetAgent;
             }
-        }
 
-        // 3) Last-resort: first registered alive agent.
-        if (MimicAgentRegistry.Instance != null)
-        {
-            IMimicAgent first = MimicAgentRegistry.Instance.GetFirstAlive();
-            if (first != null)
+            if (targetAgentBehaviour is IMimicAgent pinned &&
+                pinned.AgentGameObject != null &&
+                string.Equals(pinned.RobotKey, selectedKey, System.StringComparison.OrdinalIgnoreCase))
             {
-                if (lastResolvedRobotKey != "<fallback>")
-                {
-                    Debug.LogWarning($"[StartInput] 未找到 RobotKey='{selectedKey}' 对应的机器人，" +
-                                     $"回退到第一个已注册机器人: {first.RobotKey}");
-                    lastResolvedRobotKey = "<fallback>";
-                }
-                targetAgent = first;
+                targetAgent = pinned;
                 return targetAgent;
             }
+
+            if (lastResolvedRobotKey != selectedKey)
+            {
+                Debug.LogError($"[StartInput] No IMimicAgent registered for selected robot '{selectedKey}'. Live CSV will not be routed to another robot.");
+                lastResolvedRobotKey = selectedKey;
+            }
+
+            targetAgent = null;
+            return null;
+        }
+
+        if (!string.IsNullOrWhiteSpace(selectedRaw) || !string.IsNullOrWhiteSpace(defaultRobotName))
+        {
+            Debug.LogError($"[StartInput] Unable to resolve a registered IMimicAgent for selected robot '{selectedRaw}' / default '{defaultRobotName}'.");
+            targetAgent = null;
+            return null;
+        }
+
+        if (targetAgentBehaviour is IMimicAgent legacyPinned && legacyPinned.AgentGameObject != null)
+        {
+            targetAgent = legacyPinned;
+            return targetAgent;
         }
 
         targetAgent = null;
@@ -1160,6 +2452,22 @@ public class StartInput : MonoBehaviour
         // a helpful error message listing the path we ended up at.
         List<string> tried = new List<string>();
         string firstCandidate = string.Empty;
+        string projectRoot = Directory.GetParent(Application.dataPath)?.FullName;
+        if (!string.IsNullOrWhiteSpace(projectRoot))
+        {
+            try
+            {
+                string projectCandidate = Path.GetFullPath(Path.Combine(projectRoot, normalized));
+                tried.Add(projectCandidate);
+                firstCandidate = projectCandidate;
+                if (Directory.Exists(projectCandidate)) return projectCandidate;
+            }
+            catch
+            {
+                // Continue with the historical Assets-relative roots below.
+            }
+        }
+
         foreach (string root in RelativeWorkingDirRoots)
         {
             string baseDir = string.IsNullOrEmpty(root)
@@ -1375,6 +2683,99 @@ public class StartInput : MonoBehaviour
         return $"\"{escaped}\"";
     }
 
+    private void SetRealtimeDropdownsInteractable(bool interactable)
+    {
+        ResolveRoboListReferences();
+        ResolveCsvListReferences();
+
+        if (roboListDropdown != null)
+        {
+            roboListDropdown.interactable = interactable;
+        }
+
+        if (csvListDropdown != null)
+        {
+            csvListDropdown.interactable = interactable;
+        }
+
+        LogVerbose($"Realtime dropdowns interactable={interactable}");
+    }
+
+    private void RefreshCsvListForSelectedRobot()
+    {
+        if (!filterCsvListByRobot)
+        {
+            return;
+        }
+
+        string selectedRobot = ResolveSelectedRobotName();
+        string resolvedRobotKey = ResolveRobotNameForWham(selectedRobot);
+        RefreshCsvListForSelectedRobot(resolvedRobotKey, selectedRobot);
+    }
+
+    private void RefreshCsvListForSelectedRobot(string resolvedRobotKey, string selectedLabel)
+    {
+        if (!filterCsvListByRobot)
+        {
+            return;
+        }
+
+        ResolveCsvListReferences();
+        if (csvListFileBrowser == null)
+        {
+            return;
+        }
+
+        string filterKey = !string.IsNullOrWhiteSpace(resolvedRobotKey)
+            ? resolvedRobotKey
+            : (selectedLabel ?? string.Empty).Trim();
+        csvListFileBrowser.SetCsvRobotFilter(filterKey);
+        LogVerbose($"RefreshCsvListForSelectedRobot: label='{selectedLabel}', resolvedKey='{resolvedRobotKey}', filterKey='{filterKey}'");
+
+        if (csvListDropdown == null)
+        {
+            csvListDropdown = csvListFileBrowser.GetComponent<TMP_Dropdown>();
+        }
+
+        if (csvListDropdown != null &&
+            csvListDropdown.options != null &&
+            csvListDropdown.options.Count > 0 &&
+            IsPlaceholderOption(csvListDropdown.options[csvListDropdown.value].text))
+        {
+            Debug.LogWarning($"[StartInput] No compatible CSV files for robot '{filterKey}'.");
+        }
+    }
+
+    private void ResolveCsvListReferences()
+    {
+        if (csvListFileBrowser != null && csvListDropdown != null)
+        {
+            return;
+        }
+
+        GameObject csvListObject = GameObject.Find(csvListObjectName);
+        if (csvListObject == null)
+        {
+            if (logReferenceResolution) LogVerbose($"ResolveCsvListReferences: GameObject '{csvListObjectName}' not found.");
+            return;
+        }
+
+        if (csvListFileBrowser == null)
+        {
+            csvListFileBrowser = csvListObject.GetComponent<FileBrowser>();
+        }
+
+        if (csvListDropdown == null)
+        {
+            csvListDropdown = csvListObject.GetComponent<TMP_Dropdown>();
+        }
+
+        if (logReferenceResolution)
+        {
+            LogVerbose($"ResolveCsvListReferences: object='{csvListObject.name}', hasFileBrowser={csvListFileBrowser != null}, hasDropdown={csvListDropdown != null}");
+        }
+    }
+
     private string ResolveSelectedRobotName()
     {
         ResolveRoboListReferences();
@@ -1416,6 +2817,7 @@ public class StartInput : MonoBehaviour
         GameObject roboListObject = GameObject.Find(roboListObjectName);
         if (roboListObject == null)
         {
+            if (logReferenceResolution) LogVerbose($"ResolveRoboListReferences: GameObject '{roboListObjectName}' not found.");
             return;
         }
 
@@ -1427,6 +2829,11 @@ public class StartInput : MonoBehaviour
         if (roboListDropdown == null)
         {
             roboListDropdown = roboListObject.GetComponent<TMP_Dropdown>();
+        }
+
+        if (logReferenceResolution)
+        {
+            LogVerbose($"ResolveRoboListReferences: object='{roboListObject.name}', hasFileBrowser={roboListFileBrowser != null}, hasDropdown={roboListDropdown != null}");
         }
     }
 
@@ -1443,6 +2850,8 @@ public class StartInput : MonoBehaviour
         }
 
         string lowered = text.ToLowerInvariant();
-        return lowered.Contains("can't find") || lowered.Contains("cannot find");
+        return lowered.Contains("can't find") ||
+               lowered.Contains("cannot find") ||
+               lowered.Contains("no compatible");
     }
 }

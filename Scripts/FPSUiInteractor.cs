@@ -2,6 +2,7 @@ using UnityEngine;
 using UnityEngine.UI;
 using UnityEngine.EventSystems;
 using System.Collections.Generic;
+using TMPro;
 
 public class FPSUiInteractor : MonoBehaviour
 {
@@ -13,6 +14,7 @@ public class FPSUiInteractor : MonoBehaviour
 
     void Start()
     {
+        DisableKeyboardNavigation();
         pointerData = new PointerEventData(EventSystem.current);
     }
 
@@ -66,7 +68,7 @@ public class FPSUiInteractor : MonoBehaviour
 		ExecuteEvents.ExecuteHierarchy(currentHoveredObject, pointerData, ExecuteEvents.pointerUpHandler);
 		ExecuteEvents.ExecuteHierarchy(currentHoveredObject, pointerData, ExecuteEvents.pointerClickHandler);
 
-		EventSystem.current.SetSelectedGameObject(currentHoveredObject);
+		EventSystem.current.SetSelectedGameObject(ResolveKeyboardFocusTarget(currentHoveredObject));
 	    }
 	}
 
@@ -89,5 +91,24 @@ public class FPSUiInteractor : MonoBehaviour
         if (crosshairImage == null) return;
         crosshairImage.color = highlight ? Color.red : Color.white;
         crosshairImage.transform.localScale = highlight ? Vector3.one * 1.5f : Vector3.one;
+    }
+
+    static void DisableKeyboardNavigation()
+    {
+        var eventSystem = EventSystem.current;
+        if (eventSystem == null) return;
+
+        eventSystem.sendNavigationEvents = false;
+    }
+
+    static GameObject ResolveKeyboardFocusTarget(GameObject target)
+    {
+        if (target == null) return null;
+
+        TMP_InputField tmpInput = target.GetComponentInParent<TMP_InputField>();
+        if (tmpInput != null) return tmpInput.gameObject;
+
+        InputField input = target.GetComponentInParent<InputField>();
+        return input != null ? input.gameObject : null;
     }
 }

@@ -14,7 +14,7 @@ using UnityEditor;
 #endif
 using Gewu.Imitation;
 
-public class H1mimicAgent : Agent, IMimicAgent
+public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
 {
     public bool train = false;
     public bool replay = false;
@@ -88,9 +88,12 @@ public class H1mimicAgent : Agent, IMimicAgent
     private List<float[]> allDofData = new List<float[]>();
     private List<float[]> allPosData = new List<float[]>();
     private List<float[]> allRotData = new List<float[]>();
+    private readonly List<float[]> realtimeRawRows = new List<float[]>();
+    private readonly List<float[]> realtimeFixedRows = new List<float[]>();
     
     private int currentFrame = 0;  
     private bool isEndEpisode = false;
+    private int realtimePreviousMaxStep = -1;
     
     Transform body;
 
@@ -115,6 +118,60 @@ public class H1mimicAgent : Agent, IMimicAgent
     public bool ReplayMode { get => replay; set => replay = value; }
     public int MotionId { get => motion_idx; set => motion_idx = value; }
     public void RequestEndEpisode() => EndEpisode();
+    public int ExpectedCsvColumns => 26;
+
+    public void BeginRealtimeCsv()
+    {
+        if (realtimePreviousMaxStep < 0)
+        {
+            realtimePreviousMaxStep = MaxStep;
+        }
+
+        MaxStep = 0;
+        realtimeRawRows.Clear();
+        realtimeFixedRows.Clear();
+        allDofData = new List<float[]>();
+        allPosData = new List<float[]>();
+        allRotData = new List<float[]>();
+        motion_name = "live_motion";
+        currentFrame = 0;
+        tt = 0;
+        isEndEpisode = false;
+        UseExternalReplayData = true;
+        ReplayMode = true;
+    }
+
+    public bool AppendRealtimeCsvRows(IReadOnlyList<float[]> rows)
+    {
+        int oldFixedCount = realtimeFixedRows.Count;
+        int appended = ReplayCsvUtility.AppendResampled30FpsToFixed50Hz(
+            realtimeRawRows,
+            realtimeFixedRows,
+            rows,
+            ExpectedCsvColumns);
+        if (appended <= 0)
+        {
+            return false;
+        }
+
+        for (int rowIndex = oldFixedCount; rowIndex < realtimeFixedRows.Count; rowIndex++)
+        {
+            AppendFlatRowToH1Buffers(realtimeFixedRows[rowIndex]);
+        }
+
+        return true;
+    }
+
+    public void EndRealtimeCsv()
+    {
+        if (realtimePreviousMaxStep >= 0)
+        {
+            MaxStep = realtimePreviousMaxStep;
+            realtimePreviousMaxStep = -1;
+        }
+
+        UseExternalReplayData = false;
+    }
 
     /// <summary>
     /// Imperative reset of PD targets and replay bookkeeping. See the long
@@ -225,9 +282,31 @@ public class H1mimicAgent : Agent, IMimicAgent
         }
 
         int oldFrame = currentFrame;
-        allPosData = newPos;
-        allRotData = newRot;
-        allDofData = newDof;
+        var mergedRows = new List<float[]>(newDof.Count);
+        for (int rowIndex = 0; rowIndex < newDof.Count; rowIndex++)
+        {
+            float[] row = new float[ExpectedCols];
+            System.Array.Copy(newPos[rowIndex], 0, row, 0, RootPosCols);
+            System.Array.Copy(newRot[rowIndex], 0, row, RootPosCols, RootRotCols);
+            System.Array.Copy(newDof[rowIndex], 0, row, RootPosCols + RootRotCols, DofCols);
+            mergedRows.Add(row);
+        }
+
+        List<float[]> resampledRows = ReplayCsvUtility.Resample30FpsToFixed50Hz(mergedRows);
+        allPosData = new List<float[]>(resampledRows.Count);
+        allRotData = new List<float[]>(resampledRows.Count);
+        allDofData = new List<float[]>(resampledRows.Count);
+
+        for (int rowIndex = 0; rowIndex < resampledRows.Count; rowIndex++)
+        {
+            float[] row = resampledRows[rowIndex];
+            float[] pos = new float[RootPosCols]; System.Array.Copy(row, 0, pos, 0, RootPosCols);
+            float[] rot = new float[RootRotCols]; System.Array.Copy(row, RootPosCols, rot, 0, RootRotCols);
+            float[] dof = new float[DofCols]; System.Array.Copy(row, RootPosCols + RootRotCols, dof, 0, DofCols);
+            allPosData.Add(pos);
+            allRotData.Add(rot);
+            allDofData.Add(dof);
+        }
         motion_name = Path.GetFileNameWithoutExtension(filePath);
 
         if (keepProgress)
@@ -236,6 +315,24 @@ public class H1mimicAgent : Agent, IMimicAgent
             currentFrame = 0;
 
         return true;
+    }
+
+    private void AppendFlatRowToH1Buffers(float[] row)
+    {
+        const int RootPosCols = 3;
+        const int RootRotCols = 4;
+        const int DofCols = 19;
+
+        float[] pos = new float[RootPosCols];
+        float[] rot = new float[RootRotCols];
+        float[] dof = new float[DofCols];
+        System.Array.Copy(row, 0, pos, 0, RootPosCols);
+        System.Array.Copy(row, RootPosCols, rot, 0, RootRotCols);
+        System.Array.Copy(row, RootPosCols + RootRotCols, dof, 0, DofCols);
+
+        allPosData.Add(pos);
+        allRotData.Add(rot);
+        allDofData.Add(dof);
     }
 
     void Start()
@@ -595,6 +692,7 @@ public class H1mimicAgent : Agent, IMimicAgent
 	///////////////feedforward///////////////////////////////////////////////////////////
 	if (allDofData.Count > 0)
 	{
+        currentFrame = Mathf.Clamp(currentFrame, 0, allDofData.Count - 1);
 		float[] currentDof = allDofData[currentFrame];
 		float[] currentPos = allPosData[currentFrame];
         float[] currentRot = allRotData[currentFrame];
@@ -631,18 +729,19 @@ public class H1mimicAgent : Agent, IMimicAgent
     		Physics.gravity = Vector3.zero;
     		art0.TeleportRoot(newPosition, newRotation);
     	}
-   		currentFrame = (currentFrame + 1) % allDofData.Count;
-
-		if (currentFrame == 0)  // wrapped past last frame
-		{
-			// Don't EndEpisode in external (live) replay — the live CSV is
-			// authoritative and EndEpisode would wipe it; just loop the
-			// playhead and let the next CSV poll bring in fresh data.
-			if (!useExternalReplayData) EndEpisode();
-			currentFrame = 0;
-		}
-		    
-		if (isEndEpisode)
+        if (currentFrame < allDofData.Count - 1)
+        {
+            currentFrame++;
+        }
+        else if (!useExternalReplayData)
+        {
+            currentFrame = 0;
+            if (!replay)
+            {
+                EndEpisode();
+            }
+        }
+				if (isEndEpisode)
 		{
 	            currentFrame = 0;
 	            isEndEpisode = false; 
@@ -662,7 +761,11 @@ public class H1mimicAgent : Agent, IMimicAgent
             art0.immovable = false;
             rot_reward = - 0.01f * Quaternion.Angle(body.rotation, newRotation);
             pos_reward = - 1f * (body.position - newPosition).magnitude;
-            if (Quaternion.Angle(body.rotation, newRotation)>30f || (body.position - newPosition).magnitude>0.3f)EndEpisode();
+            if (!replay && !useExternalReplayData &&
+                (Quaternion.Angle(body.rotation, newRotation)>30f || (body.position - newPosition).magnitude>0.3f))
+            {
+                EndEpisode();
+            }
         }  
         var reward = live_reward + (rot_reward + pos_reward)*1;
         AddReward(reward);

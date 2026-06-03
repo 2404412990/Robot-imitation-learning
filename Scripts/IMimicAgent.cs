@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using UnityEngine;
 
 namespace Gewu.Imitation
@@ -72,5 +73,18 @@ namespace Gewu.Imitation
         /// snap joints to wrong positions.
         /// </summary>
         void ResetToInitialState();
+    }
+
+    /// <summary>
+    /// Optional realtime CSV ingestion surface used by StartInput. Unlike
+    /// LoadReplayCsvFromPath, this appends only newly-written CSV rows so live
+    /// playback does not periodically reparse and restart the whole file.
+    /// </summary>
+    public interface IRealtimeCsvMimicAgent
+    {
+        int ExpectedCsvColumns { get; }
+        void BeginRealtimeCsv();
+        bool AppendRealtimeCsvRows(IReadOnlyList<float[]> rows);
+        void EndRealtimeCsv();
     }
 }

@@ -1,5 +1,6 @@
 using UnityEngine;
 using UnityEngine.SceneManagement;
+using UnityEngine.EventSystems;
 
 public class Move : MonoBehaviour
 {
@@ -45,6 +46,7 @@ public class Move : MonoBehaviour
         // 只有在鼠标锁定的情况下才允许移动和旋转
         if (cursorLocked)
         {
+            ClearUiFocusForMovement();
             HandleMovement();
             HandleLook();
         }
@@ -101,6 +103,23 @@ public class Move : MonoBehaviour
     }
 
     // 统一管理鼠标状态
+    void ClearUiFocusForMovement()
+    {
+        var eventSystem = EventSystem.current;
+        if (eventSystem == null || eventSystem.currentSelectedGameObject == null) return;
+        if (!IsMovementInputPressed()) return;
+
+        eventSystem.SetSelectedGameObject(null);
+    }
+
+    static bool IsMovementInputPressed()
+    {
+        return Input.GetKey(KeyCode.W) || Input.GetKey(KeyCode.A) ||
+               Input.GetKey(KeyCode.S) || Input.GetKey(KeyCode.D) ||
+               Input.GetKey(KeyCode.UpArrow) || Input.GetKey(KeyCode.DownArrow) ||
+               Input.GetKey(KeyCode.LeftArrow) || Input.GetKey(KeyCode.RightArrow);
+    }
+
     public void SetCursorState(bool locked)
     {
         cursorLocked = locked;

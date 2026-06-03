@@ -1,11 +1,10 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using TMPro;
 using UnityEngine;
-
-
 
 public class FileBrowser : MonoBehaviour
 {
@@ -54,23 +53,48 @@ public class FileBrowser : MonoBehaviour
              "overwriting them with a '(path not found)' placeholder.")]
     public bool preserveManualOptionsOnFailure = true;
 
+    [Header("CSV Compatibility Filter")]
+    [SerializeField] private bool filterCsvByRobot;
+    [SerializeField] private string csvRobotFilterKey = "";
+
+    private struct CsvColumnCacheEntry
+    {
+        public long Length;
+        public DateTime LastWriteTimeUtc;
+        public int ColumnCount;
+    }
+
+    private static readonly Dictionary<string, CsvColumnCacheEntry> CsvColumnCache =
+        new Dictionary<string, CsvColumnCacheEntry>(StringComparer.OrdinalIgnoreCase);
+
+    private static readonly Dictionary<string, int> CsvExpectedColumnsByRobot =
+        new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
+        {
+            { "G1", 36 },
+            { "G1H", 36 },
+            { "unitree_g1", 36 },
+            { "unitree_g1_with_hands", 36 },
+            { "H1", 26 },
+            { "H1_2", 26 },
+            { "unitree_h1", 26 },
+            { "unitree_h1_2", 26 },
+            { "X02", 17 },
+            { "X02Lite", 17 },
+            { "OpenLoong", 38 },
+        };
+
     void Start()
     {
-        // 获取挂载在同一物体上的TMP_Dropdown组件
         dropdown = GetComponent<TMP_Dropdown>();
-
-        // 检查组件是否存在
         if (dropdown == null)
         {
-            Debug.LogError("未找到TMP_Dropdown组件，请确保脚本挂载在正确的物体上！");
+            Debug.LogError("[FileBrowser] No TMP_Dropdown component on this GameObject.");
             return;
         }
 
-        // 开始读取文件并填充下拉列表
         PopulateDropdown();
     }
 
-    // 从指定文件夹读取文件并填充到下拉列表中
     public void PopulateDropdown()
     {
         if (dropdown == null)
@@ -87,17 +111,12 @@ public class FileBrowser : MonoBehaviour
         folderPaths.Clear();
         folderDisplayNames.Clear();
 
-        // StaticList mode: skip filesystem scanning entirely and just push the
-        // hand-authored staticOptions into the dropdown. Used by the RoboList
-        // dropdown so it can list arbitrary robot keys (unitree_g1, unitree_h1)
-        // without needing real subfolders on disk.
         if (dropdownMode == DropdownMode.StaticList)
         {
             PopulateStaticOptions();
             return;
         }
 
-        // Try primary path first, then each fallback in order.
         string resolved = ResolveExistingFolderPath();
         if (string.IsNullOrEmpty(resolved))
         {
@@ -109,10 +128,6 @@ public class FileBrowser : MonoBehaviour
 
             if (preserveManualOptionsOnFailure && dropdown.options != null && dropdown.options.Count > 0)
             {
-                // Keep whatever the user dragged into the dropdown's Options
-                // array in the Inspector. Don't wipe it with a placeholder
-                // that won't render (Chinese strings break with default TMP
-                // font) and that wipes the user's intended options.
                 Debug.Log($"[FileBrowser] Keeping {dropdown.options.Count} manually-authored dropdown options on '{name}'.");
                 return;
             }
@@ -121,8 +136,6 @@ public class FileBrowser : MonoBehaviour
             return;
         }
 
-        // Cache the resolved path so subsequent reads (Search/GetCsvFiles…)
-        // use the same folder that succeeded the existence check.
         folderPath = resolved;
 
         if (dropdownMode == DropdownMode.Folders)
@@ -133,6 +146,20 @@ public class FileBrowser : MonoBehaviour
         {
             PopulateCsvOptions();
         }
+    }
+
+    public void SetCsvRobotFilter(string robotKeyOrLabel)
+    {
+        csvRobotFilterKey = (robotKeyOrLabel ?? string.Empty).Trim();
+        filterCsvByRobot = true;
+        PopulateDropdown();
+    }
+
+    public void ClearCsvRobotFilter()
+    {
+        csvRobotFilterKey = string.Empty;
+        filterCsvByRobot = false;
+        PopulateDropdown();
     }
 
     private string ResolveExistingFolderPath()
@@ -185,7 +212,7 @@ public class FileBrowser : MonoBehaviour
         {
             if (preserveManualOptionsOnFailure && dropdown.options != null && dropdown.options.Count > 0)
             {
-                Debug.Log($"[FileBrowser:{name}] StaticList mode with empty staticOptions — keeping manually-authored Inspector options.");
+                Debug.Log($"[FileBrowser:{name}] StaticList mode with empty staticOptions - keeping manually-authored Inspector options.");
                 return;
             }
             SetFallbackOption("(no static options)");
@@ -200,33 +227,145 @@ public class FileBrowser : MonoBehaviour
 
     private void PopulateCsvOptions()
     {
-        SearchOption searchOption = includeSubfolders ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
+        string previousSelection = GetCurrentDropdownText();
+        SearchOption searchOption = (includeSubfolders || filterCsvByRobot)
+            ? SearchOption.AllDirectories
+            : SearchOption.TopDirectoryOnly;
         string[] files = Directory.GetFiles(folderPath, searchPattern, searchOption);
 
-        // 仅保留 csv，按文件名去重，避免 .csv 与 .csv.meta 导致重复显示
-        csvFilePaths.AddRange(
-            files
-                .Where(filePath => string.Equals(Path.GetExtension(filePath), ".csv", StringComparison.OrdinalIgnoreCase))
-                .GroupBy(filePath => Path.GetFileNameWithoutExtension(filePath), StringComparer.OrdinalIgnoreCase)
-                .Select(group => group.First())
-                .OrderBy(filePath => Path.GetFileNameWithoutExtension(filePath), StringComparer.OrdinalIgnoreCase)
-        );
+        IEnumerable<string> csvFiles = files
+            .Where(filePath => string.Equals(Path.GetExtension(filePath), ".csv", StringComparison.OrdinalIgnoreCase))
+            .GroupBy(GetCsvDisplayName, StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.First());
+
+        if (filterCsvByRobot)
+        {
+            csvFiles = csvFiles.Where(IsCompatibleWithActiveRobotFilter);
+        }
+
+        csvFilePaths.AddRange(csvFiles
+            .OrderBy(filePath => Path.GetFileNameWithoutExtension(filePath), StringComparer.OrdinalIgnoreCase));
 
         List<string> fileNames = csvFilePaths
-            .Select(filePath => Path.GetFileNameWithoutExtension(filePath))
+            .Select(GetCsvDisplayName)
             .ToList();
 
         if (fileNames.Count == 0)
         {
-            SetFallbackOption("can't find csv files");
+            SetFallbackOption(filterCsvByRobot ? "no compatible csv files" : "can't find csv files");
             return;
         }
 
         dropdown.ClearOptions();
         dropdown.AddOptions(fileNames);
+        RestoreSelection(previousSelection, fileNames);
         dropdown.RefreshShownValue();
 
-        Debug.Log($"已成功将 {csvFilePaths.Count} 个csv文件添加到下拉列表中。");
+        Debug.Log($"[FileBrowser:{name}] Loaded {csvFilePaths.Count} csv files" +
+                  (filterCsvByRobot ? $" for robot '{csvRobotFilterKey}'." : "."));
+    }
+
+    private bool IsCompatibleWithActiveRobotFilter(string filePath)
+    {
+        if (!TryResolveExpectedColumns(csvRobotFilterKey, out int expectedColumns))
+        {
+            return false;
+        }
+
+        if (!TryReadCsvColumnCount(filePath, out int columnCount))
+        {
+            return false;
+        }
+
+        return columnCount == expectedColumns;
+    }
+
+    private static bool TryResolveExpectedColumns(string robotKeyOrLabel, out int expectedColumns)
+    {
+        expectedColumns = 0;
+        if (string.IsNullOrWhiteSpace(robotKeyOrLabel))
+        {
+            return false;
+        }
+
+        return CsvExpectedColumnsByRobot.TryGetValue(robotKeyOrLabel.Trim(), out expectedColumns);
+    }
+
+    private static bool TryReadCsvColumnCount(string filePath, out int columnCount)
+    {
+        columnCount = 0;
+
+        try
+        {
+            FileInfo info = new FileInfo(filePath);
+            string key = info.FullName;
+            if (CsvColumnCache.TryGetValue(key, out CsvColumnCacheEntry cached) &&
+                cached.Length == info.Length &&
+                cached.LastWriteTimeUtc == info.LastWriteTimeUtc)
+            {
+                columnCount = cached.ColumnCount;
+                return columnCount > 0;
+            }
+
+            int detected = DetectFirstNumericRowColumnCount(info.FullName);
+            CsvColumnCache[key] = new CsvColumnCacheEntry
+            {
+                Length = info.Length,
+                LastWriteTimeUtc = info.LastWriteTimeUtc,
+                ColumnCount = detected,
+            };
+
+            columnCount = detected;
+            return columnCount > 0;
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning($"[FileBrowser] Failed to inspect CSV '{filePath}': {e.Message}");
+            return false;
+        }
+    }
+
+    private static int DetectFirstNumericRowColumnCount(string filePath)
+    {
+        using (FileStream fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+        using (StreamReader reader = new StreamReader(fs))
+        {
+            string line;
+            int inspectedLines = 0;
+            while ((line = reader.ReadLine()) != null && inspectedLines < 50)
+            {
+                if (string.IsNullOrWhiteSpace(line))
+                {
+                    continue;
+                }
+
+                inspectedLines++;
+                string[] tokens = line.Split(',');
+                if (tokens.Length == 0)
+                {
+                    continue;
+                }
+
+                bool numeric = true;
+                for (int i = 0; i < tokens.Length; i++)
+                {
+                    string token = tokens[i].Trim();
+                    if (!float.TryParse(token, NumberStyles.Float, CultureInfo.InvariantCulture, out _) &&
+                        !float.TryParse(token, out _))
+                    {
+                        numeric = false;
+                        break;
+                    }
+                }
+
+                if (numeric)
+                {
+                    return tokens.Length;
+                }
+            }
+        }
+
+        return 0;
     }
 
     private void PopulateFolderOptions()
@@ -254,14 +393,70 @@ public class FileBrowser : MonoBehaviour
         dropdown.AddOptions(folderNames);
         dropdown.RefreshShownValue();
 
-        Debug.Log($"已成功将 {folderPaths.Count} 个文件夹添加到下拉列表中。");
+        Debug.Log($"[FileBrowser:{name}] Loaded {folderPaths.Count} folders.");
     }
 
     private void SetFallbackOption(string text)
     {
+        csvFilePaths.Clear();
         dropdown.ClearOptions();
         dropdown.AddOptions(new List<string> { text });
+        dropdown.value = 0;
         dropdown.RefreshShownValue();
+    }
+
+    private string GetCurrentDropdownText()
+    {
+        if (dropdown == null || dropdown.options == null || dropdown.options.Count == 0)
+        {
+            return string.Empty;
+        }
+
+        int index = Mathf.Clamp(dropdown.value, 0, dropdown.options.Count - 1);
+        return dropdown.options[index].text;
+    }
+
+    private void RestoreSelection(string previousSelection, List<string> fileNames)
+    {
+        if (string.IsNullOrWhiteSpace(previousSelection))
+        {
+            dropdown.value = 0;
+            return;
+        }
+
+        int index = fileNames.FindIndex(fileName =>
+            string.Equals(fileName, previousSelection, StringComparison.OrdinalIgnoreCase));
+        dropdown.value = index >= 0 ? index : 0;
+    }
+
+    private string GetCsvDisplayName(string absolutePath)
+    {
+        string noExt = Path.GetFileNameWithoutExtension(absolutePath);
+        if (string.IsNullOrWhiteSpace(folderPath))
+        {
+            return noExt;
+        }
+
+        try
+        {
+            string directory = Path.GetDirectoryName(absolutePath);
+            if (string.IsNullOrWhiteSpace(directory))
+            {
+                return noExt;
+            }
+
+            string relativeDirectory = Path.GetRelativePath(folderPath, directory);
+            if (string.IsNullOrWhiteSpace(relativeDirectory) || relativeDirectory == ".")
+            {
+                return noExt;
+            }
+
+            return Path.Combine(relativeDirectory, noExt).Replace(Path.DirectorySeparatorChar, '/');
+        }
+        catch
+        {
+            return noExt;
+        }
     }
 
     private string GetFolderDisplayName(string absolutePath)
@@ -296,6 +491,22 @@ public class FileBrowser : MonoBehaviour
 
         int index = Mathf.Clamp(dropdown.value, 0, csvFilePaths.Count - 1);
         return Path.GetFileNameWithoutExtension(csvFilePaths[index]);
+    }
+
+    public string GetSelectedCsvPath()
+    {
+        if (dropdown == null)
+        {
+            dropdown = GetComponent<TMP_Dropdown>();
+        }
+
+        if (dropdown == null || dropdownMode != DropdownMode.CsvFiles || csvFilePaths.Count == 0)
+        {
+            return string.Empty;
+        }
+
+        int index = Mathf.Clamp(dropdown.value, 0, csvFilePaths.Count - 1);
+        return csvFilePaths[index];
     }
 
     public List<string> GetCsvFilePaths()

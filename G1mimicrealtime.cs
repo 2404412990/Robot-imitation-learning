@@ -95,7 +95,9 @@ public class G1mimicAgent_RealTime : Agent
                     }
                 }
             }
-            catch (Exception e) { }
+            catch (Exception e) {
+                Debug.LogError("Error receiving data: " + e.Message);
+            }
         }
     }
 

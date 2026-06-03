@@ -12,7 +12,7 @@ using System;
 using System.Globalization;
 using Gewu.Imitation;
 
-public class G1mimicAgent : Agent, IMimicAgent
+public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
 {
     public bool train = false;
     public bool replay = false;
@@ -101,6 +101,7 @@ public class G1mimicAgent : Agent, IMimicAgent
     private List<float[]> itpData = new List<float[]>();
 
     private int currentFrame;
+    private int realtimePreviousMaxStep = -1;
 
     float[] currentData = new float[36];
     float[] currentPos = new float[3];
@@ -144,6 +145,40 @@ public class G1mimicAgent : Agent, IMimicAgent
     public bool ReplayMode { get => replay; set => replay = value; }
     public int MotionId { get => motion_id; set => motion_id = value; }
     public void RequestEndEpisode() => EndEpisode();
+    public int ExpectedCsvColumns => 36;
+
+    public void BeginRealtimeCsv()
+    {
+        if (realtimePreviousMaxStep < 0)
+        {
+            realtimePreviousMaxStep = MaxStep;
+        }
+
+        MaxStep = 0;
+        refData = new List<float[]>();
+        itpData = new List<float[]>();
+        motion_name = "live_motion";
+        currentFrame = 0;
+        tt = 0;
+        UseExternalReplayData = true;
+        ReplayMode = true;
+    }
+
+    public bool AppendRealtimeCsvRows(IReadOnlyList<float[]> rows)
+    {
+        return ReplayCsvUtility.AppendResampled30FpsToFixed50Hz(refData, itpData, rows, ExpectedCsvColumns) > 0;
+    }
+
+    public void EndRealtimeCsv()
+    {
+        if (realtimePreviousMaxStep >= 0)
+        {
+            MaxStep = realtimePreviousMaxStep;
+            realtimePreviousMaxStep = -1;
+        }
+
+        UseExternalReplayData = false;
+    }
 
     /// <summary>
     /// Imperative reset of the agent's PD targets and replay bookkeeping.

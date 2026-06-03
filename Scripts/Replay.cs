@@ -11,15 +11,12 @@ public class Replay : MonoBehaviour
     [SerializeField] private TMP_Dropdown csvListDropdown;
     [SerializeField] private FileBrowser csvListFileBrowser;
 
-    [Tooltip("Optional explicit IMimicAgent to drive in replay. When left empty, the agent " +
-             "matching the currently selected robot key (from the RoboList dropdown wired into " +
-             "StartInput) is looked up via MimicAgentRegistry. If that also fails, the first " +
-             "registered agent in the scene is used.")]
+    [Tooltip("Optional explicit IMimicAgent to drive in replay. RoboList selection has priority; " +
+             "if the selected robot has no matching registered agent, replay stops instead of " +
+             "falling back to another robot.")]
     [SerializeField] private MonoBehaviour targetAgentBehaviour;
     [SerializeField] private StartInput startInput;
-    [Tooltip("Optional RoboList dropdown used to pick which robot the replay applies to. " +
-             "When empty, this Replay script falls back to whichever agent ResolveActiveAgent() " +
-             "would pick (typically the first registered robot).")]
+    [Tooltip("Optional RoboList dropdown used to pick which robot the replay applies to.")]
     [SerializeField] private TMP_Dropdown roboListDropdown;
     [SerializeField] private FileBrowser roboListFileBrowser;
     [SerializeField] private string roboListObjectName = "RoboList";
@@ -43,6 +40,18 @@ public class Replay : MonoBehaviour
 
     private Button replayButton;
     private bool addedRuntimeListener;
+
+    private static readonly Dictionary<string, string> RobotAliases =
+        new Dictionary<string, string>(System.StringComparer.OrdinalIgnoreCase)
+        {
+            { "G1", "unitree_g1" },
+            { "G1H", "unitree_g1_with_hands" },
+            { "H1", "unitree_h1" },
+            { "H1_2", "unitree_h1_2" },
+            { "X02", "x02lite" },
+            { "X02Lite", "x02lite" },
+            { "OpenLoong", "openloong" },
+        };
 
     void Awake()
     {
@@ -162,6 +171,15 @@ public class Replay : MonoBehaviour
     {
         if (string.IsNullOrWhiteSpace(selectedCsvName)) return string.Empty;
 
+        if (csvListFileBrowser != null)
+        {
+            string selectedPath = csvListFileBrowser.GetSelectedCsvPath();
+            if (!string.IsNullOrWhiteSpace(selectedPath) && File.Exists(selectedPath))
+            {
+                return selectedPath;
+            }
+        }
+
         string datasetPath = ResolveReplayDatasetPath();
         if (string.IsNullOrEmpty(datasetPath)) return string.Empty;
 
@@ -169,7 +187,7 @@ public class Replay : MonoBehaviour
 
         try
         {
-            string[] allFiles = Directory.GetFiles(datasetPath);
+            string[] allFiles = Directory.GetFiles(datasetPath, "*.csv", SearchOption.AllDirectories);
             foreach (string file in allFiles)
             {
                 if (Path.GetExtension(file).ToLower() != ".csv") continue;
@@ -190,24 +208,24 @@ public class Replay : MonoBehaviour
 
     private IMimicAgent ResolveActiveAgent()
     {
-        // 1) Inspector override.
+        string selectedKey = ResolveSelectedRobotKey();
+
+        if (!string.IsNullOrWhiteSpace(selectedKey) && MimicAgentRegistry.Instance != null)
+        {
+            IMimicAgent byKey = MimicAgentRegistry.Instance.FindByKey(selectedKey);
+            if (byKey != null && byKey.AgentGameObject != null) return byKey;
+
+            Debug.LogError($"[Replay] No IMimicAgent registered for selected robot '{selectedKey}'. Replay will not fall back to another robot.");
+            return null;
+        }
+
         if (targetAgentBehaviour is IMimicAgent pinned && pinned.AgentGameObject != null)
         {
             return pinned;
         }
 
-        // 2) Match the RoboList selection (if a dropdown is wired up).
-        string selectedKey = ResolveSelectedRobotKey();
-        if (!string.IsNullOrWhiteSpace(selectedKey) && MimicAgentRegistry.Instance != null)
-        {
-            IMimicAgent byKey = MimicAgentRegistry.Instance.FindByKey(selectedKey);
-            if (byKey != null && byKey.AgentGameObject != null) return byKey;
-        }
-
-        // 3) Last-resort: first registered alive agent.
-        return MimicAgentRegistry.Instance != null
-            ? MimicAgentRegistry.Instance.GetFirstAlive()
-            : null;
+        Debug.LogError("[Replay] No robot is selected in RoboList and no targetAgentBehaviour is assigned.");
+        return null;
     }
 
     private string ResolveSelectedRobotKey()
@@ -225,18 +243,29 @@ public class Replay : MonoBehaviour
         if (roboListFileBrowser != null)
         {
             string folder = roboListFileBrowser.GetSelectedFolderPath();
-            if (!string.IsNullOrWhiteSpace(folder)) return Path.GetFileName(folder).Trim();
+            if (!string.IsNullOrWhiteSpace(folder)) return NormalizeRobotKey(Path.GetFileName(folder).Trim());
             string csv = roboListFileBrowser.GetSelectedCsvName();
-            if (!string.IsNullOrWhiteSpace(csv)) return csv.Trim();
+            if (!string.IsNullOrWhiteSpace(csv)) return NormalizeRobotKey(csv.Trim());
         }
 
         if (roboListDropdown != null && roboListDropdown.options != null && roboListDropdown.options.Count > 0)
         {
             string text = roboListDropdown.options[roboListDropdown.value].text;
-            if (!string.IsNullOrWhiteSpace(text) && !text.StartsWith("(")) return text.Trim();
+            if (!string.IsNullOrWhiteSpace(text) && !text.StartsWith("(")) return NormalizeRobotKey(text.Trim());
         }
 
         return string.Empty;
+    }
+
+    private static string NormalizeRobotKey(string raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return string.Empty;
+        }
+
+        string trimmed = raw.Trim();
+        return RobotAliases.TryGetValue(trimmed, out string alias) ? alias : trimmed;
     }
 
     private void ResolveReferences()
@@ -400,13 +429,12 @@ public class Replay : MonoBehaviour
 
         try
         {
-            string[] allFiles = Directory.GetFiles(directoryPath);
+            string[] allFiles = Directory.GetFiles(directoryPath, "*.csv", SearchOption.AllDirectories);
             foreach (string file in allFiles)
             {
                 if (Path.GetExtension(file).ToLower() == ".csv")
                 {
-                    string fileName = Path.GetFileName(file);
-                    csvFiles.Add(Path.Combine(directoryPath, fileName));
+                    csvFiles.Add(file);
                 }
             }
         }

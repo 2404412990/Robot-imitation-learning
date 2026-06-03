@@ -11,7 +11,7 @@ using System;
 using System.Globalization;
 using Gewu.Imitation;
 
-public class X02LiteMimicAgent : Agent, IMimicAgent
+public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
 {
     public bool train = false;
     public bool replay = false;
@@ -19,6 +19,20 @@ public class X02LiteMimicAgent : Agent, IMimicAgent
     [Header("Multi-Robot Registry")]
     [Tooltip("Robot key used by the WHAM + GMR pipeline. Must match the name in StartInput.")]
     [SerializeField] private string robotKey = "x02lite";
+
+    private static readonly string[] CsvJointNames =
+    {
+        "L_hip_yaw_Link",
+        "L_hip_roll_Link",
+        "L_hip_pitch_Link",
+        "L_knee_Link",
+        "L_ankle_pitch_Link",
+        "R_hip_yaw_Link",
+        "R_hip_roll_Link",
+        "R_hip_pitch_Link",
+        "R_knee_Link",
+        "R_ankle_pitch_Link",
+    };
 
     // X02Lite has 10 DOF (legs only, 5 per leg). The URDF joint order is:
     //   0..4  left  leg: hip_yaw, hip_roll, hip_pitch, knee_pitch, ankle_pitch
@@ -65,6 +79,7 @@ public class X02LiteMimicAgent : Agent, IMimicAgent
     private List<float[]> itpData = new List<float[]>();
 
     private int currentFrame;
+    private int realtimePreviousMaxStep = -1;
 
     // X02Lite CSV: 3 root pos + 4 root quat + 10 DOF = 17 cols
     float[] currentData = new float[17];
@@ -104,6 +119,39 @@ public class X02LiteMimicAgent : Agent, IMimicAgent
     public bool ReplayMode { get => replay; set => replay = value; }
     public int MotionId { get; set; }
     public void RequestEndEpisode() => EndEpisode();
+    public int ExpectedCsvColumns => 17;
+
+    public void BeginRealtimeCsv()
+    {
+        if (realtimePreviousMaxStep < 0)
+        {
+            realtimePreviousMaxStep = MaxStep;
+        }
+
+        MaxStep = 0;
+        refData = new List<float[]>();
+        itpData = new List<float[]>();
+        currentFrame = 0;
+        tt = 0;
+        UseExternalReplayData = true;
+        ReplayMode = true;
+    }
+
+    public bool AppendRealtimeCsvRows(IReadOnlyList<float[]> rows)
+    {
+        return ReplayCsvUtility.AppendResampled30FpsToFixed50Hz(refData, itpData, rows, ExpectedCsvColumns) > 0;
+    }
+
+    public void EndRealtimeCsv()
+    {
+        if (realtimePreviousMaxStep >= 0)
+        {
+            MaxStep = realtimePreviousMaxStep;
+            realtimePreviousMaxStep = -1;
+        }
+
+        UseExternalReplayData = false;
+    }
 
     public void ResetToInitialState()
     {
@@ -137,15 +185,7 @@ public class X02LiteMimicAgent : Agent, IMimicAgent
     public override void Initialize()
     {
         arts = this.GetComponentsInChildren<ArticulationBody>();
-        int ActionNum = 0;
-        for (int k = 0; k < arts.Length; k++)
-        {
-            if (arts[k].jointType.ToString() == "RevoluteJoint")
-            {
-                jh[ActionNum] = arts[k];
-                ActionNum++;
-            }
-        }
+        ResolveCsvJointMap();
 
         body = arts[0].GetComponent<Transform>();
         art0 = body.GetComponent<ArticulationBody>();
@@ -167,6 +207,30 @@ public class X02LiteMimicAgent : Agent, IMimicAgent
         if (logJointMappingOnStart) DumpJointMapping();
 
         MimicAgentRegistry.Instance.Register(this);
+    }
+
+    private void ResolveCsvJointMap()
+    {
+        var byName = arts
+            .Where(art => art != null && art.jointType == ArticulationJointType.RevoluteJoint)
+            .GroupBy(art => art.name, System.StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(group => group.Key, group => group.First(), System.StringComparer.OrdinalIgnoreCase);
+
+        var fallback = arts
+            .Where(art => art != null && art.jointType == ArticulationJointType.RevoluteJoint)
+            .ToList();
+
+        for (int i = 0; i < CsvJointNames.Length; i++)
+        {
+            if (byName.TryGetValue(CsvJointNames[i], out ArticulationBody joint))
+            {
+                jh[i] = joint;
+                continue;
+            }
+
+            jh[i] = i < fallback.Count ? fallback[i] : null;
+            UnityEngine.Debug.LogWarning($"[X02Lite] Missing expected joint '{CsvJointNames[i]}'; using traversal fallback at index {i}.");
+        }
     }
 
     List<string> GetCsvFileNames(string directoryPath)
@@ -519,7 +583,8 @@ public class X02LiteMimicAgent : Agent, IMimicAgent
         if (replay) kb = 0;
         for (int i = 0; i < 10; i++)
         {
-            u[i] = u[i] * kk + (1 - kk) * continuousActions[i];
+            float action = i < continuousActions.Length ? continuousActions[i] : 0f;
+            u[i] = u[i] * kk + (1 - kk) * action;
             utotal[i] = kb * u[i] + uff[i];
             SetJointTargetDeg(jh[i], utotal[i]);
         }
@@ -600,6 +665,7 @@ public class X02LiteMimicAgent : Agent, IMimicAgent
 
     void SetJointTargetDeg(ArticulationBody joint, float x)
     {
+        if (joint == null) return;
         var drive = joint.xDrive;
         drive.stiffness = 180f;
         drive.damping = 8f;
