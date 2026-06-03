@@ -84,7 +84,18 @@ namespace Gewu.Imitation
     {
         int ExpectedCsvColumns { get; }
         void BeginRealtimeCsv();
+        void SetRealtimePlaybackRate(float framesPerSecond, float bufferSeconds);
         bool AppendRealtimeCsvRows(IReadOnlyList<float[]> rows);
         void EndRealtimeCsv();
+    }
+
+    /// <summary>
+    /// Optional visibility/selection hook used by StartInput when robots are
+    /// hidden via renderer toggles instead of SetActive(false). Implementations
+    /// can freeze physics and suppress policy/replay updates while hidden.
+    /// </summary>
+    public interface ISelectableMimicAgent
+    {
+        void SetRobotSelectedInScene(bool isSelected);
     }
 }

@@ -80,9 +80,13 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
 
     private int currentFrame;
     private int realtimePreviousMaxStep = -1;
+    private float realtimeFrameCursor;
+    private float realtimePlaybackFps = ReplayCsvUtility.SourceFps;
+    private float realtimePlaybackBufferSeconds = 0.2f;
 
     // X02Lite CSV: 3 root pos + 4 root quat + 10 DOF = 17 cols
     float[] currentData = new float[17];
+    float[] realtimeSampledData = new float[17];
     float[] currentPos = new float[3];
     float[] currentRot = new float[4];
     float[] currentDof = new float[10];
@@ -132,14 +136,21 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
         refData = new List<float[]>();
         itpData = new List<float[]>();
         currentFrame = 0;
+        realtimeFrameCursor = 0f;
         tt = 0;
         UseExternalReplayData = true;
         ReplayMode = true;
     }
 
+    public void SetRealtimePlaybackRate(float framesPerSecond, float bufferSeconds)
+    {
+        realtimePlaybackFps = ReplayCsvUtility.ClampRealtimeFps(framesPerSecond);
+        realtimePlaybackBufferSeconds = Mathf.Max(0f, bufferSeconds);
+    }
+
     public bool AppendRealtimeCsvRows(IReadOnlyList<float[]> rows)
     {
-        return ReplayCsvUtility.AppendResampled30FpsToFixed50Hz(refData, itpData, rows, ExpectedCsvColumns) > 0;
+        return ReplayCsvUtility.AppendRawRows(itpData, rows, ExpectedCsvColumns) > 0;
     }
 
     public void EndRealtimeCsv()
@@ -162,7 +173,11 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
             uff[i] = 0f;
             utotal[i] = 0f;
         }
-        currentFrame = frame0;
+        currentFrame = useExternalReplayData ? 0 : frame0;
+        if (useExternalReplayData)
+        {
+            realtimeFrameCursor = 0f;
+        }
         tt = 0;
     }
 
@@ -477,22 +492,27 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
 
         for (int i = 0; i < 10; i++) u[i]   = 0;
         for (int i = 0; i < 10; i++) uff[i] = 0;
-        currentFrame = frame0;
+        currentFrame = useExternalReplayData ? 0 : frame0;
+        if (useExternalReplayData)
+        {
+            realtimeFrameCursor = 0f;
+        }
 
         if (replay && !useExternalReplayData)
         {
             TryLoadCurrentMotionData(keepProgress: false);
         }
 
-        if (refData == null || refData.Count == 0)
+        List<float[]> episodeData = useExternalReplayData ? itpData : refData;
+        if (episodeData == null || episodeData.Count == 0)
         {
-            UnityEngine.Debug.LogWarning("[X02Lite] refData is empty, skip OnEpisodeBegin.");
+            UnityEngine.Debug.LogWarning("[X02Lite] replay data is empty, skip OnEpisodeBegin.");
             return;
         }
 
-        currentFrame = Mathf.Clamp(currentFrame, 0, refData.Count - 1);
+        currentFrame = Mathf.Clamp(currentFrame, 0, episodeData.Count - 1);
         tt = 0;
-        currentData = refData[currentFrame];
+        currentData = episodeData[currentFrame];
         Array.Copy(currentData, 0, currentPos, 0, 3);
         Array.Copy(currentData, 3, currentRot, 0, 4);
         Array.Copy(currentData, 7, currentDof, 0, 10);
@@ -594,8 +614,25 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
     {
         if (itpData != null && itpData.Count > 0)
         {
-            currentFrame = Mathf.Clamp(currentFrame, 0, itpData.Count - 1);
-            currentData = itpData[currentFrame];
+            if (useExternalReplayData)
+            {
+                realtimeFrameCursor = Mathf.Clamp(realtimeFrameCursor, 0f, itpData.Count - 1);
+                if (ReplayCsvUtility.SampleRowsAtFrame(itpData, realtimeFrameCursor, ExpectedCsvColumns, realtimeSampledData))
+                {
+                    currentData = realtimeSampledData;
+                    currentFrame = Mathf.Clamp(Mathf.FloorToInt(realtimeFrameCursor), 0, itpData.Count - 1);
+                }
+                else
+                {
+                    currentFrame = Mathf.Clamp(currentFrame, 0, itpData.Count - 1);
+                    currentData = itpData[currentFrame];
+                }
+            }
+            else
+            {
+                currentFrame = Mathf.Clamp(currentFrame, 0, itpData.Count - 1);
+                currentData = itpData[currentFrame];
+            }
             Array.Copy(currentData, 0, currentPos, 0, 3);
             Array.Copy(currentData, 3, currentRot, 0, 4);
             Array.Copy(currentData, 7, currentDof, 0, 10);
@@ -659,7 +696,20 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
 
         if (itpData != null && currentFrame < itpData.Count - 1)
         {
-            currentFrame = currentFrame + 1;
+            if (useExternalReplayData)
+            {
+                realtimeFrameCursor = ReplayCsvUtility.AdvanceRealtimeCursor(
+                    realtimeFrameCursor,
+                    itpData.Count,
+                    realtimePlaybackFps,
+                    Time.fixedDeltaTime,
+                    realtimePlaybackBufferSeconds);
+                currentFrame = Mathf.Clamp(Mathf.FloorToInt(realtimeFrameCursor), 0, itpData.Count - 1);
+            }
+            else
+            {
+                currentFrame = currentFrame + 1;
+            }
         }
     }
 

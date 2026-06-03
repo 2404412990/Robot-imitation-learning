@@ -17,9 +17,6 @@ backup/
 
 Imitation.rar
 
-/*.meta
-
-/*.*.meta
 !OpenLoongMimicAgent.cs.meta
 
 /AGENTS.md

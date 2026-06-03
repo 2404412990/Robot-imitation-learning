@@ -89,11 +89,17 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
     private List<float[]> allPosData = new List<float[]>();
     private List<float[]> allRotData = new List<float[]>();
     private readonly List<float[]> realtimeRawRows = new List<float[]>();
-    private readonly List<float[]> realtimeFixedRows = new List<float[]>();
+    private readonly float[] realtimeSampledRow = new float[26];
+    private readonly float[] realtimeCurrentPos = new float[3];
+    private readonly float[] realtimeCurrentRot = new float[4];
+    private readonly float[] realtimeCurrentDof = new float[19];
     
     private int currentFrame = 0;  
     private bool isEndEpisode = false;
     private int realtimePreviousMaxStep = -1;
+    private float realtimeFrameCursor;
+    private float realtimePlaybackFps = ReplayCsvUtility.SourceFps;
+    private float realtimePlaybackBufferSeconds = 0.2f;
     
     Transform body;
 
@@ -129,37 +135,27 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
 
         MaxStep = 0;
         realtimeRawRows.Clear();
-        realtimeFixedRows.Clear();
         allDofData = new List<float[]>();
         allPosData = new List<float[]>();
         allRotData = new List<float[]>();
         motion_name = "live_motion";
         currentFrame = 0;
+        realtimeFrameCursor = 0f;
         tt = 0;
         isEndEpisode = false;
         UseExternalReplayData = true;
         ReplayMode = true;
     }
 
+    public void SetRealtimePlaybackRate(float framesPerSecond, float bufferSeconds)
+    {
+        realtimePlaybackFps = ReplayCsvUtility.ClampRealtimeFps(framesPerSecond);
+        realtimePlaybackBufferSeconds = Mathf.Max(0f, bufferSeconds);
+    }
+
     public bool AppendRealtimeCsvRows(IReadOnlyList<float[]> rows)
     {
-        int oldFixedCount = realtimeFixedRows.Count;
-        int appended = ReplayCsvUtility.AppendResampled30FpsToFixed50Hz(
-            realtimeRawRows,
-            realtimeFixedRows,
-            rows,
-            ExpectedCsvColumns);
-        if (appended <= 0)
-        {
-            return false;
-        }
-
-        for (int rowIndex = oldFixedCount; rowIndex < realtimeFixedRows.Count; rowIndex++)
-        {
-            AppendFlatRowToH1Buffers(realtimeFixedRows[rowIndex]);
-        }
-
-        return true;
+        return ReplayCsvUtility.AppendRawRows(realtimeRawRows, rows, ExpectedCsvColumns) > 0;
     }
 
     public void EndRealtimeCsv()
@@ -591,19 +587,33 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
         //if(train)idx=(int)Mathf.Floor(((Time.time%390)/30));//train for 2 million steps after
 
         tt=0;
-        // Guard against empty data — e.g. live retargeting before the first
-        // CSV frame has arrived. The original code accessed index [1]
-        // unconditionally; pick a safe in-range index instead.
-        if (allDofData == null || allDofData.Count == 0 ||
-            allPosData == null || allPosData.Count == 0 ||
-            allRotData == null || allRotData.Count == 0)
+        float[] currentDof;
+        float[] currentPos;
+        float[] currentRot;
+        if (useExternalReplayData && realtimeRawRows.Count > 0)
         {
-            return;
+            float[] currentFlatRow = realtimeRawRows[0];
+            currentPos = realtimeCurrentPos;
+            currentRot = realtimeCurrentRot;
+            currentDof = realtimeCurrentDof;
+            System.Array.Copy(currentFlatRow, 0, currentPos, 0, 3);
+            System.Array.Copy(currentFlatRow, 3, currentRot, 0, 4);
+            System.Array.Copy(currentFlatRow, 7, currentDof, 0, 19);
         }
-        int seedFrame = Mathf.Min(1, allDofData.Count - 1);
-        float[] currentDof = allDofData[seedFrame];
-        float[] currentPos = allPosData[Mathf.Min(seedFrame, allPosData.Count - 1)];
-        float[] currentRot = allRotData[Mathf.Min(seedFrame, allRotData.Count - 1)];
+        else
+        {
+            if (allDofData == null || allDofData.Count == 0 ||
+                allPosData == null || allPosData.Count == 0 ||
+                allRotData == null || allRotData.Count == 0)
+            {
+                return;
+            }
+
+            int seedFrame = Mathf.Min(1, allDofData.Count - 1);
+            currentDof = allDofData[seedFrame];
+            currentPos = allPosData[Mathf.Min(seedFrame, allPosData.Count - 1)];
+            currentRot = allRotData[Mathf.Min(seedFrame, allRotData.Count - 1)];
+        }
         Vector3 newPosition = new Vector3(-currentPos[1], currentPos[2], currentPos[0]);
         Quaternion newRotation = new Quaternion(
             currentRot[1], 
@@ -690,12 +700,36 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
     void FixedUpdate()
     {
 	///////////////feedforward///////////////////////////////////////////////////////////
-	if (allDofData.Count > 0)
+    bool hasRealtimeRows = useExternalReplayData && realtimeRawRows.Count > 0;
+	if (hasRealtimeRows || allDofData.Count > 0)
 	{
-        currentFrame = Mathf.Clamp(currentFrame, 0, allDofData.Count - 1);
-		float[] currentDof = allDofData[currentFrame];
-		float[] currentPos = allPosData[currentFrame];
-        float[] currentRot = allRotData[currentFrame];
+        float[] currentDof;
+        float[] currentPos;
+        float[] currentRot;
+        if (hasRealtimeRows)
+        {
+            realtimeFrameCursor = Mathf.Clamp(realtimeFrameCursor, 0f, realtimeRawRows.Count - 1);
+            float[] currentFlatRow = realtimeSampledRow;
+            if (!ReplayCsvUtility.SampleRowsAtFrame(realtimeRawRows, realtimeFrameCursor, ExpectedCsvColumns, realtimeSampledRow))
+            {
+                currentFlatRow = realtimeRawRows[Mathf.Clamp(currentFrame, 0, realtimeRawRows.Count - 1)];
+            }
+
+            currentFrame = Mathf.Clamp(Mathf.FloorToInt(realtimeFrameCursor), 0, realtimeRawRows.Count - 1);
+            currentPos = realtimeCurrentPos;
+            currentRot = realtimeCurrentRot;
+            currentDof = realtimeCurrentDof;
+            System.Array.Copy(currentFlatRow, 0, currentPos, 0, 3);
+            System.Array.Copy(currentFlatRow, 3, currentRot, 0, 4);
+            System.Array.Copy(currentFlatRow, 7, currentDof, 0, 19);
+        }
+        else
+        {
+            currentFrame = Mathf.Clamp(currentFrame, 0, allDofData.Count - 1);
+		    currentDof = allDofData[currentFrame];
+		    currentPos = allPosData[currentFrame];
+            currentRot = allRotData[currentFrame];
+        }
 		for (int i = 0; i < 19; i++)uff[i] = currentDof[i]* 180f / 3.14f;
 
         Quaternion gymQuat = new Quaternion(
@@ -729,9 +763,23 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
     		Physics.gravity = Vector3.zero;
     		art0.TeleportRoot(newPosition, newRotation);
     	}
-        if (currentFrame < allDofData.Count - 1)
+        int availableFrameCount = hasRealtimeRows ? realtimeRawRows.Count : allDofData.Count;
+        if (currentFrame < availableFrameCount - 1)
         {
-            currentFrame++;
+            if (hasRealtimeRows)
+            {
+                realtimeFrameCursor = ReplayCsvUtility.AdvanceRealtimeCursor(
+                    realtimeFrameCursor,
+                    realtimeRawRows.Count,
+                    realtimePlaybackFps,
+                    Time.fixedDeltaTime,
+                    realtimePlaybackBufferSeconds);
+                currentFrame = Mathf.Clamp(Mathf.FloorToInt(realtimeFrameCursor), 0, realtimeRawRows.Count - 1);
+            }
+            else
+            {
+                currentFrame++;
+            }
         }
         else if (!useExternalReplayData)
         {
@@ -741,7 +789,7 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
                 EndEpisode();
             }
         }
-				if (isEndEpisode)
+		if (!useExternalReplayData && isEndEpisode)
 		{
 	            currentFrame = 0;
 	            isEndEpisode = false; 

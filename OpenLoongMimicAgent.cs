@@ -3,12 +3,13 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using Gewu.Imitation;
 using Unity.MLAgents;
 using Unity.MLAgents.Actuators;
 using UnityEngine;
 
-public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
+public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelectableMimicAgent
 {
     private const int RootPosCols = 3;
     private const int RootRotCols = 4;
@@ -16,6 +17,41 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
     private const int ExpectedCols = RootPosCols + RootRotCols + DofCols;
 
     private static readonly string[] CsvJointNames =
+    {
+        "J_head_yaw",
+        "J_head_pitch",
+        "J_arm_r_01",
+        "J_arm_r_02",
+        "J_arm_r_03",
+        "J_arm_r_04",
+        "J_arm_r_05",
+        "J_arm_r_06",
+        "J_arm_r_07",
+        "J_arm_l_01",
+        "J_arm_l_02",
+        "J_arm_l_03",
+        "J_arm_l_04",
+        "J_arm_l_05",
+        "J_arm_l_06",
+        "J_arm_l_07",
+        "J_waist_pitch",
+        "J_waist_roll",
+        "J_waist_yaw",
+        "J_hip_r_roll",
+        "J_hip_r_yaw",
+        "J_hip_r_pitch",
+        "J_knee_r_pitch",
+        "J_ankle_r_pitch",
+        "J_ankle_r_roll",
+        "J_hip_l_roll",
+        "J_hip_l_yaw",
+        "J_hip_l_pitch",
+        "J_knee_l_pitch",
+        "J_ankle_l_pitch",
+        "J_ankle_l_roll",
+    };
+
+    private static readonly string[] CsvBodyNames =
     {
         "Link_head_yaw",
         "Link_head_pitch",
@@ -95,11 +131,17 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
     private float[] restVelocities = Array.Empty<float>();
     private List<float[]> refData = new List<float[]>();
     private List<float[]> itpData = new List<float[]>();
+    private readonly float[] realtimeSampledRow = new float[ExpectedCols];
     private int currentFrame;
     private int realtimePreviousMaxStep = -1;
+    private float realtimeFrameCursor;
+    private float realtimePlaybackFps = ReplayCsvUtility.SourceFps;
+    private float realtimePlaybackBufferSeconds = 0.2f;
     private int tt;
     private Vector3 newPosition;
     private Quaternion newRotation;
+    private int appliedRowDebugCount;
+    private bool isRobotSelectedInScene = true;
 
     public string RobotKey => string.IsNullOrWhiteSpace(robotKey) ? "openloong" : robotKey.Trim();
     public GameObject AgentGameObject => gameObject;
@@ -108,6 +150,42 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
     public int MotionId { get; set; }
     public void RequestEndEpisode() => EndEpisode();
     public int ExpectedCsvColumns => ExpectedCols;
+
+    public void SetRobotSelectedInScene(bool isSelected)
+    {
+        isRobotSelectedInScene = isSelected;
+        if (rootArticulation == null)
+        {
+            return;
+        }
+
+        if (isSelected)
+        {
+            return;
+        }
+
+        UseExternalReplayData = false;
+        ReplayMode = false;
+        rootArticulation.immovable = false;
+        rootArticulation.TeleportRoot(pos0, rot0);
+        rootArticulation.velocity = Vector3.zero;
+        rootArticulation.angularVelocity = Vector3.zero;
+        SafeSetJointPositions(new List<float>(restPositions));
+        SafeSetJointVelocities(new List<float>(restVelocities));
+
+        for (int i = 0; i < DofCols; i++)
+        {
+            u[i] = 0f;
+            uff[i] = 0f;
+            utotal[i] = 0f;
+            SetJointTargetDeg(jh[i], 0f);
+        }
+
+        currentFrame = frame0;
+        realtimeFrameCursor = 0f;
+        tt = 0;
+        rootArticulation.immovable = true;
+    }
 
     public void BeginRealtimeCsv()
     {
@@ -120,14 +198,22 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
         refData = new List<float[]>();
         itpData = new List<float[]>();
         currentFrame = 0;
+        realtimeFrameCursor = 0f;
+        appliedRowDebugCount = 0;
         tt = 0;
         UseExternalReplayData = true;
         ReplayMode = true;
     }
 
+    public void SetRealtimePlaybackRate(float framesPerSecond, float bufferSeconds)
+    {
+        realtimePlaybackFps = ReplayCsvUtility.ClampRealtimeFps(framesPerSecond);
+        realtimePlaybackBufferSeconds = Mathf.Max(0f, bufferSeconds);
+    }
+
     public bool AppendRealtimeCsvRows(IReadOnlyList<float[]> rows)
     {
-        return ReplayCsvUtility.AppendResampled30FpsToFixed50Hz(refData, itpData, rows, ExpectedCsvColumns) > 0;
+        return ReplayCsvUtility.AppendRawRows(itpData, rows, ExpectedCsvColumns) > 0;
     }
 
     public void EndRealtimeCsv()
@@ -184,7 +270,11 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
         Array.Clear(u, 0, u.Length);
         Array.Clear(uff, 0, uff.Length);
         Array.Clear(utotal, 0, utotal.Length);
-        currentFrame = frame0;
+        currentFrame = useExternalReplayData ? 0 : frame0;
+        if (useExternalReplayData)
+        {
+            realtimeFrameCursor = 0f;
+        }
         tt = 0;
 
         if (replay && !useExternalReplayData)
@@ -204,6 +294,11 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
 
     public override void OnActionReceived(ActionBuffers actionBuffers)
     {
+        if (!isRobotSelectedInScene)
+        {
+            return;
+        }
+
         var continuousActions = actionBuffers.ContinuousActions;
         float actionGain = replay ? 0f : 50f;
         const float Smooth = 0.9f;
@@ -219,12 +314,26 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
 
     private void FixedUpdate()
     {
+        if (!isRobotSelectedInScene)
+        {
+            return;
+        }
+
         if (rootArticulation == null || itpData == null || itpData.Count == 0)
         {
             return;
         }
 
-        ApplyFrame(Mathf.Clamp(currentFrame, 0, itpData.Count - 1), teleportRoot: replay);
+        if (useExternalReplayData)
+        {
+            realtimeFrameCursor = Mathf.Clamp(realtimeFrameCursor, 0f, itpData.Count - 1);
+            ApplyInterpolatedRealtimeFrame(realtimeFrameCursor, teleportRoot: replay);
+            currentFrame = Mathf.Clamp(Mathf.FloorToInt(realtimeFrameCursor), 0, itpData.Count - 1);
+        }
+        else
+        {
+            ApplyFrame(Mathf.Clamp(currentFrame, 0, itpData.Count - 1), teleportRoot: replay);
+        }
 
         tt++;
         if (tt > 3)
@@ -234,8 +343,32 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
 
         if (currentFrame < itpData.Count - 1)
         {
-            currentFrame++;
+            if (useExternalReplayData)
+            {
+                realtimeFrameCursor = ReplayCsvUtility.AdvanceRealtimeCursor(
+                    realtimeFrameCursor,
+                    itpData.Count,
+                    realtimePlaybackFps,
+                    Time.fixedDeltaTime,
+                    realtimePlaybackBufferSeconds);
+                currentFrame = Mathf.Clamp(Mathf.FloorToInt(realtimeFrameCursor), 0, itpData.Count - 1);
+            }
+            else
+            {
+                currentFrame++;
+            }
         }
+    }
+
+    private void ApplyInterpolatedRealtimeFrame(float frameCursor, bool teleportRoot)
+    {
+        if (!ReplayCsvUtility.SampleRowsAtFrame(itpData, frameCursor, ExpectedCsvColumns, realtimeSampledRow))
+        {
+            ApplyFrame(Mathf.Clamp(currentFrame, 0, itpData.Count - 1), teleportRoot);
+            return;
+        }
+
+        ApplyRow(realtimeSampledRow, teleportRoot);
     }
 
     public bool LoadReplayCsvFromPath(string filePath, bool keepProgress)
@@ -285,7 +418,8 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
         if (string.IsNullOrWhiteSpace(datasetPath)) return false;
 
         List<string> csvFiles = Directory.GetFiles(datasetPath, "*.csv", SearchOption.AllDirectories)
-            .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+            .OrderBy(path => string.Equals(Path.GetFileName(path), "neutral_stand.csv", StringComparison.OrdinalIgnoreCase) ? 0 : 1)
+            .ThenBy(path => path, StringComparer.OrdinalIgnoreCase)
             .ToList();
         if (csvFiles.Count == 0) return false;
 
@@ -305,6 +439,10 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
         currentFrame = keepProgress
             ? Mathf.Clamp(oldFrame, 0, itpData.Count - 1)
             : Mathf.Clamp(frame0, 0, itpData.Count - 1);
+        if (!keepProgress)
+        {
+            appliedRowDebugCount = 0;
+        }
         return true;
     }
 
@@ -346,6 +484,11 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
     private void ApplyFrame(int frameIndex, bool teleportRoot)
     {
         float[] row = itpData[frameIndex];
+        ApplyRow(row, teleportRoot);
+    }
+
+    private void ApplyRow(float[] row, bool teleportRoot)
+    {
         float[] pos = new float[RootPosCols];
         float[] rot = new float[RootRotCols];
         Array.Copy(row, 0, pos, 0, RootPosCols);
@@ -357,6 +500,8 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
             uff[i] = row[RootPosCols + RootRotCols + i] * Mathf.Rad2Deg * sign;
             SetJointTargetDeg(jh[i], uff[i]);
         }
+
+        LogAppliedRowDebug(row);
 
         newPosition = new Vector3(-pos[1], pos[2], pos[0]);
         newRotation = new Quaternion(-rot[1], rot[2], rot[0], -rot[3]);
@@ -372,27 +517,81 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
         }
     }
 
+    private void LogAppliedRowDebug(float[] row)
+    {
+        if (appliedRowDebugCount >= 3)
+        {
+            return;
+        }
+
+        appliedRowDebugCount++;
+        int boundCount = 0;
+        int nonZeroDofCount = 0;
+        float maxAbsDeg = 0f;
+        string maxName = "<none>";
+        for (int i = 0; i < DofCols; i++)
+        {
+            if (jh[i] != null)
+            {
+                boundCount++;
+            }
+
+            float absDeg = Mathf.Abs(uff[i]);
+            if (Mathf.Abs(row[RootPosCols + RootRotCols + i]) > 1e-4f)
+            {
+                nonZeroDofCount++;
+            }
+
+            if (absDeg > maxAbsDeg)
+            {
+                maxAbsDeg = absDeg;
+                maxName = CsvJointNames[i];
+            }
+        }
+
+        Debug.Log(
+            $"[OpenLoong] Applied CSV row: boundJoints={boundCount}/{DofCols}, nonZeroDof={nonZeroDofCount}/{DofCols}, " +
+            $"maxTarget={maxAbsDeg:F1}deg at {maxName}.");
+    }
+
     private void ResolveCsvJointMap()
     {
-        var byName = arts
-            .Where(art => art != null && art.jointType == ArticulationJointType.RevoluteJoint)
-            .GroupBy(art => art.name, StringComparer.OrdinalIgnoreCase)
-            .ToDictionary(group => group.Key, group => group.First(), StringComparer.OrdinalIgnoreCase);
+        if (CsvJointNames.Length != DofCols || CsvBodyNames.Length != DofCols)
+        {
+            Debug.LogError($"[OpenLoong] Joint map length mismatch: joints={CsvJointNames.Length}, bodies={CsvBodyNames.Length}, expected={DofCols}.");
+            return;
+        }
 
-        var fallback = arts
-            .Where(art => art != null && art.jointType == ArticulationJointType.RevoluteJoint)
-            .ToList();
-
+        var byName = BuildArticulationAliasMap();
+        var missing = new List<string>();
         for (int i = 0; i < CsvJointNames.Length; i++)
         {
-            if (byName.TryGetValue(CsvJointNames[i], out ArticulationBody joint))
+            ArticulationBody joint = null;
+            foreach (string alias in GetCsvJointAliases(i))
             {
-                jh[i] = joint;
+                if (byName.TryGetValue(alias, out joint))
+                {
+                    break;
+                }
+            }
+
+            jh[i] = joint;
+            if (joint == null)
+            {
+                missing.Add($"{i}:{CsvJointNames[i]}/{CsvBodyNames[i]}");
                 continue;
             }
 
-            jh[i] = i < fallback.Count ? fallback[i] : null;
-            Debug.LogWarning($"[OpenLoong] Missing expected joint '{CsvJointNames[i]}'; using traversal fallback at index {i}.");
+            EnsureCsvJointIsMovable(i, joint);
+        }
+
+        if (missing.Count > 0)
+        {
+            Debug.LogError("[OpenLoong] Missing CSV joint bindings; DOF rows will not be applied to these joints: " + string.Join(", ", missing));
+        }
+        else
+        {
+            Debug.Log($"[OpenLoong] Bound {DofCols} CSV DOF joints by MuJoCo jointName/Unity link aliases.");
         }
     }
 
@@ -403,9 +602,129 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
         for (int i = 0; i < CsvJointNames.Length; i++)
         {
             string unityName = jh[i] != null ? jh[i].name : "<null>";
-            lines.AppendLine($"  CSV[{i,2}] {CsvJointNames[i]} -> {unityName}");
+            string unityJointType = jh[i] != null ? jh[i].jointType.ToString() : "<null>";
+            lines.AppendLine($"  CSV[{i,2}] {CsvJointNames[i]} ({CsvBodyNames[i]}) -> {unityName} [{unityJointType}]");
         }
         Debug.Log(lines.ToString());
+    }
+
+    private Dictionary<string, ArticulationBody> BuildArticulationAliasMap()
+    {
+        var map = new Dictionary<string, ArticulationBody>(StringComparer.OrdinalIgnoreCase);
+        foreach (ArticulationBody art in arts)
+        {
+            if (art == null)
+            {
+                continue;
+            }
+
+            AddAlias(map, art.name, art);
+            AddLinkJointAlias(map, art.name, art);
+            foreach (string jointName in ReadUrdfJointNames(art))
+            {
+                AddAlias(map, jointName, art);
+                AddLinkJointAlias(map, jointName, art);
+            }
+        }
+        return map;
+    }
+
+    private static void EnsureCsvJointIsMovable(int index, ArticulationBody joint)
+    {
+        if (joint == null || joint.jointType != ArticulationJointType.FixedJoint)
+        {
+            return;
+        }
+
+        joint.jointType = ArticulationJointType.RevoluteJoint;
+        Debug.LogWarning(
+            $"[OpenLoong] Converted fixed Unity joint '{joint.name}' to RevoluteJoint for CSV[{index}] " +
+            $"{CsvJointNames[index]} ({CsvBodyNames[index]}).");
+    }
+
+    private static IEnumerable<string> GetCsvJointAliases(int index)
+    {
+        yield return CsvJointNames[index];
+        yield return CsvBodyNames[index];
+
+        string jointSuffix = StripPrefix(CsvJointNames[index], "J_");
+        string bodySuffix = StripPrefix(CsvBodyNames[index], "Link_");
+        if (!string.IsNullOrWhiteSpace(jointSuffix))
+        {
+            yield return jointSuffix;
+            yield return "Link_" + jointSuffix;
+        }
+        if (!string.IsNullOrWhiteSpace(bodySuffix))
+        {
+            yield return bodySuffix;
+            yield return "J_" + bodySuffix;
+        }
+    }
+
+    private static void AddLinkJointAlias(Dictionary<string, ArticulationBody> map, string name, ArticulationBody art)
+    {
+        string suffix = StripPrefix(name, "Link_");
+        if (!string.IsNullOrWhiteSpace(suffix))
+        {
+            AddAlias(map, "J_" + suffix, art);
+            AddAlias(map, suffix, art);
+            return;
+        }
+
+        suffix = StripPrefix(name, "J_");
+        if (!string.IsNullOrWhiteSpace(suffix))
+        {
+            AddAlias(map, "Link_" + suffix, art);
+            AddAlias(map, suffix, art);
+        }
+    }
+
+    private static void AddAlias(Dictionary<string, ArticulationBody> map, string name, ArticulationBody art)
+    {
+        if (string.IsNullOrWhiteSpace(name) || art == null)
+        {
+            return;
+        }
+
+        string key = name.Trim();
+        if (!map.ContainsKey(key))
+        {
+            map.Add(key, art);
+        }
+    }
+
+    private static string StripPrefix(string value, string prefix)
+    {
+        if (string.IsNullOrWhiteSpace(value) || !value.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+        return value.Substring(prefix.Length);
+    }
+
+    private static IEnumerable<string> ReadUrdfJointNames(ArticulationBody art)
+    {
+        foreach (MonoBehaviour component in art.GetComponents<MonoBehaviour>())
+        {
+            if (component == null)
+            {
+                continue;
+            }
+
+            Type componentType = component.GetType();
+            FieldInfo field = componentType.GetField("jointName", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            if (field != null && field.FieldType == typeof(string) && field.GetValue(component) is string fieldValue)
+            {
+                yield return fieldValue;
+            }
+
+            PropertyInfo property = componentType.GetProperty("jointName", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            if (property != null && property.PropertyType == typeof(string) && property.GetIndexParameters().Length == 0 &&
+                property.GetValue(component) is string propertyValue)
+            {
+                yield return propertyValue;
+            }
+        }
     }
 
     private string ResolveDatasetPath()

@@ -30,6 +30,8 @@ public class StartInput : MonoBehaviour
 
     [Header("Runtime Env")]
     [SerializeField] private string outputRoot = "output/my_run";
+    [Tooltip("Resolve relative OUTPUT_ROOT under the Unity project's Library folder so live CSV/log/pkl writes do not trigger AssetDatabase imports. Absolute outputRoot paths are unchanged.")]
+    [SerializeField] private bool keepRuntimeOutputOutsideAssets = true;
     [SerializeField] private string outputCsvFileName = "csv/live_motion.csv";
     [SerializeField] private string defaultRobotName = "unitree_g1";
     [SerializeField] private bool recordGmrVideo = true;
@@ -76,6 +78,12 @@ public class StartInput : MonoBehaviour
     [SerializeField] private string csvListObjectName = "CsvList";
     [SerializeField] private bool filterCsvListByRobot = true;
 
+    [Header("Realtime UI Controls")]
+    [SerializeField] private Button replayButton;
+    [SerializeField] private string replayButtonObjectName = "Replay";
+    [SerializeField] private Button stopButton;
+    [SerializeField] private string stopButtonObjectName = "Stop";
+
     [Tooltip("When the RoboList dropdown selection changes at runtime, stop the running " +
              "WHAM/GMR pipeline (the CSV format is robot-specific so it must be restarted) " +
              "and switch the live retargeting target to the newly selected robot. The user " +
@@ -117,6 +125,14 @@ public class StartInput : MonoBehaviour
     [SerializeField] private bool restartEpisodeOnFirstCsv = true;
     [Tooltip("Wait for this many 30fps source rows before starting live Unity playback.")]
     [SerializeField] private int realtimeWarmupSourceRows = 6;
+    [Tooltip("Keep Unity playback this many seconds behind the latest CSV row to avoid catching the writer and stuttering on tail frames.")]
+    [SerializeField] private float realtimePlaybackBufferSeconds = 0.2f;
+    [Tooltip("Fallback live CSV producer frame rate. StartInput estimates the real rate from appended rows when enabled below.")]
+    [SerializeField] private float defaultRealtimeCsvFps = ReplayCsvUtility.SourceFps;
+    [Tooltip("Estimate WHAM/GMR CSV production fps from newly appended rows and align Unity live playback to it.")]
+    [SerializeField] private bool estimateRealtimeCsvProducerFps = true;
+    [Tooltip("Sliding window in seconds for estimating realtime CSV producer fps. The first backlog batch is ignored.")]
+    [SerializeField] private float realtimeCsvFpsWindowSeconds = 2f;
     [Tooltip("Maximum realtime CSV batches applied on the Unity main thread per frame.")]
     [SerializeField] private int maxRealtimeCsvBatchesPerFrame = 4;
     [Tooltip("Maximum queued pipeline log lines emitted to the Unity console per frame.")]
@@ -125,6 +141,8 @@ public class StartInput : MonoBehaviour
     [Header("Debug")]
     [SerializeField] private bool verboseDebugLogging = true;
     [SerializeField] private bool logCsvChangeEvents = true;
+    [Tooltip("Minimum seconds between high-frequency CSV append logs. Startup/empty-file warnings are not throttled by this.")]
+    [SerializeField] private float csvChangeLogIntervalSeconds = 1f;
     [SerializeField] private bool logReferenceResolution = false;
     [SerializeField] private bool writeDebugLogFile = true;
     [SerializeField] private string debugLogFileName = "unity_startinput.log";
@@ -161,7 +179,7 @@ public class StartInput : MonoBehaviour
     private volatile bool csvWorkerRunning;
     private volatile bool isStoppingPipeline;
     private readonly object processStateLock = new object();
-    private readonly ConcurrentQueue<List<float[]>> realtimeCsvRowsQueue = new ConcurrentQueue<List<float[]>>();
+    private readonly ConcurrentQueue<RealtimeCsvBatch> realtimeCsvRowsQueue = new ConcurrentQueue<RealtimeCsvBatch>();
     private readonly ConcurrentQueue<string> realtimeCsvResetQueue = new ConcurrentQueue<string>();
     private readonly ConcurrentQueue<QueuedUnityLog> unityLogQueue = new ConcurrentQueue<QueuedUnityLog>();
     private readonly ConcurrentQueue<string> debugLogQueue = new ConcurrentQueue<string>();
@@ -224,6 +242,30 @@ public class StartInput : MonoBehaviour
         {
             Message = message;
             Type = type;
+        }
+    }
+
+    private struct RealtimeCsvBatch
+    {
+        public readonly List<float[]> Rows;
+        public readonly float ProducerFps;
+
+        public RealtimeCsvBatch(List<float[]> rows, float producerFps)
+        {
+            Rows = rows;
+            ProducerFps = producerFps;
+        }
+    }
+
+    private struct RealtimeFpsSample
+    {
+        public readonly System.DateTime TimeUtc;
+        public readonly int RowCount;
+
+        public RealtimeFpsSample(System.DateTime timeUtc, int rowCount)
+        {
+            TimeUtc = timeUtc;
+            RowCount = rowCount;
         }
     }
 
@@ -459,6 +501,7 @@ public class StartInput : MonoBehaviour
         sb.AppendLine($"  bashWorkingDirectory: {bashWorkingDirectory}");
         sb.AppendLine($"  resolvedWorkingDirectory: {workingDir}");
         sb.AppendLine($"  outputRoot: {outputRoot}");
+        sb.AppendLine($"  keepRuntimeOutputOutsideAssets: {keepRuntimeOutputOutsideAssets}");
         sb.AppendLine($"  resolvedOutputRootPath: {resolvedOutputRootPath}");
         sb.AppendLine($"  resolvedOutputRootAbsolute: {outputRootAbs}");
         sb.AppendLine($"  outputCsvFileName: {outputCsvFileName}");
@@ -469,6 +512,8 @@ public class StartInput : MonoBehaviour
         sb.AppendLine($"  monitorRunning: {monitorCoroutine != null}");
         sb.AppendLine($"  csvExists: {!string.IsNullOrWhiteSpace(csvAbs) && File.Exists(csvAbs)}");
         sb.AppendLine($"  csvNoDataWarningSeconds: {csvNoDataWarningSeconds}");
+        sb.AppendLine($"  realtimePlaybackBufferSeconds: {realtimePlaybackBufferSeconds}");
+        sb.AppendLine($"  csvChangeLogIntervalSeconds: {csvChangeLogIntervalSeconds}");
         sb.AppendLine($"  replayBootstrapped: {replayBootstrapped}");
         sb.AppendLine($"  lastCsvLength: {lastCsvLength}");
         sb.AppendLine($"  lastCsvWriteTimeUtc: {lastCsvWriteTimeUtc:O}");
@@ -567,9 +612,9 @@ public class StartInput : MonoBehaviour
         }
 
         int maxBatches = Mathf.Max(1, maxRealtimeCsvBatchesPerFrame);
-        for (int i = 0; i < maxBatches && realtimeCsvRowsQueue.TryDequeue(out List<float[]> rows); i++)
+        for (int i = 0; i < maxBatches && realtimeCsvRowsQueue.TryDequeue(out RealtimeCsvBatch batch); i++)
         {
-            ApplyRealtimeCsvRows(rows);
+            ApplyRealtimeCsvRows(batch.Rows, batch.ProducerFps);
         }
     }
 
@@ -858,6 +903,12 @@ public class StartInput : MonoBehaviour
             for (int i = 0; i < renderers.Length; i++)
             {
                 if (renderers[i] != null) renderers[i].enabled = isSelected;
+            }
+
+            if (agentsByGo.TryGetValue(root, out IMimicAgent visibilityAgent) &&
+                visibilityAgent is ISelectableMimicAgent selectableAgent)
+            {
+                selectableAgent.SetRobotSelectedInScene(isSelected);
             }
 
             // Pause hidden agents' replay loop so they don't keep
@@ -1875,7 +1926,7 @@ public class StartInput : MonoBehaviour
 
     private void DrainRealtimeCsvQueues()
     {
-        while (realtimeCsvRowsQueue.TryDequeue(out List<float[]> _)) { }
+        while (realtimeCsvRowsQueue.TryDequeue(out RealtimeCsvBatch _)) { }
         while (realtimeCsvResetQueue.TryDequeue(out string _)) { }
     }
 
@@ -1885,8 +1936,12 @@ public class StartInput : MonoBehaviour
         int sleepMs = System.Math.Max(20, (int)System.Math.Round(csvPollInterval * 1000f));
         float emptyWarningSeconds = System.Math.Max(1f, csvNoDataWarningSeconds);
         bool logChanges = logCsvChangeEvents;
+        bool estimateProducerFps = estimateRealtimeCsvProducerFps;
+        float fallbackFps = ClampRealtimeCsvFps(defaultRealtimeCsvFps);
+        float fpsWindowSeconds = (float)System.Math.Max(0.25, realtimeCsvFpsWindowSeconds);
+        float changeLogIntervalSeconds = (float)System.Math.Max(0.1, csvChangeLogIntervalSeconds);
 
-        csvWorkerThread = new Thread(() => CsvWorkerLoop(csvPath, expectedColumns, robotKey, sleepMs, logChanges, emptyWarningSeconds))
+        csvWorkerThread = new Thread(() => CsvWorkerLoop(csvPath, expectedColumns, robotKey, sleepMs, logChanges, emptyWarningSeconds, fallbackFps, estimateProducerFps, fpsWindowSeconds, changeLogIntervalSeconds))
         {
             Name = "StartInput-CsvWorker",
             IsBackground = true
@@ -1894,7 +1949,7 @@ public class StartInput : MonoBehaviour
         csvWorkerThread.Start();
     }
 
-    private void CsvWorkerLoop(string csvPath, int expectedColumns, string robotKey, int sleepMs, bool logChanges, float emptyWarningSeconds)
+    private void CsvWorkerLoop(string csvPath, int expectedColumns, string robotKey, int sleepMs, bool logChanges, float emptyWarningSeconds, float fallbackFps, bool estimateProducerFps, float fpsWindowSeconds, float changeLogIntervalSeconds)
     {
         bool missingLogged = false;
         bool firstDataLogged = false;
@@ -1905,9 +1960,12 @@ public class StartInput : MonoBehaviour
         System.DateTime previousWriteTimeUtc = System.DateTime.MinValue;
         System.DateTime monitorStartUtc = System.DateTime.UtcNow;
         System.DateTime lastEmptyWarningUtc = System.DateTime.MinValue;
+        System.DateTime lastChangeLogUtc = System.DateTime.MinValue;
+        Queue<RealtimeFpsSample> fpsSamples = new Queue<RealtimeFpsSample>();
+        float producerFps = fallbackFps;
 
         QueueUnityLog(
-            $"[StartInput] Realtime CSV worker active: robot='{robotKey}', expectedColumns={expectedColumns}, csv='{csvPath}', pollMs={sleepMs}");
+            $"[StartInput] Realtime CSV worker active: robot='{robotKey}', expectedColumns={expectedColumns}, csv='{csvPath}', pollMs={sleepMs}, fallbackFps={fallbackFps:F2}, estimateFps={estimateProducerFps}, fpsWindow={fpsWindowSeconds:F2}s, changeLogInterval={changeLogIntervalSeconds:F2}s");
 
         while (csvWorkerRunning)
         {
@@ -1982,18 +2040,26 @@ public class StartInput : MonoBehaviour
                     List<float[]> rows = ReadNewRealtimeCsvRowsFromPath(csvPath, currentLength, expectedColumns, ref readOffset, ref pendingText);
                     if (rows.Count > 0)
                     {
+                        System.DateTime rowsUtc = System.DateTime.UtcNow;
+                        if (estimateProducerFps)
+                        {
+                            producerFps = EstimateCsvProducerFps(fpsSamples, rowsUtc, rows.Count, fpsWindowSeconds, fallbackFps);
+                        }
+
                         if (!firstDataLogged)
                         {
                             firstDataLogged = true;
-                            QueueUnityLog($"[StartInput] Realtime CSV has data: {csvPath} ({currentLength} bytes)");
+                            QueueUnityLog($"[StartInput] Realtime CSV has data: {csvPath} ({currentLength} bytes), producerFps={producerFps:F2}");
                         }
 
-                        if (logChanges)
+                        if (logChanges &&
+                            (lastChangeLogUtc == System.DateTime.MinValue || (rowsUtc - lastChangeLogUtc).TotalSeconds >= changeLogIntervalSeconds))
                         {
-                            QueueUnityLog($"[StartInput] CSV appended: rows={rows.Count}, bytes={currentLength}, offset={readOffset}, path='{csvPath}'");
+                            QueueUnityLog($"[StartInput] CSV appended: rows={rows.Count}, bytes={currentLength}, offset={readOffset}, producerFps={producerFps:F2}, path='{csvPath}'");
+                            lastChangeLogUtc = rowsUtc;
                         }
 
-                        realtimeCsvRowsQueue.Enqueue(rows);
+                        realtimeCsvRowsQueue.Enqueue(new RealtimeCsvBatch(rows, producerFps));
                     }
                 }
 
@@ -2059,6 +2125,66 @@ public class StartInput : MonoBehaviour
         }
 
         return rows;
+    }
+
+    private static float EstimateCsvProducerFps(
+        Queue<RealtimeFpsSample> samples,
+        System.DateTime nowUtc,
+        int rowCount,
+        float windowSeconds,
+        float fallbackFps)
+    {
+        if (samples == null || rowCount <= 0)
+        {
+            return fallbackFps;
+        }
+
+        samples.Enqueue(new RealtimeFpsSample(nowUtc, rowCount));
+        double safeWindowSeconds = System.Math.Max(0.25, windowSeconds);
+        while (samples.Count > 0 && (nowUtc - samples.Peek().TimeUtc).TotalSeconds > safeWindowSeconds)
+        {
+            samples.Dequeue();
+        }
+
+        if (samples.Count < 2)
+        {
+            return fallbackFps;
+        }
+
+        bool skippedFirst = false;
+        int rowsAfterFirst = 0;
+        System.DateTime firstSampleUtc = System.DateTime.MinValue;
+        foreach (RealtimeFpsSample sample in samples)
+        {
+            if (!skippedFirst)
+            {
+                firstSampleUtc = sample.TimeUtc;
+                skippedFirst = true;
+                continue;
+            }
+
+            rowsAfterFirst += sample.RowCount;
+        }
+
+        double seconds = (nowUtc - firstSampleUtc).TotalSeconds;
+        if (seconds <= 0.001 || rowsAfterFirst <= 0)
+        {
+            return fallbackFps;
+        }
+
+        return ClampRealtimeCsvFps(rowsAfterFirst / (float)seconds);
+    }
+
+    private static float ClampRealtimeCsvFps(float framesPerSecond)
+    {
+        if (float.IsNaN(framesPerSecond) || float.IsInfinity(framesPerSecond) || framesPerSecond <= 0f)
+        {
+            return ReplayCsvUtility.SourceFps;
+        }
+
+        return (float)System.Math.Max(
+            ReplayCsvUtility.MinRealtimeFps,
+            System.Math.Min(ReplayCsvUtility.MaxRealtimeFps, framesPerSecond));
     }
 
     private IEnumerator MonitorCsvCoroutine()
@@ -2139,7 +2265,7 @@ public class StartInput : MonoBehaviour
                         LogVerbose($"CSV appended: rows={rows.Count}, bytes={currentLength}, offset={csvReadOffset}, path='{resolvedCsvPath}'");
                     }
 
-                    ApplyRealtimeCsvRows(rows);
+                    ApplyRealtimeCsvRows(rows, ClampRealtimeCsvFps(defaultRealtimeCsvFps));
                 }
             }
 
@@ -2226,7 +2352,7 @@ public class StartInput : MonoBehaviour
         return true;
     }
 
-    private void ApplyRealtimeCsvRows(List<float[]> rows)
+    private void ApplyRealtimeCsvRows(List<float[]> rows, float producerFps)
     {
         if (rows == null || rows.Count == 0)
         {
@@ -2240,6 +2366,9 @@ public class StartInput : MonoBehaviour
         }
 
         realtimeSourceRowsRead += rows.Count;
+        float playbackFps = ClampRealtimeCsvFps(producerFps);
+        float playbackBufferSeconds = Mathf.Max(0f, realtimePlaybackBufferSeconds);
+        activeRealtimeCsvAgent.SetRealtimePlaybackRate(playbackFps, playbackBufferSeconds);
 
         if (!replayBootstrapped)
         {
@@ -2274,7 +2403,8 @@ public class StartInput : MonoBehaviour
             Debug.Log(
                 $"[StartInput] Realtime CSV playback started for '{activeRealtimeMimicAgent.RobotKey}' after {realtimeSourceRowsRead} source rows: {resolvedCsvPath}. " +
                 $"expectedColumns={activeRealtimeCsvAgent.ExpectedCsvColumns}, warmupRows={Mathf.Max(1, realtimeWarmupSourceRows)}, " +
-                $"selectedRobot='{ResolveSelectedRobotName()}', bufferedBatches={realtimeCsvRowsQueue.Count}, rootMapping=csv[0..2]->Unity(-y,z,x), quat=csv[3..6]->Unity(-y,z,x,-w)");
+                $"producerFps={playbackFps:F2}, playbackBuffer={playbackBufferSeconds:F2}s, selectedRobot='{ResolveSelectedRobotName()}', bufferedBatches={realtimeCsvRowsQueue.Count}, " +
+                $"rootMapping=csv[0..2]->Unity(-y,z,x), quat=csv[3..6]->Unity(-y,z,x,-w)");
             return;
         }
 
@@ -2490,6 +2620,36 @@ public class StartInput : MonoBehaviour
 
     private string ResolveOutputRootAbsolutePath(string baseDir)
     {
+        if (string.IsNullOrWhiteSpace(outputRoot))
+        {
+            return string.Empty;
+        }
+
+        string expanded = ExpandPathPrefix(outputRoot);
+        string normalized = NormalizePathSeparators(expanded);
+
+        try
+        {
+            if (Path.IsPathRooted(normalized))
+            {
+                return Path.GetFullPath(normalized);
+            }
+
+            if (keepRuntimeOutputOutsideAssets)
+            {
+                string projectRoot = Directory.GetParent(Application.dataPath)?.FullName;
+                if (!string.IsNullOrWhiteSpace(projectRoot))
+                {
+                    return Path.GetFullPath(Path.Combine(projectRoot, "Library", "ImitationRuntime", normalized));
+                }
+            }
+        }
+        catch (System.Exception e)
+        {
+            Debug.LogError($"瑙ｆ瀽 OUTPUT_ROOT 澶辫触: {outputRoot} ({e.Message})");
+            return string.Empty;
+        }
+
         return ResolvePathFromBaseDirectory(outputRoot, baseDir);
     }
 
@@ -2687,6 +2847,7 @@ public class StartInput : MonoBehaviour
     {
         ResolveRoboListReferences();
         ResolveCsvListReferences();
+        ResolveRealtimeControlButtons();
 
         if (roboListDropdown != null)
         {
@@ -2698,7 +2859,68 @@ public class StartInput : MonoBehaviour
             csvListDropdown.interactable = interactable;
         }
 
-        LogVerbose($"Realtime dropdowns interactable={interactable}");
+        if (startButton != null)
+        {
+            startButton.interactable = interactable;
+        }
+
+        if (replayButton != null)
+        {
+            replayButton.interactable = interactable;
+        }
+
+        if (stopButton != null)
+        {
+            stopButton.interactable = true;
+        }
+
+        LogVerbose(
+            $"Realtime controls interactable: dropdowns={interactable}, start={interactable}, replay={interactable}, stop={stopButton != null && stopButton.interactable}");
+    }
+
+    private void ResolveRealtimeControlButtons()
+    {
+        if (startButton == null)
+        {
+            startButton = GetComponent<Button>();
+        }
+
+        if (replayButton == null)
+        {
+            replayButton = ResolveButtonByObjectName(replayButtonObjectName);
+            if (replayButton == null)
+            {
+                Replay replayComponent = FindObjectOfType<Replay>();
+                if (replayComponent != null)
+                {
+                    replayButton = replayComponent.GetComponent<Button>();
+                }
+            }
+        }
+
+        if (stopButton == null)
+        {
+            stopButton = ResolveButtonByObjectName(stopButtonObjectName);
+            if (stopButton == null)
+            {
+                Stop stopComponent = FindObjectOfType<Stop>();
+                if (stopComponent != null)
+                {
+                    stopButton = stopComponent.GetComponent<Button>();
+                }
+            }
+        }
+    }
+
+    private Button ResolveButtonByObjectName(string objectName)
+    {
+        if (string.IsNullOrWhiteSpace(objectName))
+        {
+            return null;
+        }
+
+        GameObject buttonObject = GameObject.Find(objectName);
+        return buttonObject != null ? buttonObject.GetComponent<Button>() : null;
     }
 
     private void RefreshCsvListForSelectedRobot()
