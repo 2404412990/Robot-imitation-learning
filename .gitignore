@@ -13,15 +13,23 @@ results/
 
 backup/
 
+backup.meta
+
+Robot-imitation-learning.meta
 .vscode/
 
 Imitation.rar
+Imitation.rar.meta
 
 !OpenLoongMimicAgent.cs.meta
 
 /AGENTS.md
 
+AGENTS.md.meta
+
 /CLAUDE.md
+
+CLAUDE.md.meta
 
 .codex/
 
