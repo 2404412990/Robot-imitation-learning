@@ -1953,6 +1953,7 @@ public class StartInput : MonoBehaviour
     {
         bool missingLogged = false;
         bool firstDataLogged = false;
+        bool invalidRowLogged = false;
         string lastReadError = string.Empty;
         long readOffset = 0L;
         string pendingText = string.Empty;
@@ -1993,6 +1994,7 @@ public class StartInput : MonoBehaviour
                     readOffset = 0L;
                     pendingText = string.Empty;
                     firstDataLogged = false;
+                    invalidRowLogged = false;
                     monitorStartUtc = System.DateTime.UtcNow;
                     realtimeCsvResetQueue.Enqueue("CSV truncated or recreated");
                 }
@@ -2037,7 +2039,7 @@ public class StartInput : MonoBehaviour
 
                 if (currentLength > readOffset)
                 {
-                    List<float[]> rows = ReadNewRealtimeCsvRowsFromPath(csvPath, currentLength, expectedColumns, ref readOffset, ref pendingText);
+                    List<float[]> rows = ReadNewRealtimeCsvRowsFromPath(csvPath, currentLength, expectedColumns, robotKey, ref readOffset, ref pendingText, ref invalidRowLogged);
                     if (rows.Count > 0)
                     {
                         System.DateTime rowsUtc = System.DateTime.UtcNow;
@@ -2081,7 +2083,14 @@ public class StartInput : MonoBehaviour
         }
     }
 
-    private List<float[]> ReadNewRealtimeCsvRowsFromPath(string csvPath, long currentLength, int expectedColumns, ref long readOffset, ref string pendingText)
+    private List<float[]> ReadNewRealtimeCsvRowsFromPath(
+        string csvPath,
+        long currentLength,
+        int expectedColumns,
+        string robotKey,
+        ref long readOffset,
+        ref string pendingText,
+        ref bool invalidRowLogged)
     {
         var rows = new List<float[]>();
         if (expectedColumns <= 0 || currentLength <= readOffset)
@@ -2118,9 +2127,17 @@ public class StartInput : MonoBehaviour
 
         for (int i = 0; i < completeLineCount; i++)
         {
-            if (TryParseRealtimeCsvLine(lines[i], expectedColumns, out float[] row))
+            if (TryParseRealtimeCsvLine(lines[i], expectedColumns, out float[] row, out int actualColumns, out string failureReason))
             {
                 rows.Add(row);
+            }
+            else if (!invalidRowLogged && !string.IsNullOrWhiteSpace(lines[i]))
+            {
+                QueueUnityLog(
+                    $"[StartInput] Realtime CSV row rejected for robot='{robotKey}': expectedColumns={expectedColumns}, actualColumns={actualColumns}, reason={failureReason}, csv='{csvPath}'. " +
+                    "This usually means the WHAM/GMR --robot output does not match RoboList, or a stale/corrupt live_motion.csv is being read.",
+                    QueuedUnityLogType.Warning);
+                invalidRowLogged = true;
             }
         }
 
@@ -2323,15 +2340,25 @@ public class StartInput : MonoBehaviour
 
     private bool TryParseRealtimeCsvLine(string line, int expectedColumns, out float[] row)
     {
+        return TryParseRealtimeCsvLine(line, expectedColumns, out row, out _, out _);
+    }
+
+    private bool TryParseRealtimeCsvLine(string line, int expectedColumns, out float[] row, out int actualColumns, out string failureReason)
+    {
         row = null;
+        actualColumns = 0;
+        failureReason = string.Empty;
         if (string.IsNullOrWhiteSpace(line) || expectedColumns <= 0)
         {
+            failureReason = string.IsNullOrWhiteSpace(line) ? "empty line" : "invalid expectedColumns";
             return false;
         }
 
         string[] tokens = line.Split(',');
-        if (tokens.Length < expectedColumns)
+        actualColumns = tokens.Length;
+        if (tokens.Length != expectedColumns)
         {
+            failureReason = "column count mismatch";
             return false;
         }
 
@@ -2343,6 +2370,7 @@ public class StartInput : MonoBehaviour
                 !float.TryParse(token, out value))
             {
                 row = null;
+                failureReason = $"invalid float at column {i}";
                 return false;
             }
 

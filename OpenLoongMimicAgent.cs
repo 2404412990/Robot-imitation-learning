@@ -86,14 +86,14 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, I
         "Link_ankle_l_roll",
     };
 
-    private static readonly float[] CsvJointSigns =
+    private static readonly float[] UnityDriveSigns =
     {
-         1f, -1f,
-        -1f, -1f, -1f, -1f, -1f,  1f,  1f,
-         1f,  1f,  1f,  1f,  1f, -1f,  1f,
-        -1f,  1f,  1f,
-         1f,  1f, -1f, -1f, -1f,  1f,
-         1f,  1f, -1f, -1f, -1f,  1f,
+        1f, 1f,
+        1f, 1f, 1f, 1f, 1f, 1f, 1f,
+        1f, -1f, 1f, 1f, 1f, 1f, 1f,
+        1f, 1f, 1f,
+        1f, 1f, 1f, 1f, 1f, 1f,
+        1f, 1f, 1f, 1f, 1f, 1f,
     };
 
     [SerializeField] private string robotKey = "openloong";
@@ -101,11 +101,16 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, I
     [SerializeField] private bool useExternalReplayData;
     [SerializeField] private string datasetRelativePath = "Assets/Gewu/Imitation/dataset/openloong";
     [SerializeField] private int frame0;
-    [SerializeField] private float jointStiffness = 300f;
-    [SerializeField] private float jointDamping = 20f;
+    [SerializeField] private float jointStiffness = 2000f;
+    [SerializeField] private float jointDamping = 200f;
     [SerializeField] private bool logJointMappingOnStart = true;
+    [Tooltip("Correct Unity articulation drive signs that differ from MuJoCo qpos axes. Currently only J_arm_l_02 is inverted; do not use the old broad sign table.")]
     [SerializeField] private bool applyMjcfAxisSignCorrection = true;
     [SerializeField] private bool clampTargetsToDriveLimits = true;
+    [SerializeField] private float replayJointForceLimit = 300f;
+    [SerializeField] private bool keepRootImmovableDuringReplay = true;
+    [SerializeField] private bool writeReplayJointPositionsDirectly = true;
+    [SerializeField] private bool zeroReplayJointVelocitiesOnDirectWrite = true;
 
     private static readonly string[] DefaultDatasetSearchPaths =
     {
@@ -142,6 +147,7 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, I
     private Quaternion newRotation;
     private int appliedRowDebugCount;
     private bool isRobotSelectedInScene = true;
+    private bool hasLoggedDirectJointStateError;
 
     public string RobotKey => string.IsNullOrWhiteSpace(robotKey) ? "openloong" : robotKey.Trim();
     public GameObject AgentGameObject => gameObject;
@@ -230,6 +236,7 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, I
     public override void Initialize()
     {
         Time.fixedDeltaTime = 0.02f;
+        DisableConflictingLegacyControllers();
         arts = GetComponentsInChildren<ArticulationBody>();
         if (arts == null || arts.Length == 0)
         {
@@ -242,18 +249,46 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, I
         pos0 = body.position;
         rot0 = body.rotation;
 
+        ResolveCsvJointMap();
+        CaptureRestPose();
+        if (logJointMappingOnStart) DumpJointMapping();
+        TryLoadCurrentMotionData(keepProgress: false);
+
+        MimicAgentRegistry.Instance.Register(this);
+    }
+
+    private void CaptureRestPose()
+    {
         positionCache.Clear();
         velocityCache.Clear();
         rootArticulation.GetJointPositions(positionCache);
         rootArticulation.GetJointVelocities(velocityCache);
         restPositions = positionCache.ToArray();
         restVelocities = velocityCache.ToArray();
+    }
 
-        ResolveCsvJointMap();
-        if (logJointMappingOnStart) DumpJointMapping();
-        TryLoadCurrentMotionData(keepProgress: false);
+    private void DisableConflictingLegacyControllers()
+    {
+        MonoBehaviour[] behaviours = GetComponents<MonoBehaviour>();
+        for (int i = 0; i < behaviours.Length; i++)
+        {
+            MonoBehaviour behaviour = behaviours[i];
+            if (behaviour == null || ReferenceEquals(behaviour, this))
+            {
+                continue;
+            }
 
-        MimicAgentRegistry.Instance.Register(this);
+            string typeName = behaviour.GetType().Name;
+            if (string.Equals(typeName, "RobotRLAgent", StringComparison.Ordinal) ||
+                string.Equals(typeName, "LoongAgent", StringComparison.Ordinal))
+            {
+                if (behaviour.enabled)
+                {
+                    behaviour.enabled = false;
+                    Debug.LogWarning($"[OpenLoong] Disabled conflicting legacy controller '{typeName}' on '{gameObject.name}'.");
+                }
+            }
+        }
     }
 
     public override void OnEpisodeBegin()
@@ -336,7 +371,11 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, I
         }
 
         tt++;
-        if (tt > 3)
+        if (replay && keepRootImmovableDuringReplay)
+        {
+            rootArticulation.immovable = true;
+        }
+        else if (tt > 3)
         {
             rootArticulation.immovable = false;
         }
@@ -496,8 +535,7 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, I
 
         for (int i = 0; i < DofCols; i++)
         {
-            float sign = applyMjcfAxisSignCorrection ? CsvJointSigns[i] : 1f;
-            uff[i] = row[RootPosCols + RootRotCols + i] * Mathf.Rad2Deg * sign;
+            uff[i] = GetSignedCsvJointRadians(row, i) * Mathf.Rad2Deg;
             SetJointTargetDeg(jh[i], uff[i]);
         }
 
@@ -515,6 +553,78 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, I
             rootArticulation.velocity = Vector3.zero;
             rootArticulation.angularVelocity = Vector3.zero;
         }
+
+        if ((replay || useExternalReplayData) && writeReplayJointPositionsDirectly)
+        {
+            ApplyDirectJointStateFromCsvRow(row);
+        }
+    }
+
+    private void ApplyDirectJointStateFromCsvRow(float[] row)
+    {
+        int wroteCount = 0;
+        for (int i = 0; i < DofCols; i++)
+        {
+            ArticulationBody joint = jh[i];
+            if (joint == null)
+            {
+                continue;
+            }
+
+            ArticulationReducedSpace jointPosition = joint.jointPosition;
+            if (jointPosition.dofCount <= 0)
+            {
+                continue;
+            }
+
+            jointPosition[0] = ClampJointRadiansToDrive(joint, GetSignedCsvJointRadians(row, i));
+            joint.jointPosition = jointPosition;
+            wroteCount++;
+
+            if (zeroReplayJointVelocitiesOnDirectWrite)
+            {
+                ArticulationReducedSpace jointVelocity = joint.jointVelocity;
+                if (jointVelocity.dofCount > 0)
+                {
+                    jointVelocity[0] = 0f;
+                    joint.jointVelocity = jointVelocity;
+                }
+            }
+        }
+
+        if (wroteCount == 0 && !hasLoggedDirectJointStateError)
+        {
+            Debug.LogError("[OpenLoong] Direct qpos replay could not write any joint positions because all bound joints reported jointPosition.dofCount=0.");
+            hasLoggedDirectJointStateError = true;
+        }
+    }
+
+    private float ClampJointRadiansToDrive(ArticulationBody joint, float radians)
+    {
+        if (!clampTargetsToDriveLimits || joint == null)
+        {
+            return radians;
+        }
+
+        ArticulationDrive drive = joint.xDrive;
+        if (drive.lowerLimit >= drive.upperLimit)
+        {
+            return radians;
+        }
+
+        float degrees = Mathf.Clamp(radians * Mathf.Rad2Deg, drive.lowerLimit, drive.upperLimit);
+        return degrees * Mathf.Deg2Rad;
+    }
+
+    private float GetSignedCsvJointRadians(float[] row, int dofIndex)
+    {
+        float value = row[RootPosCols + RootRotCols + dofIndex];
+        if (applyMjcfAxisSignCorrection && dofIndex >= 0 && dofIndex < UnityDriveSigns.Length)
+        {
+            value *= UnityDriveSigns[dofIndex];
+        }
+
+        return value;
     }
 
     private void LogAppliedRowDebug(float[] row)
@@ -526,6 +636,7 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, I
 
         appliedRowDebugCount++;
         int boundCount = 0;
+        int directJointStateCount = 0;
         int nonZeroDofCount = 0;
         float maxAbsDeg = 0f;
         string maxName = "<none>";
@@ -534,6 +645,11 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, I
             if (jh[i] != null)
             {
                 boundCount++;
+            }
+
+            if (jh[i] != null && jh[i].jointPosition.dofCount > 0)
+            {
+                directJointStateCount++;
             }
 
             float absDeg = Mathf.Abs(uff[i]);
@@ -550,8 +666,9 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, I
         }
 
         Debug.Log(
-            $"[OpenLoong] Applied CSV row: boundJoints={boundCount}/{DofCols}, nonZeroDof={nonZeroDofCount}/{DofCols}, " +
-            $"maxTarget={maxAbsDeg:F1}deg at {maxName}.");
+            $"[OpenLoong] Applied CSV row: boundJoints={boundCount}/{DofCols}, directJointState={directJointStateCount}/{DofCols}, nonZeroDof={nonZeroDofCount}/{DofCols}, " +
+            $"maxTarget={maxAbsDeg:F1}deg at {maxName}, " +
+            $"J_arm_l_02 raw={row[RootPosCols + RootRotCols + 10] * Mathf.Rad2Deg:F1}deg applied={GetSignedCsvJointRadians(row, 10) * Mathf.Rad2Deg:F1}deg.");
     }
 
     private void ResolveCsvJointMap()
@@ -603,7 +720,9 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, I
         {
             string unityName = jh[i] != null ? jh[i].name : "<null>";
             string unityJointType = jh[i] != null ? jh[i].jointType.ToString() : "<null>";
-            lines.AppendLine($"  CSV[{i,2}] {CsvJointNames[i]} ({CsvBodyNames[i]}) -> {unityName} [{unityJointType}]");
+            int reducedDof = jh[i] != null ? jh[i].jointPosition.dofCount : 0;
+            float sign = applyMjcfAxisSignCorrection && i < UnityDriveSigns.Length ? UnityDriveSigns[i] : 1f;
+            lines.AppendLine($"  CSV[{i,2}] {CsvJointNames[i]} ({CsvBodyNames[i]}) -> {unityName} [{unityJointType}], reducedDof={reducedDof}, sign={sign:+0;-0;+0}");
         }
         Debug.Log(lines.ToString());
     }
@@ -797,6 +916,10 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, I
         }
         drive.stiffness = jointStiffness;
         drive.damping = jointDamping;
+        if (replay || useExternalReplayData)
+        {
+            drive.forceLimit = Mathf.Max(drive.forceLimit, replayJointForceLimit);
+        }
         drive.target = value;
         joint.xDrive = drive;
     }
