@@ -431,32 +431,7 @@ public class FileBrowser : MonoBehaviour
 
     private string GetCsvDisplayName(string absolutePath)
     {
-        string noExt = Path.GetFileNameWithoutExtension(absolutePath);
-        if (string.IsNullOrWhiteSpace(folderPath))
-        {
-            return noExt;
-        }
-
-        try
-        {
-            string directory = Path.GetDirectoryName(absolutePath);
-            if (string.IsNullOrWhiteSpace(directory))
-            {
-                return noExt;
-            }
-
-            string relativeDirectory = Path.GetRelativePath(folderPath, directory);
-            if (string.IsNullOrWhiteSpace(relativeDirectory) || relativeDirectory == ".")
-            {
-                return noExt;
-            }
-
-            return Path.Combine(relativeDirectory, noExt).Replace(Path.DirectorySeparatorChar, '/');
-        }
-        catch
-        {
-            return noExt;
-        }
+        return Path.GetFileNameWithoutExtension(absolutePath);
     }
 
     private string GetFolderDisplayName(string absolutePath)

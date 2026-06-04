@@ -95,10 +95,8 @@ public class StartInput : MonoBehaviour
              "usually want to confirm before paying that cost.")]
     [SerializeField] private bool autoStartOnRobotSwitch = false;
 
-    [Tooltip("When ON, only the selected robot's GameObject stays active in the scene; the " +
-             "others get SetActive(false). Lets the dropdown act as a visual switch even " +
-             "when a robot has no IMimicAgent attached yet. Resolution order: 1) match in " +
-             "sceneRobots list, 2) RobotKey of a registered IMimicAgent.")]
+    [Tooltip("When ON, only the selected robot remains visible/collidable. Inactive robots stay active " +
+             "as GameObjects but their Renderers and Colliders are disabled to avoid articulation rebuilds.")]
     [SerializeField] private bool hideInactiveRobotsOnSwitch = true;
 
     [System.Serializable]
@@ -765,6 +763,10 @@ public class StartInput : MonoBehaviour
     // Cached per-root so we don't allocate every dropdown change.
     private readonly Dictionary<GameObject, Renderer[]> _cachedRobotRenderers =
         new Dictionary<GameObject, Renderer[]>();
+    private readonly Dictionary<GameObject, Collider[]> _cachedRobotColliders =
+        new Dictionary<GameObject, Collider[]>();
+    private readonly Dictionary<Collider, bool> _originalColliderEnabled =
+        new Dictionary<Collider, bool>();
 
     private Renderer[] GetOrCacheRenderers(GameObject root)
     {
@@ -773,6 +775,31 @@ public class StartInput : MonoBehaviour
         var fresh = root.GetComponentsInChildren<Renderer>(includeInactive: true);
         _cachedRobotRenderers[root] = fresh;
         return fresh;
+    }
+
+    private Collider[] GetOrCacheColliders(GameObject root)
+    {
+        if (root == null) return System.Array.Empty<Collider>();
+        if (_cachedRobotColliders.TryGetValue(root, out var cached) && cached != null) return cached;
+
+        var fresh = root.GetComponentsInChildren<Collider>(includeInactive: true);
+        for (int i = 0; i < fresh.Length; i++)
+        {
+            Collider collider = fresh[i];
+            if (collider != null && !_originalColliderEnabled.ContainsKey(collider))
+            {
+                _originalColliderEnabled[collider] = collider.enabled;
+            }
+        }
+
+        _cachedRobotColliders[root] = fresh;
+        return fresh;
+    }
+
+    private bool GetOriginalColliderEnabled(Collider collider)
+    {
+        return collider != null &&
+               (!_originalColliderEnabled.TryGetValue(collider, out bool originalEnabled) || originalEnabled);
     }
 
     /// <summary>
@@ -893,6 +920,7 @@ public class StartInput : MonoBehaviour
                 // components were null before activation, so the cached
                 // array (if any) is full of nulls. Rebuild now.
                 _cachedRobotRenderers.Remove(root);
+                _cachedRobotColliders.Remove(root);
             }
 
             // Renderer toggle — visibility-only, no SetActive(false) on the
@@ -903,6 +931,16 @@ public class StartInput : MonoBehaviour
             for (int i = 0; i < renderers.Length; i++)
             {
                 if (renderers[i] != null) renderers[i].enabled = isSelected;
+            }
+
+            Collider[] colliders = GetOrCacheColliders(root);
+            for (int i = 0; i < colliders.Length; i++)
+            {
+                Collider collider = colliders[i];
+                if (collider != null)
+                {
+                    collider.enabled = isSelected && GetOriginalColliderEnabled(collider);
+                }
             }
 
             if (agentsByGo.TryGetValue(root, out IMimicAgent visibilityAgent) &&
@@ -929,9 +967,9 @@ public class StartInput : MonoBehaviour
         // caller (OnRoboListChanged) tries to FindByKey.
         if (bootstrapped > 0)
         {
-            Debug.Log($"[StartInput] 首次激活 {bootstrapped} 个机器人（SetActive(true) bootstrap）。");
+            Debug.Log($"[StartInput] First-time activated {bootstrapped} robot(s) with SetActive(true) bootstrap.");
         }
-        Debug.Log($"[StartInput] 可见性切换 (Renderer mode)：显示 {shown} 个，隐藏 {hidden} 个 → 当前 '{selectedLabel}'。");
+        Debug.Log($"[StartInput] Visibility switch (Renderer+Collider mode): shown={shown}, hidden={hidden}, selected='{selectedLabel}'.");
     }
 
     private IEnumerator ApplyInitialRobotSelectionStateNextFrame()

@@ -114,6 +114,14 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
     public float rotationKp = 1000f;
     public float rotationKd = 50f;
 
+    [Header("Root Height")]
+    [Tooltip("MuJoCo X02Lite.xml qpos0 pelvis height. Used only for legacy CSV rows whose root z is zero.")]
+    [SerializeField] private float nominalRootHeight = 0.958f;
+    [Tooltip("If the scene stores the pelvis root at ground height, lift it to nominalRootHeight on Initialize/Reset.")]
+    [SerializeField] private bool normalizeInitialRootHeight = true;
+    [SerializeField] private bool replaceZeroCsvRootHeight = true;
+    [SerializeField] private float zeroRootHeightEpsilon = 0.05f;
+
     private bool _isClone = false;
 
     // ── IMimicAgent surface ───────────────────────────────────────────────────
@@ -166,6 +174,17 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
 
     public void ResetToInitialState()
     {
+        RestoreInitialRootPose();
+
+        if (restPositions != null)
+        {
+            SafeSetJointPositions(new List<float>(restPositions));
+        }
+        if (restVelocities != null)
+        {
+            SafeSetJointVelocities(new List<float>(restVelocities));
+        }
+
         for (int i = 0; i < 10; i++)
         {
             if (jh[i] != null) SetJointTargetDeg(jh[i], 0f);
@@ -209,6 +228,10 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
         {
             pos0 = body.position;
             rot0 = body.rotation;
+            NormalizeInitialRootPose();
+            art0.TeleportRoot(pos0, rot0);
+            art0.velocity = Vector3.zero;
+            art0.angularVelocity = Vector3.zero;
 
             art0.GetJointPositions(P0);
             art0.GetJointVelocities(W0);
@@ -483,9 +506,7 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
     public override void OnEpisodeBegin()
     {
         arts[0].immovable       = false;
-        arts[0].TeleportRoot(pos0, rot0);
-        arts[0].velocity        = Vector3.zero;
-        arts[0].angularVelocity = Vector3.zero;
+        RestoreInitialRootPose();
 
         SafeSetJointPositions(new List<float>(restPositions));
         SafeSetJointVelocities(new List<float>(restVelocities));
@@ -523,16 +544,13 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
             SetJointTargetDeg(jh[i], uff[i]);
         }
 
-        Vector3 newPosition = new Vector3(-currentPos[1], currentPos[2] + 0.04f, currentPos[0]);
+        Vector3 newPosition = BuildUnityRootPosition(currentPos);
         Quaternion newRotation = new Quaternion(
             -currentRot[1],
              currentRot[2],
              currentRot[0],
             -currentRot[3]
         );
-        newPosition.x += pos0.x;
-        newPosition.z += pos0.z;
-
         arts[0].TeleportRoot(newPosition, newRotation);
         arts[0].velocity        = Vector3.zero;
         arts[0].angularVelocity = Vector3.zero;
@@ -638,16 +656,13 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
             Array.Copy(currentData, 7, currentDof, 0, 10);
             for (int i = 0; i < 10; i++) uff[i] = currentDof[i] * 180f / 3.14f;
 
-            newPosition = new Vector3(-currentPos[1], currentPos[2], currentPos[0]);
+            newPosition = BuildUnityRootPosition(currentPos);
             newRotation = new Quaternion(
                 -currentRot[1],
                  currentRot[2],
                  currentRot[0],
                 -currentRot[3]
             );
-            newPosition.x += pos0.x;
-            newPosition.z += pos0.z;
-
             if (replay)
             {
                 Physics.gravity = Vector3.zero;
@@ -721,6 +736,38 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
         drive.damping = 8f;
         drive.target = x;
         joint.xDrive = drive;
+    }
+
+    private Vector3 BuildUnityRootPosition(float[] rootPos)
+    {
+        float y = rootPos[2];
+        if (replaceZeroCsvRootHeight && Mathf.Abs(y) <= zeroRootHeightEpsilon)
+        {
+            y = nominalRootHeight;
+        }
+
+        Vector3 position = new Vector3(-rootPos[1], y, rootPos[0]);
+        position.x += pos0.x;
+        position.z += pos0.z;
+        return position;
+    }
+
+    private void NormalizeInitialRootPose()
+    {
+        if (normalizeInitialRootHeight && Mathf.Abs(pos0.y) <= zeroRootHeightEpsilon)
+        {
+            pos0.y = nominalRootHeight;
+        }
+    }
+
+    private void RestoreInitialRootPose()
+    {
+        if (arts == null || arts.Length == 0 || arts[0] == null) return;
+
+        NormalizeInitialRootPose();
+        arts[0].TeleportRoot(pos0, rot0);
+        arts[0].velocity = Vector3.zero;
+        arts[0].angularVelocity = Vector3.zero;
     }
 
     public override void Heuristic(in ActionBuffers actionsOut) { }
