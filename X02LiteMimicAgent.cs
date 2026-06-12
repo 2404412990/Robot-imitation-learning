@@ -11,8 +11,11 @@ using System;
 using System.Globalization;
 using Gewu.Imitation;
 
-public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
+public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelectableMimicAgent
 {
+    private const int DofCount = 18;
+    private const int CsvColumnCount = 7 + DofCount;
+
     public bool train = false;
     public bool replay = false;
 
@@ -22,6 +25,14 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
 
     private static readonly string[] CsvJointNames =
     {
+        "L_shoulder_pitch_Link",
+        "L_shoulder_roll_Link",
+        "L_shoulder_yaw_Link",
+        "L_elbow_Link",
+        "R_shoulder_pitch_Link",
+        "R_shoulder_roll_Link",
+        "R_shoulder_yaw_Link",
+        "R_elbow_Link",
         "L_hip_yaw_Link",
         "L_hip_roll_Link",
         "L_hip_pitch_Link",
@@ -34,33 +45,127 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
         "R_ankle_pitch_Link",
     };
 
-    // X02Lite has 10 DOF (legs only, 5 per leg). The URDF joint order is:
-    //   0..4  left  leg: hip_yaw, hip_roll, hip_pitch, knee_pitch, ankle_pitch
-    //   5..9  right leg: hip_yaw, hip_roll, hip_pitch, knee_pitch, ankle_pitch
-    // Unity's GetComponentsInChildren<ArticulationBody>() traversal may yield a
-    // different order — DumpJointMapping() will print the actual order at startup.
+    private static readonly string[][] CsvJointNameAliases =
+    {
+        new[] { "L_shoulder_pitch_Link", "Link_arm_l_01" },
+        new[] { "L_shoulder_roll_Link", "Link_arm_l_02" },
+        new[] { "L_shoulder_yaw_Link", "Link_arm_l_03" },
+        new[] { "L_elbow_Link", "Link_arm_l_04" },
+        new[] { "R_shoulder_pitch_Link", "Link_arm_r_01" },
+        new[] { "R_shoulder_roll_Link", "Link_arm_r_02" },
+        new[] { "R_shoulder_yaw_Link", "Link_arm_r_03" },
+        new[] { "R_elbow_Link", "Link_arm_r_04" },
+        new[] { "L_hip_yaw_Link", "Link_hip_l_yaw" },
+        new[] { "L_hip_roll_Link", "Link_hip_l_roll" },
+        new[] { "L_hip_pitch_Link", "Link_hip_l_pitch" },
+        new[] { "L_knee_Link", "Link_knee_l_pitch" },
+        new[] { "L_ankle_pitch_Link", "Link_ankle_l_pitch" },
+        new[] { "R_hip_yaw_Link", "Link_hip_r_yaw" },
+        new[] { "R_hip_roll_Link", "Link_hip_r_roll" },
+        new[] { "R_hip_pitch_Link", "Link_hip_r_pitch" },
+        new[] { "R_knee_Link", "Link_knee_r_pitch" },
+        new[] { "R_ankle_pitch_Link", "Link_ankle_r_pitch" },
+    };
+
+    private static readonly string[] CsvJointDisplayNames =
+    {
+        "L_shoulder_pitch",
+        "L_shoulder_roll",
+        "L_shoulder_yaw",
+        "L_elbow",
+        "R_shoulder_pitch",
+        "R_shoulder_roll",
+        "R_shoulder_yaw",
+        "R_elbow",
+        "L_hip_yaw",
+        "L_hip_roll",
+        "L_hip_pitch",
+        "L_knee_pitch",
+        "L_ankle_pitch",
+        "R_hip_yaw",
+        "R_hip_roll",
+        "R_hip_pitch",
+        "R_knee_pitch",
+        "R_ankle_pitch",
+    };
+
+    private static readonly float[] JointLowerLimitsDeg =
+    {
+        -90f, 0f, -130f, -145f,
+        -90f, 0f, -130f, 0f,
+        -45f, -15f, -30f, -140f, -80f,
+        -45f, -15f, -30f, -140f, -80f,
+    };
+
+    private static readonly float[] JointUpperLimitsDeg =
+    {
+        180f, 180f, 130f, 0f,
+        180f, 180f, 130f, 90f,
+        45f, 45f, 115f, 5f, 60f,
+        45f, 45f, 115f, 5f, 60f,
+    };
+
+    // CSV order stays MuJoCo/X02LiteV21. Unity's imported left elbow reduced-space
+    // axis bends opposite to MuJoCo, so it uses a negative drive range below.
+    private static readonly float[] DefaultUnityJointSigns =
+    {
+        1f, 1f, 1f, -1f,
+        1f, 1f, 1f, 1f,
+        1f, 1f, 1f, 1f, 1f,
+        1f, 1f, 1f, 1f, 1f,
+    };
+
+    // X02LiteV21 CSV/MuJoCo order:
+    //   0..3   left  arm: shoulder_pitch, shoulder_roll, shoulder_yaw, elbow
+    //   4..7   right arm: shoulder_pitch, shoulder_roll, shoulder_yaw, elbow
+    //   8..12  left  leg: hip_yaw, hip_roll, hip_pitch, knee_pitch, ankle_pitch
+    //   13..17 right leg: hip_yaw, hip_roll, hip_pitch, knee_pitch, ankle_pitch
+    // Unity traversal may differ, so ResolveCsvJointMap maps by ArticulationBody name.
 
     [Tooltip("If ON, print every Unity revolute joint's GameObject name on Initialize().")]
     [SerializeField] private bool logJointMappingOnStart = true;
+    [SerializeField] private bool requireCompleteRevoluteJointMap = true;
+    [SerializeField] private bool writeReplayJointPositionsDirectly = true;
+    [SerializeField] private bool writeLiveJointPositionsDirectly = false;
+    [SerializeField] private bool zeroReplayJointVelocitiesOnDirectWrite = true;
+    [SerializeField] private bool preferNeutralStandForDefaultReplay = true;
+    [SerializeField] private string neutralStandCsvFileName = "neutral_stand.csv";
+    [SerializeField] private float replayJointForceLimit = 300f;
+    [SerializeField] private bool clampTargetsToDriveLimits = true;
+    [SerializeField] private bool showGroundedNeutralPoseWhenSelected = true;
+    [SerializeField] private bool applyUnityJointSignCorrection = true;
+    [SerializeField] private bool logUnityJointSignsOnStart = true;
 
     private void DumpJointMapping()
     {
         var sb = new System.Text.StringBuilder();
-        sb.AppendLine($"[X02LiteMimicAgent:{name}] Joint mapping (identity assumed):");
-        for (int i = 0; i < 10 && i < jh.Length; i++)
+        sb.AppendLine($"[X02LiteMimicAgent:{name}] Joint mapping:");
+        for (int i = 0; i < DofCount && i < jh.Length; i++)
         {
-            string jointName = (jh[i] != null) ? jh[i].name : "<null>";
-            sb.AppendLine($"  Unity jh[{i,2}] = '{jointName}'   ←  CSV[{i}]");
+            string jointName = (jh[i] != null) ? $"{jh[i].name} ({jh[i].jointType})" : "<missing>";
+            sb.AppendLine($"  CSV[{i,2}] {CsvJointDisplayNames[i],-18} -> Unity '{jointName}'");
         }
-        sb.AppendLine("Expected URDF order (10 DOF X02Lite):");
-        sb.AppendLine("  0..4 left  leg: hip_yaw, hip_roll, hip_pitch, knee_pitch, ankle_pitch");
-        sb.AppendLine("  5..9 right leg: hip_yaw, hip_roll, hip_pitch, knee_pitch, ankle_pitch");
+        sb.AppendLine("Expected X02LiteV21 order (18 DOF):");
+        sb.AppendLine("  0..3 left arm, 4..7 right arm, 8..12 left leg, 13..17 right leg");
+        sb.AppendLine("Missing joints are skipped; they are never mapped by traversal fallback.");
+        if (logUnityJointSignsOnStart)
+        {
+            sb.AppendLine("Unity joint signs:");
+            for (int i = 0; i < DofCount; i++)
+            {
+                ArticulationDrive drive = jh[i] != null ? jh[i].xDrive : default(ArticulationDrive);
+                string limits = jh[i] != null
+                    ? $"limits=[{drive.lowerLimit:F1},{drive.upperLimit:F1}]"
+                    : "limits=<missing>";
+                sb.AppendLine($"  CSV[{i,2}] {CsvJointDisplayNames[i],-18} sign={GetUnityJointSign(i),4:F1} {limits}");
+            }
+        }
         UnityEngine.Debug.Log(sb.ToString());
     }
 
-    float[] uff = new float[10];
-    float[] u = new float[10];
-    float[] utotal = new float[10];
+    float[] uff = new float[DofCount];
+    float[] u = new float[DofCount];
+    float[] utotal = new float[DofCount];
 
     public bool useExternalReplayData = false;
 
@@ -71,8 +176,6 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
     {
         "Assets/Gewu/Imitation/dataset/x02lite",
         "Assets/Imitation/dataset/x02lite",
-        "Assets/Gewu/Imitation/dataset",
-        "Assets/Imitation/dataset",
     };
 
     private List<float[]> refData = new List<float[]>();
@@ -83,13 +186,19 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
     private float realtimeFrameCursor;
     private float realtimePlaybackFps = ReplayCsvUtility.SourceFps;
     private float realtimePlaybackBufferSeconds = 0.2f;
+    private bool hasValidJointMap = true;
+    private bool holdSelectionNeutralPose;
+    private bool isLiveRealtimeCsv;
+    private bool hasLoggedDirectJointStateError;
+    private bool hasLoggedEmptyReplayData;
+    private float[] neutralPoseFrame;
 
-    // X02Lite CSV: 3 root pos + 4 root quat + 10 DOF = 17 cols
-    float[] currentData = new float[17];
-    float[] realtimeSampledData = new float[17];
+    // X02Lite CSV: 3 root pos + 4 root quat + 18 DOF = 25 cols
+    float[] currentData = new float[CsvColumnCount];
+    float[] realtimeSampledData = new float[CsvColumnCount];
     float[] currentPos = new float[3];
     float[] currentRot = new float[4];
-    float[] currentDof = new float[10];
+    float[] currentDof = new float[DofCount];
 
     Transform body;
 
@@ -103,11 +212,11 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
     Quaternion rot0;
     Quaternion newRotation;
     Vector3 newPosition;
-    ArticulationBody[] jh = new ArticulationBody[10];
+    ArticulationBody[] jh = new ArticulationBody[DofCount];
     ArticulationBody[] arts = new ArticulationBody[40];
     ArticulationBody art0;
     int tt = 0;
-    public int frame0 = 100;
+    public int frame0 = 0;
 
     public float positionKp = 1000f;
     public float positionKd = 50f;
@@ -115,14 +224,15 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
     public float rotationKd = 50f;
 
     [Header("Root Height")]
-    [Tooltip("MuJoCo X02Lite.xml qpos0 pelvis height. Used only for legacy CSV rows whose root z is zero.")]
-    [SerializeField] private float nominalRootHeight = 0.958f;
+    [Tooltip("MuJoCo X02LiteV21.xml qpos0 pelvis height. Used only for legacy CSV rows whose root z is zero.")]
+    [SerializeField] private float nominalRootHeight = 0.962f;
     [Tooltip("If the scene stores the pelvis root at ground height, lift it to nominalRootHeight on Initialize/Reset.")]
     [SerializeField] private bool normalizeInitialRootHeight = true;
     [SerializeField] private bool replaceZeroCsvRootHeight = true;
     [SerializeField] private float zeroRootHeightEpsilon = 0.05f;
 
     private bool _isClone = false;
+    private bool isRobotSelectedInScene = true;
 
     // ── IMimicAgent surface ───────────────────────────────────────────────────
     public string RobotKey => string.IsNullOrWhiteSpace(robotKey) ? "x02lite" : robotKey.Trim();
@@ -130,24 +240,73 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
     public bool UseExternalReplayData { get => useExternalReplayData; set => useExternalReplayData = value; }
     public bool ReplayMode { get => replay; set => replay = value; }
     public int MotionId { get; set; }
-    public void RequestEndEpisode() => EndEpisode();
-    public int ExpectedCsvColumns => 17;
-
-    public void BeginRealtimeCsv()
+    public void RequestEndEpisode()
     {
+        if (ReplayMode || UseExternalReplayData)
+        {
+            TryApplyReplayStartFrame(logIfEmpty: true);
+            return;
+        }
+
+        EndEpisode();
+    }
+    public int ExpectedCsvColumns => CsvColumnCount;
+
+    public void SetRobotSelectedInScene(bool isSelected)
+    {
+        isRobotSelectedInScene = isSelected;
+        if (isSelected)
+        {
+            if (showGroundedNeutralPoseWhenSelected && !ReplayMode && !UseExternalReplayData)
+            {
+                UseExternalReplayData = false;
+                ReplayMode = false;
+                isLiveRealtimeCsv = false;
+                holdSelectionNeutralPose = true;
+                ClearReplayBuffers();
+                ApplyGroundedNeutralPose();
+            }
+            else
+            {
+                holdSelectionNeutralPose = false;
+            }
+            return;
+        }
+
+        holdSelectionNeutralPose = false;
+        UseExternalReplayData = false;
+        ReplayMode = false;
+        isLiveRealtimeCsv = false;
+        ClearReplayBuffers();
+        if (art0 != null)
+        {
+            art0.velocity = Vector3.zero;
+            art0.angularVelocity = Vector3.zero;
+            art0.immovable = true;
+        }
+    }
+
+    public bool BeginRealtimeCsv()
+    {
+        if (!hasValidJointMap)
+        {
+            UnityEngine.Debug.LogError("[X02Lite] BeginRealtimeCsv aborted: incomplete or invalid revolute joint mapping.");
+            return false;
+        }
+
         if (realtimePreviousMaxStep < 0)
         {
             realtimePreviousMaxStep = MaxStep;
         }
 
+        holdSelectionNeutralPose = false;
         MaxStep = 0;
-        refData = new List<float[]>();
-        itpData = new List<float[]>();
+        ClearReplayBuffers();
         currentFrame = 0;
         realtimeFrameCursor = 0f;
         tt = 0;
-        UseExternalReplayData = true;
-        ReplayMode = true;
+        isLiveRealtimeCsv = true;
+        return true;
     }
 
     public void SetRealtimePlaybackRate(float framesPerSecond, float bufferSeconds)
@@ -158,7 +317,12 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
 
     public bool AppendRealtimeCsvRows(IReadOnlyList<float[]> rows)
     {
-        return ReplayCsvUtility.AppendRawRows(itpData, rows, ExpectedCsvColumns) > 0;
+        if (!hasValidJointMap)
+        {
+            return false;
+        }
+
+        return ReplayCsvUtility.AppendRawRows(itpData, rows, ExpectedCsvColumns, copyRows: false) > 0;
     }
 
     public void EndRealtimeCsv()
@@ -170,10 +334,12 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
         }
 
         UseExternalReplayData = false;
+        isLiveRealtimeCsv = false;
     }
 
     public void ResetToInitialState()
     {
+        isLiveRealtimeCsv = false;
         RestoreInitialRootPose();
 
         if (restPositions != null)
@@ -185,7 +351,7 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
             SafeSetJointVelocities(new List<float>(restVelocities));
         }
 
-        for (int i = 0; i < 10; i++)
+        for (int i = 0; i < DofCount; i++)
         {
             if (jh[i] != null) SetJointTargetDeg(jh[i], 0f);
             u[i] = 0f;
@@ -198,6 +364,13 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
             realtimeFrameCursor = 0f;
         }
         tt = 0;
+
+        if (isRobotSelectedInScene && !ReplayMode && !UseExternalReplayData && showGroundedNeutralPoseWhenSelected)
+        {
+            holdSelectionNeutralPose = true;
+            ClearReplayBuffers();
+            ApplyGroundedNeutralPose();
+        }
     }
 
     void Start()
@@ -219,12 +392,16 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
     public override void Initialize()
     {
         arts = this.GetComponentsInChildren<ArticulationBody>();
-        ResolveCsvJointMap();
+        art0 = ResolveRootArticulation();
+        body = art0 != null ? art0.transform : null;
+        hasValidJointMap = art0 != null && ResolveCsvJointMap();
 
-        body = arts[0].GetComponent<Transform>();
-        art0 = body.GetComponent<ArticulationBody>();
+        if (art0 == null)
+        {
+            UnityEngine.Debug.LogError("[X02Lite] No ArticulationBody root found. Replay/live retargeting is disabled.");
+        }
 
-        if (restPositions == null)
+        if (restPositions == null && art0 != null && body != null)
         {
             pos0 = body.position;
             rot0 = body.rotation;
@@ -240,35 +417,114 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
             restVelocities = W0.ToArray();
         }
 
-        TryLoadCurrentMotionData(keepProgress: false);
+        TryCacheNeutralPoseFrame();
+        if (replay)
+        {
+            TryLoadCurrentMotionData(keepProgress: false);
+        }
+        else
+        {
+            ClearReplayBuffers();
+        }
 
         if (logJointMappingOnStart) DumpJointMapping();
+
+        if (!hasValidJointMap)
+        {
+            UnityEngine.Debug.LogError("[X02Lite] Incomplete joint map. Replay/live retargeting will stay disabled until every expected arm/leg joint is authored as a RevoluteJoint.");
+        }
 
         MimicAgentRegistry.Instance.Register(this);
     }
 
-    private void ResolveCsvJointMap()
+    private ArticulationBody ResolveRootArticulation()
+    {
+        if (arts == null || arts.Length == 0)
+        {
+            return null;
+        }
+
+        ArticulationBody root = arts.FirstOrDefault(art => art != null && art.isRoot);
+        if (root != null)
+        {
+            return root;
+        }
+
+        root = arts.FirstOrDefault(art => art != null && string.Equals(art.name, "pelvis", System.StringComparison.OrdinalIgnoreCase));
+        if (root != null)
+        {
+            UnityEngine.Debug.LogWarning("[X02Lite] No articulation isRoot flag found; using pelvis as root.");
+            return root;
+        }
+
+        root = arts.FirstOrDefault(art => art != null);
+        if (root != null)
+        {
+            UnityEngine.Debug.LogWarning($"[X02Lite] No articulation root/pelvis found; falling back to first ArticulationBody '{root.name}'.");
+        }
+        return root;
+    }
+
+    private bool ResolveCsvJointMap()
     {
         var byName = arts
-            .Where(art => art != null && art.jointType == ArticulationJointType.RevoluteJoint)
+            .Where(art => art != null)
             .GroupBy(art => art.name, System.StringComparer.OrdinalIgnoreCase)
             .ToDictionary(group => group.Key, group => group.First(), System.StringComparer.OrdinalIgnoreCase);
 
-        var fallback = arts
-            .Where(art => art != null && art.jointType == ArticulationJointType.RevoluteJoint)
-            .ToList();
+        bool mappingValid = true;
 
         for (int i = 0; i < CsvJointNames.Length; i++)
         {
-            if (byName.TryGetValue(CsvJointNames[i], out ArticulationBody joint))
+            ArticulationBody joint = ResolveCsvJointByAliases(i, byName);
+            if (joint != null)
             {
-                jh[i] = joint;
+                bool jointValid = EnsureCsvJointIsDriveable(i, joint);
+                jh[i] = jointValid ? joint : null;
+                mappingValid &= jointValid;
                 continue;
             }
 
-            jh[i] = i < fallback.Count ? fallback[i] : null;
-            UnityEngine.Debug.LogWarning($"[X02Lite] Missing expected joint '{CsvJointNames[i]}'; using traversal fallback at index {i}.");
+            jh[i] = null;
+            mappingValid = false;
+            UnityEngine.Debug.LogError($"[X02Lite] Missing expected joint for CSV[{i}] {CsvJointDisplayNames[i]}. Tried: {DescribeJointAliases(i)}.");
         }
+
+        return !requireCompleteRevoluteJointMap || mappingValid;
+    }
+
+    private ArticulationBody ResolveCsvJointByAliases(int csvIndex, Dictionary<string, ArticulationBody> byName)
+    {
+        string[] aliases = CsvJointNameAliases[csvIndex];
+        for (int i = 0; i < aliases.Length; i++)
+        {
+            if (byName.TryGetValue(aliases[i], out ArticulationBody joint))
+            {
+                return joint;
+            }
+        }
+        return null;
+    }
+
+    private static string DescribeJointAliases(int csvIndex)
+    {
+        return string.Join(", ", CsvJointNameAliases[csvIndex]);
+    }
+
+    private bool EnsureCsvJointIsDriveable(int csvIndex, ArticulationBody joint)
+    {
+        if (joint == null)
+        {
+            return false;
+        }
+
+        if (joint.jointType != ArticulationJointType.RevoluteJoint)
+        {
+            UnityEngine.Debug.LogError($"[X02Lite] Joint '{joint.name}' is {joint.jointType}, not RevoluteJoint. CSV[{csvIndex}] {CsvJointDisplayNames[csvIndex]} is invalid.");
+            return false;
+        }
+
+        return true;
     }
 
     List<string> GetCsvFileNames(string directoryPath)
@@ -278,7 +534,8 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
         {
             if (Directory.Exists(directoryPath))
             {
-                foreach (string file in Directory.GetFiles(directoryPath))
+                foreach (string file in Directory.GetFiles(directoryPath, "*.csv", SearchOption.AllDirectories)
+                    .OrderBy(file => file, StringComparer.OrdinalIgnoreCase))
                 {
                     if (Path.GetExtension(file).ToLower() == ".csv")
                         csvFiles.Add(file);
@@ -295,6 +552,7 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
     List<float[]> LoadDataFromFile(string filePath)
     {
         List<float[]> dataList = new List<float[]>();
+        bool loggedColumnMismatch = false;
         try
         {
             using (FileStream fileStream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
@@ -317,8 +575,16 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
                         }
                     }
 
-                    if (frameData.Count < 17) continue;
-                    if (frameData.Count > 17) frameData = frameData.Take(17).ToList();
+                    if (frameData.Count != CsvColumnCount)
+                    {
+                        if (!loggedColumnMismatch)
+                        {
+                            UnityEngine.Debug.LogWarning(
+                                $"[X02Lite] Skipping CSV row with {frameData.Count} columns in '{filePath}'. Expected exactly {CsvColumnCount} columns.");
+                            loggedColumnMismatch = true;
+                        }
+                        continue;
+                    }
 
                     dataList.Add(frameData.ToArray());
                 }
@@ -333,6 +599,12 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
 
     public bool LoadReplayCsvFromPath(string filePath, bool keepProgress = true)
     {
+        if (!hasValidJointMap)
+        {
+            UnityEngine.Debug.LogError("[X02Lite] LoadReplayCsvFromPath aborted: incomplete or invalid revolute joint mapping.");
+            return false;
+        }
+
         if (string.IsNullOrWhiteSpace(filePath))
         {
             UnityEngine.Debug.LogWarning("[X02Lite] LoadReplayCsvFromPath failed: filePath is empty.");
@@ -351,6 +623,10 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
             return false;
         }
 
+        holdSelectionNeutralPose = false;
+        isLiveRealtimeCsv = false;
+        ReplayMode = true;
+        UnityEngine.Debug.Log($"[X02Lite] Loaded replay CSV '{filePath}' rows={data.Count}.");
         return ApplyReplayData(data, keepProgress);
     }
 
@@ -367,7 +643,7 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
         }
 
         int mid = Mathf.Clamp(MotionId, 0, csvFileNames.Count - 1);
-        string selectedCsv = csvFileNames[mid];
+        string selectedCsv = PickDefaultReplayCsv(csvFileNames, mid);
 
         List<float[]> data = LoadDataFromFile(selectedCsv);
         if (data == null || data.Count == 0)
@@ -376,7 +652,35 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
             return false;
         }
 
+        isLiveRealtimeCsv = false;
         return ApplyReplayData(data, keepProgress);
+    }
+
+    private string PickDefaultReplayCsv(List<string> csvFileNames, int fallbackIndex)
+    {
+        if (csvFileNames == null || csvFileNames.Count == 0)
+        {
+            return string.Empty;
+        }
+
+        if (preferNeutralStandForDefaultReplay)
+        {
+            string neutralName = string.IsNullOrWhiteSpace(neutralStandCsvFileName)
+                ? "neutral_stand.csv"
+                : neutralStandCsvFileName.Trim();
+
+            string neutral = csvFileNames.FirstOrDefault(file =>
+                string.Equals(Path.GetFileName(file), neutralName, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(Path.GetFileNameWithoutExtension(file), Path.GetFileNameWithoutExtension(neutralName), StringComparison.OrdinalIgnoreCase));
+
+            if (!string.IsNullOrWhiteSpace(neutral))
+            {
+                return neutral;
+            }
+        }
+
+        int index = Mathf.Clamp(fallbackIndex, 0, csvFileNames.Count - 1);
+        return csvFileNames[index];
     }
 
     private bool ApplyReplayData(List<float[]> data, bool keepProgress)
@@ -384,6 +688,7 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
         if (data == null || data.Count == 0) return false;
 
         int oldFrame = currentFrame;
+        isLiveRealtimeCsv = false;
         refData = data;
 
         if (refData.Count <= 1)
@@ -405,9 +710,11 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
 
         if (itpData.Count == 0) return false;
 
+        holdSelectionNeutralPose = false;
+        hasLoggedDirectJointStateError = false;
         currentFrame = keepProgress
             ? Mathf.Clamp(oldFrame, 0, itpData.Count - 1)
-            : Mathf.Clamp(frame0, 0, itpData.Count - 1);
+            : 0;
 
         return true;
     }
@@ -451,24 +758,26 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
 
     private int ArticulationCacheSize()
     {
-        if (arts == null || arts.Length == 0 || arts[0] == null) return 0;
+        if (art0 == null) return 0;
         _cacheProbe.Clear();
-        arts[0].GetJointPositions(_cacheProbe);
+        art0.GetJointPositions(_cacheProbe);
         return _cacheProbe.Count;
     }
 
     private void SafeSetJointPositions(List<float> positions)
     {
+        if (art0 == null) return;
         int cacheSize = ArticulationCacheSize();
         List<float> safe = AlignToCache(positions, cacheSize);
-        arts[0].SetJointPositions(safe);
+        art0.SetJointPositions(safe);
     }
 
     private void SafeSetJointVelocities(List<float> velocities)
     {
+        if (art0 == null) return;
         int cacheSize = ArticulationCacheSize();
         List<float> safe = AlignToCache(velocities, cacheSize);
-        arts[0].SetJointVelocities(safe);
+        art0.SetJointVelocities(safe);
     }
 
     private List<float> AlignToCache(List<float> source, int cacheSize)
@@ -484,7 +793,7 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
         if (source.Count + RootDofCount == cacheSize)
         {
             _cacheProbe.Clear();
-            arts[0].GetJointPositions(_cacheProbe);
+            art0.GetJointPositions(_cacheProbe);
             var safe = new List<float>(cacheSize);
             for (int i = 0; i < RootDofCount && i < _cacheProbe.Count; i++)
                 safe.Add(_cacheProbe[i]);
@@ -505,14 +814,46 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
 
     public override void OnEpisodeBegin()
     {
-        arts[0].immovable       = false;
+        if (!isRobotSelectedInScene)
+        {
+            return;
+        }
+
+        if (!hasValidJointMap)
+        {
+            return;
+        }
+
+        if (holdSelectionNeutralPose && !ReplayMode && !useExternalReplayData)
+        {
+            ApplyGroundedNeutralPose();
+            return;
+        }
+
+        TryApplyReplayStartFrame(logIfEmpty: true);
+    }
+
+    private bool TryApplyReplayStartFrame(bool logIfEmpty)
+    {
+        if (!isRobotSelectedInScene || !hasValidJointMap || art0 == null)
+        {
+            return false;
+        }
+
+        art0.immovable       = false;
         RestoreInitialRootPose();
 
-        SafeSetJointPositions(new List<float>(restPositions));
-        SafeSetJointVelocities(new List<float>(restVelocities));
+        if (restPositions != null)
+        {
+            SafeSetJointPositions(new List<float>(restPositions));
+        }
+        if (restVelocities != null)
+        {
+            SafeSetJointVelocities(new List<float>(restVelocities));
+        }
 
-        for (int i = 0; i < 10; i++) u[i]   = 0;
-        for (int i = 0; i < 10; i++) uff[i] = 0;
+        for (int i = 0; i < DofCount; i++) u[i]   = 0;
+        for (int i = 0; i < DofCount; i++) uff[i] = 0;
         currentFrame = useExternalReplayData ? 0 : frame0;
         if (useExternalReplayData)
         {
@@ -527,22 +868,23 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
         List<float[]> episodeData = useExternalReplayData ? itpData : refData;
         if (episodeData == null || episodeData.Count == 0)
         {
-            UnityEngine.Debug.LogWarning("[X02Lite] replay data is empty, skip OnEpisodeBegin.");
-            return;
+            if (logIfEmpty && !hasLoggedEmptyReplayData)
+            {
+                UnityEngine.Debug.LogWarning("[X02Lite] replay data is empty, skip replay start.");
+                hasLoggedEmptyReplayData = true;
+            }
+            return false;
         }
 
+        hasLoggedEmptyReplayData = false;
         currentFrame = Mathf.Clamp(currentFrame, 0, episodeData.Count - 1);
         tt = 0;
         currentData = episodeData[currentFrame];
         Array.Copy(currentData, 0, currentPos, 0, 3);
         Array.Copy(currentData, 3, currentRot, 0, 4);
-        Array.Copy(currentData, 7, currentDof, 0, 10);
+        Array.Copy(currentData, 7, currentDof, 0, DofCount);
 
-        for (int i = 0; i < 10; i++)
-        {
-            uff[i] = currentDof[i] * 180f / 3.14f;
-            SetJointTargetDeg(jh[i], uff[i]);
-        }
+        ApplyCurrentDofToJoints(directWrite: replay && (!isLiveRealtimeCsv || writeLiveJointPositionsDirectly));
 
         Vector3 newPosition = BuildUnityRootPosition(currentPos);
         Quaternion newRotation = new Quaternion(
@@ -551,10 +893,11 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
              currentRot[0],
             -currentRot[3]
         );
-        arts[0].TeleportRoot(newPosition, newRotation);
-        arts[0].velocity        = Vector3.zero;
-        arts[0].angularVelocity = Vector3.zero;
-        arts[0].immovable       = true;
+        art0.TeleportRoot(newPosition, newRotation);
+        art0.velocity        = Vector3.zero;
+        art0.angularVelocity = Vector3.zero;
+        art0.immovable       = true;
+        return true;
     }
 
     List<float[]> Interpolate(float[] t, List<float[]> posList, float[] targetT)
@@ -592,7 +935,7 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
         else
             sensor.AddObservation(Vector3.zero);
 
-        for (int i = 0; i < 10; i++)
+        for (int i = 0; i < DofCount; i++)
         {
             float pos = 0f, vel = 0f;
             if (jh[i] != null)
@@ -615,11 +958,16 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
 
     public override void OnActionReceived(ActionBuffers actionBuffers)
     {
+        if (!isRobotSelectedInScene)
+        {
+            return;
+        }
+
         var continuousActions = actionBuffers.ContinuousActions;
         var kk = 0.9f;
         float kb = 50;
         if (replay) kb = 0;
-        for (int i = 0; i < 10; i++)
+        for (int i = 0; i < DofCount; i++)
         {
             float action = i < continuousActions.Length ? continuousActions[i] : 0f;
             u[i] = u[i] * kk + (1 - kk) * action;
@@ -630,7 +978,23 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
 
     void FixedUpdate()
     {
-        if (itpData != null && itpData.Count > 0)
+        if (!isRobotSelectedInScene)
+        {
+            return;
+        }
+
+        if (!hasValidJointMap)
+        {
+            return;
+        }
+
+        if (holdSelectionNeutralPose && !ReplayMode && !useExternalReplayData)
+        {
+            return;
+        }
+
+        bool hasMotionData = itpData != null && itpData.Count > 0;
+        if (hasMotionData)
         {
             if (useExternalReplayData)
             {
@@ -653,8 +1017,8 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
             }
             Array.Copy(currentData, 0, currentPos, 0, 3);
             Array.Copy(currentData, 3, currentRot, 0, 4);
-            Array.Copy(currentData, 7, currentDof, 0, 10);
-            for (int i = 0; i < 10; i++) uff[i] = currentDof[i] * 180f / 3.14f;
+            Array.Copy(currentData, 7, currentDof, 0, DofCount);
+            ApplyCurrentDofToJoints(directWrite: replay && (!isLiveRealtimeCsv || writeLiveJointPositionsDirectly));
 
             newPosition = BuildUnityRootPosition(currentPos);
             newRotation = new Quaternion(
@@ -666,18 +1030,19 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
             if (replay)
             {
                 Physics.gravity = Vector3.zero;
-                arts[0].TeleportRoot(newPosition, newRotation);
+                art0.immovable = true;
+                art0.TeleportRoot(newPosition, newRotation);
             }
             else
             {
                 if (tt > 3)
                 {
-                    arts[0].immovable = false;
+                    art0.immovable = false;
 
                     Vector3 positionError = newPosition - body.position;
                     Vector3 velocityError = -art0.velocity;
                     Vector3 positionForce = positionKp * positionError + positionKd * velocityError;
-                    arts[0].AddForce(positionForce);
+                    art0.AddForce(positionForce);
 
                     Quaternion rotationError = newRotation * Quaternion.Inverse(body.rotation);
                     rotationError.ToAngleAxis(out float angle, out Vector3 axis);
@@ -691,9 +1056,9 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
         }
 
         tt++;
-        if (tt > 3)
+        if (train && hasMotionData && tt > 3 && !replay)
         {
-            arts[0].immovable = false;
+            art0.immovable = false;
             float rot_reward = -0.01f * Quaternion.Angle(body.rotation, newRotation);
             float pos_reward = -1f * (body.position - newPosition).magnitude;
 
@@ -703,8 +1068,15 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
             }
 
             float dof_reward = 0f;
-            for (int i = 0; i < 10; i++)
-                dof_reward += -0.1f * Mathf.Abs(jh[i].jointPosition[0] - currentDof[i]);
+            for (int i = 0; i < DofCount; i++)
+            {
+                if (jh[i] == null || jh[i].jointPosition.dofCount == 0)
+                {
+                    continue;
+                }
+
+                dof_reward += -0.1f * Mathf.Abs(jh[i].jointPosition[0] - ToUnityJointRadians(i, currentDof[i]));
+            }
 
             AddReward(1f + (rot_reward + pos_reward) * 1f + dof_reward);
         }
@@ -732,10 +1104,109 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
     {
         if (joint == null) return;
         var drive = joint.xDrive;
+        if (clampTargetsToDriveLimits)
+        {
+            x = Mathf.Clamp(x, drive.lowerLimit, drive.upperLimit);
+        }
         drive.stiffness = 180f;
         drive.damping = 8f;
+        drive.forceLimit = Mathf.Max(drive.forceLimit, replayJointForceLimit);
         drive.target = x;
         joint.xDrive = drive;
+    }
+
+    private void ApplyCurrentDofToJoints(bool directWrite)
+    {
+        int directWriteCount = 0;
+        for (int i = 0; i < DofCount; i++)
+        {
+            float targetRad = ToUnityJointRadians(i, currentDof[i]);
+            float targetDeg = targetRad * Mathf.Rad2Deg;
+            uff[i] = targetDeg;
+            SetJointTargetDeg(jh[i], targetDeg);
+
+            if (directWrite && writeReplayJointPositionsDirectly)
+            {
+                if (SetJointPositionRad(jh[i], targetRad))
+                {
+                    directWriteCount++;
+                }
+            }
+        }
+
+        if (directWrite && writeReplayJointPositionsDirectly && directWriteCount == 0 && !hasLoggedDirectJointStateError)
+        {
+            UnityEngine.Debug.LogError("[X02Lite] Direct replay could not write any joint positions; all mapped joints reported empty reduced-space state.");
+            hasLoggedDirectJointStateError = true;
+        }
+    }
+
+    private float ToUnityJointRadians(int csvIndex, float csvRadians)
+    {
+        return csvRadians * GetUnityJointSign(csvIndex);
+    }
+
+    private float GetUnityJointSign(int csvIndex)
+    {
+        if (!applyUnityJointSignCorrection || csvIndex < 0 || csvIndex >= DefaultUnityJointSigns.Length)
+        {
+            return 1f;
+        }
+
+        return DefaultUnityJointSigns[csvIndex] < 0f ? -1f : 1f;
+    }
+
+    private bool SetJointPositionRad(ArticulationBody joint, float radians)
+    {
+        if (joint == null || joint.jointType != ArticulationJointType.RevoluteJoint)
+        {
+            return false;
+        }
+
+        try
+        {
+            ArticulationReducedSpace jointPosition = joint.jointPosition;
+            if (jointPosition.dofCount <= 0)
+            {
+                return false;
+            }
+
+            jointPosition[0] = ClampJointRadiansToDrive(joint, radians);
+            joint.jointPosition = jointPosition;
+
+            if (zeroReplayJointVelocitiesOnDirectWrite)
+            {
+                ArticulationReducedSpace jointVelocity = joint.jointVelocity;
+                if (jointVelocity.dofCount > 0)
+                {
+                    jointVelocity[0] = 0f;
+                    joint.jointVelocity = jointVelocity;
+                }
+            }
+            return true;
+        }
+        catch (System.Exception e)
+        {
+            UnityEngine.Debug.LogWarning($"[X02Lite] Failed to write joint position for '{joint.name}': {e.Message}");
+            return false;
+        }
+    }
+
+    private float ClampJointRadiansToDrive(ArticulationBody joint, float radians)
+    {
+        if (!clampTargetsToDriveLimits || joint == null)
+        {
+            return radians;
+        }
+
+        ArticulationDrive drive = joint.xDrive;
+        if (drive.lowerLimit >= drive.upperLimit)
+        {
+            return radians;
+        }
+
+        float degrees = Mathf.Clamp(radians * Mathf.Rad2Deg, drive.lowerLimit, drive.upperLimit);
+        return degrees * Mathf.Deg2Rad;
     }
 
     private Vector3 BuildUnityRootPosition(float[] rootPos)
@@ -760,14 +1231,102 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
         }
     }
 
+    private void ClearReplayBuffers()
+    {
+        refData = new List<float[]>();
+        itpData = new List<float[]>();
+        currentFrame = 0;
+        realtimeFrameCursor = 0f;
+    }
+
+    private bool TryCacheNeutralPoseFrame()
+    {
+        string datasetPath = ResolveDatasetPath();
+        if (string.IsNullOrWhiteSpace(datasetPath))
+        {
+            return false;
+        }
+
+        List<string> csvFileNames = GetCsvFileNames(datasetPath);
+        string neutralPath = FindNeutralCsv(csvFileNames);
+        if (string.IsNullOrWhiteSpace(neutralPath))
+        {
+            return false;
+        }
+
+        List<float[]> data = LoadDataFromFile(neutralPath);
+        if (data == null || data.Count == 0)
+        {
+            return false;
+        }
+
+        neutralPoseFrame = data[0];
+        return neutralPoseFrame != null && neutralPoseFrame.Length >= CsvColumnCount;
+    }
+
+    private string FindNeutralCsv(List<string> csvFileNames)
+    {
+        if (csvFileNames == null || csvFileNames.Count == 0)
+        {
+            return string.Empty;
+        }
+
+        string neutralName = string.IsNullOrWhiteSpace(neutralStandCsvFileName)
+            ? "neutral_stand.csv"
+            : neutralStandCsvFileName.Trim();
+
+        return csvFileNames.FirstOrDefault(file =>
+            string.Equals(Path.GetFileName(file), neutralName, StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(Path.GetFileNameWithoutExtension(file), Path.GetFileNameWithoutExtension(neutralName), StringComparison.OrdinalIgnoreCase))
+            ?? string.Empty;
+    }
+
+    private void ApplyGroundedNeutralPose()
+    {
+        if (arts == null || arts.Length == 0 || art0 == null)
+        {
+            return;
+        }
+
+        if ((neutralPoseFrame == null || neutralPoseFrame.Length < CsvColumnCount) && !TryCacheNeutralPoseFrame())
+        {
+            UnityEngine.Debug.LogWarning("[X02Lite] neutral_stand.csv is unavailable, falling back to zero joint targets for selection pose.");
+        }
+
+        RestoreInitialRootPose();
+        art0.immovable = true;
+        art0.velocity = Vector3.zero;
+        art0.angularVelocity = Vector3.zero;
+
+        for (int i = 0; i < DofCount; i++)
+        {
+            float targetRad = 0f;
+            if (neutralPoseFrame != null && neutralPoseFrame.Length >= CsvColumnCount)
+            {
+                targetRad = neutralPoseFrame[7 + i];
+            }
+
+            currentDof[i] = targetRad;
+            float unityTargetRad = ToUnityJointRadians(i, targetRad);
+            uff[i] = unityTargetRad * Mathf.Rad2Deg;
+            SetJointTargetDeg(jh[i], uff[i]);
+            if (writeReplayJointPositionsDirectly)
+            {
+                SetJointPositionRad(jh[i], unityTargetRad);
+            }
+        }
+
+        tt = 0;
+    }
+
     private void RestoreInitialRootPose()
     {
-        if (arts == null || arts.Length == 0 || arts[0] == null) return;
+        if (art0 == null) return;
 
         NormalizeInitialRootPose();
-        arts[0].TeleportRoot(pos0, rot0);
-        arts[0].velocity = Vector3.zero;
-        arts[0].angularVelocity = Vector3.zero;
+        art0.TeleportRoot(pos0, rot0);
+        art0.velocity = Vector3.zero;
+        art0.angularVelocity = Vector3.zero;
     }
 
     public override void Heuristic(in ActionBuffers actionsOut) { }

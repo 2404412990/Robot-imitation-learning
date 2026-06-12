@@ -116,8 +116,6 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, I
     {
         "Assets/Gewu/Imitation/dataset/openloong",
         "Assets/Imitation/dataset/openloong",
-        "Assets/Gewu/Imitation/dataset",
-        "Assets/Imitation/dataset",
     };
 
     private readonly float[] uff = new float[DofCols];
@@ -193,7 +191,7 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, I
         rootArticulation.immovable = true;
     }
 
-    public void BeginRealtimeCsv()
+    public bool BeginRealtimeCsv()
     {
         if (realtimePreviousMaxStep < 0)
         {
@@ -207,8 +205,7 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, I
         realtimeFrameCursor = 0f;
         appliedRowDebugCount = 0;
         tt = 0;
-        UseExternalReplayData = true;
-        ReplayMode = true;
+        return true;
     }
 
     public void SetRealtimePlaybackRate(float framesPerSecond, float bufferSeconds)
@@ -219,7 +216,7 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, I
 
     public bool AppendRealtimeCsvRows(IReadOnlyList<float[]> rows)
     {
-        return ReplayCsvUtility.AppendRawRows(itpData, rows, ExpectedCsvColumns) > 0;
+        return ReplayCsvUtility.AppendRawRows(itpData, rows, ExpectedCsvColumns, copyRows: false) > 0;
     }
 
     public void EndRealtimeCsv()

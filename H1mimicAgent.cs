@@ -14,7 +14,7 @@ using UnityEditor;
 #endif
 using Gewu.Imitation;
 
-public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
+public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelectableMimicAgent
 {
     public bool train = false;
     public bool replay = false;
@@ -116,6 +116,7 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
     int tt = 0;
 
     private bool _isClone = false;
+    private bool isRobotSelectedInScene = true;
 
     // ── IMimicAgent surface ───────────────────────────────────────────────────
     public string RobotKey => string.IsNullOrWhiteSpace(robotKey) ? "unitree_h1" : robotKey.Trim();
@@ -126,7 +127,22 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
     public void RequestEndEpisode() => EndEpisode();
     public int ExpectedCsvColumns => 26;
 
-    public void BeginRealtimeCsv()
+    public void SetRobotSelectedInScene(bool isSelected)
+    {
+        isRobotSelectedInScene = isSelected;
+        if (isSelected) return;
+
+        UseExternalReplayData = false;
+        ReplayMode = false;
+        if (art0 != null)
+        {
+            art0.velocity = Vector3.zero;
+            art0.angularVelocity = Vector3.zero;
+            art0.immovable = true;
+        }
+    }
+
+    public bool BeginRealtimeCsv()
     {
         if (realtimePreviousMaxStep < 0)
         {
@@ -143,8 +159,7 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
         realtimeFrameCursor = 0f;
         tt = 0;
         isEndEpisode = false;
-        UseExternalReplayData = true;
-        ReplayMode = true;
+        return true;
     }
 
     public void SetRealtimePlaybackRate(float framesPerSecond, float bufferSeconds)
@@ -155,7 +170,7 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
 
     public bool AppendRealtimeCsvRows(IReadOnlyList<float[]> rows)
     {
-        return ReplayCsvUtility.AppendRawRows(realtimeRawRows, rows, ExpectedCsvColumns) > 0;
+        return ReplayCsvUtility.AppendRawRows(realtimeRawRows, rows, ExpectedCsvColumns, copyRows: false) > 0;
     }
 
     public void EndRealtimeCsv()
@@ -528,6 +543,11 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
 
     public override void OnEpisodeBegin()
     {
+        if (!isRobotSelectedInScene)
+        {
+            return;
+        }
+
         // ── CRITICAL: clear immovable BEFORE cache writes (see the long comment
         // in G1mimicAgent.OnEpisodeBegin). Previous OnEpisodeBegin set
         // arts[0].immovable = true to keep root pinned during replay; that
@@ -683,6 +703,11 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
     
     public override void OnActionReceived(ActionBuffers actionBuffers)
     {
+        if (!isRobotSelectedInScene)
+        {
+            return;
+        }
+
         var continuousActions = actionBuffers.ContinuousActions;
         var kk = 0.9f;
         
@@ -699,6 +724,11 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
 
     void FixedUpdate()
     {
+        if (!isRobotSelectedInScene)
+        {
+            return;
+        }
+
 	///////////////feedforward///////////////////////////////////////////////////////////
     bool hasRealtimeRows = useExternalReplayData && realtimeRawRows.Count > 0;
 	if (hasRealtimeRows || allDofData.Count > 0)

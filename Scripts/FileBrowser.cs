@@ -33,7 +33,6 @@ public class FileBrowser : MonoBehaviour
     {
         "Assets/Gewu/Imitation/dataset",
         "Assets/Imitation/dataset",
-        "Assets/Imatation/dataset",
     };
 
     public string searchPattern = "*.*";
@@ -67,20 +66,16 @@ public class FileBrowser : MonoBehaviour
     private static readonly Dictionary<string, CsvColumnCacheEntry> CsvColumnCache =
         new Dictionary<string, CsvColumnCacheEntry>(StringComparer.OrdinalIgnoreCase);
 
+    // Store only normalized keys here; aliases are handled by NormalizeRobotKey.
     private static readonly Dictionary<string, int> CsvExpectedColumnsByRobot =
         new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
         {
-            { "G1", 36 },
-            { "G1H", 36 },
             { "unitree_g1", 36 },
             { "unitree_g1_with_hands", 36 },
-            { "H1", 26 },
-            { "H1_2", 26 },
             { "unitree_h1", 26 },
             { "unitree_h1_2", 26 },
-            { "X02", 17 },
-            { "X02Lite", 17 },
-            { "OpenLoong", 38 },
+            { "x02lite", 25 },
+            { "openloong", 38 },
         };
 
     void Start()
@@ -234,9 +229,7 @@ public class FileBrowser : MonoBehaviour
         string[] files = Directory.GetFiles(folderPath, searchPattern, searchOption);
 
         IEnumerable<string> csvFiles = files
-            .Where(filePath => string.Equals(Path.GetExtension(filePath), ".csv", StringComparison.OrdinalIgnoreCase))
-            .GroupBy(GetCsvDisplayName, StringComparer.OrdinalIgnoreCase)
-            .Select(group => group.First());
+            .Where(filePath => string.Equals(Path.GetExtension(filePath), ".csv", StringComparison.OrdinalIgnoreCase));
 
         if (filterCsvByRobot)
         {
@@ -244,6 +237,8 @@ public class FileBrowser : MonoBehaviour
         }
 
         csvFilePaths.AddRange(csvFiles
+            .GroupBy(GetCsvDisplayName, StringComparer.OrdinalIgnoreCase)
+            .Select(PickPreferredCsvForDisplayName)
             .OrderBy(filePath => Path.GetFileNameWithoutExtension(filePath), StringComparer.OrdinalIgnoreCase));
 
         List<string> fileNames = csvFilePaths
@@ -280,6 +275,78 @@ public class FileBrowser : MonoBehaviour
         return columnCount == expectedColumns;
     }
 
+    private string PickPreferredCsvForDisplayName(IGrouping<string, string> group)
+    {
+        if (group == null)
+        {
+            return string.Empty;
+        }
+
+        return group
+            .OrderByDescending(filePath => IsInRobotNamedFolder(filePath, csvRobotFilterKey) ? 1 : 0)
+            .ThenBy(filePath => filePath, StringComparer.OrdinalIgnoreCase)
+            .FirstOrDefault() ?? string.Empty;
+    }
+
+    private static bool IsInRobotNamedFolder(string filePath, string robotKeyOrLabel)
+    {
+        if (string.IsNullOrWhiteSpace(filePath) || string.IsNullOrWhiteSpace(robotKeyOrLabel))
+        {
+            return false;
+        }
+
+        string normalizedRobot = NormalizeRobotKey(robotKeyOrLabel);
+        if (string.IsNullOrWhiteSpace(normalizedRobot))
+        {
+            return false;
+        }
+
+        string directory = Path.GetDirectoryName(filePath) ?? string.Empty;
+        char[] separators = { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar };
+        foreach (string segment in directory.Split(separators, StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (string.Equals(NormalizeRobotKey(segment), normalizedRobot, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static string NormalizeRobotKey(string raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return string.Empty;
+        }
+
+        string key = raw.Trim();
+        if (string.Equals(key, "G1", StringComparison.OrdinalIgnoreCase))
+        {
+            return "unitree_g1";
+        }
+        if (string.Equals(key, "G1H", StringComparison.OrdinalIgnoreCase))
+        {
+            return "unitree_g1_with_hands";
+        }
+        if (string.Equals(key, "H1", StringComparison.OrdinalIgnoreCase))
+        {
+            return "unitree_h1";
+        }
+        if (string.Equals(key, "H1_2", StringComparison.OrdinalIgnoreCase))
+        {
+            return "unitree_h1_2";
+        }
+        if (string.Equals(key, "X02", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(key, "X02Lite", StringComparison.OrdinalIgnoreCase))
+        {
+            return "x02lite";
+        }
+
+        return key;
+    }
+
     private static bool TryResolveExpectedColumns(string robotKeyOrLabel, out int expectedColumns)
     {
         expectedColumns = 0;
@@ -288,7 +355,8 @@ public class FileBrowser : MonoBehaviour
             return false;
         }
 
-        return CsvExpectedColumnsByRobot.TryGetValue(robotKeyOrLabel.Trim(), out expectedColumns);
+        string normalizedKey = NormalizeRobotKey(robotKeyOrLabel);
+        return CsvExpectedColumnsByRobot.TryGetValue(normalizedKey, out expectedColumns);
     }
 
     private static bool TryReadCsvColumnCount(string filePath, out int columnCount)

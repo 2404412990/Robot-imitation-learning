@@ -90,6 +90,15 @@ public static class ReplayCsvUtility
         IReadOnlyList<float[]> newRows,
         int expectedDimension)
     {
+        return AppendRawRows(target, newRows, expectedDimension, copyRows: true);
+    }
+
+    public static int AppendRawRows(
+        List<float[]> target,
+        IReadOnlyList<float[]> newRows,
+        int expectedDimension,
+        bool copyRows)
+    {
         if (target == null || newRows == null || newRows.Count == 0)
         {
             return 0;
@@ -105,9 +114,16 @@ public static class ReplayCsvUtility
                 continue;
             }
 
-            float[] copy = new float[expectedDimension];
-            System.Array.Copy(row, 0, copy, 0, expectedDimension);
-            target.Add(copy);
+            if (copyRows)
+            {
+                float[] copy = new float[expectedDimension];
+                System.Array.Copy(row, 0, copy, 0, expectedDimension);
+                target.Add(copy);
+            }
+            else
+            {
+                target.Add(row);
+            }
             appended++;
         }
 
@@ -191,7 +207,9 @@ public static class ReplayCsvUtility
         frameCursor = Mathf.Clamp(frameCursor, 0f, absoluteMaxFrame);
         float fps = ClampRealtimeFps(framesPerSecond);
         int targetBufferFrames = Mathf.Max(0, Mathf.FloorToInt(fps * Mathf.Max(0f, targetBufferSeconds)));
-        float maxPlayableFrame = Mathf.Max(0f, absoluteMaxFrame - targetBufferFrames);
+        float maxPlayableFrame = absoluteMaxFrame <= targetBufferFrames
+            ? absoluteMaxFrame
+            : Mathf.Max(0f, absoluteMaxFrame - targetBufferFrames);
         if (frameCursor >= maxPlayableFrame)
         {
             return frameCursor;

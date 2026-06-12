@@ -67,6 +67,10 @@ namespace Gewu.Imitation
                 Debug.LogWarning($"[MimicAgentRegistry] Duplicate robot key '{key}'. " +
                                  $"Keeping '{(existing.AgentGameObject != null ? existing.AgentGameObject.name : "<null>")}', " +
                                  $"ignoring '{(agent.AgentGameObject != null ? agent.AgentGameObject.name : "<null>")}'.");
+                if (agent is MonoBehaviour duplicateBehaviour)
+                {
+                    duplicateBehaviour.enabled = false;
+                }
                 return;
             }
 

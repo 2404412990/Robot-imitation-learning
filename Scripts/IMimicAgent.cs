@@ -83,7 +83,7 @@ namespace Gewu.Imitation
     public interface IRealtimeCsvMimicAgent
     {
         int ExpectedCsvColumns { get; }
-        void BeginRealtimeCsv();
+        bool BeginRealtimeCsv();
         void SetRealtimePlaybackRate(float framesPerSecond, float bufferSeconds);
         bool AppendRealtimeCsvRows(IReadOnlyList<float[]> rows);
         void EndRealtimeCsv();

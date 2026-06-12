@@ -12,7 +12,7 @@ using System;
 using System.Globalization;
 using Gewu.Imitation;
 
-public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
+public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelectableMimicAgent
 {
     public bool train = false;
     public bool replay = false;
@@ -76,25 +76,22 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
     private List<string> actionFolders = new List<string>();
     public int motion_id;
     public string motion_name;
-    [Tooltip("Primary dataset folder. If missing, the script tries the fallback below, " +
-             "then the built-in search list (Assets/Gewu/Imitation/dataset → Assets/Imitation/dataset → Assets/Imatation/dataset). " +
+    [Tooltip("Primary Unitree G1 dataset folder. If missing, the script tries robot-specific fallbacks only. " +
              "Relative paths resolve from the project root; absolute paths are used as-is.")]
-    [SerializeField] private string datasetRelativePath = "Assets/Gewu/Imitation/dataset";
-    [SerializeField] private string datasetFallbackRelativePath = "Assets/Imitation/dataset";
+    [SerializeField] private string datasetRelativePath = "Assets/Gewu/Imitation/dataset/unitree_g1";
+    [SerializeField] private string datasetFallbackRelativePath = "Assets/Imitation/dataset/unitree_g1";
     public bool useExternalReplayData = false;
 
     private string dofFilePath;
     private string rotFilePath;
     private string posFilePath;
 
-    // Default dataset search paths. The first one matches this project's actual
-    // folder layout (Assets/Gewu/Imitation/dataset); the next two preserve the
-    // historical typo + correctly-spelled paths so older scenes don't break.
+    // Robot-specific paths only. The dataset root now contains per-robot
+    // subfolders, so using it as a replay source produces no CSV rows.
     private static readonly string[] DefaultDatasetSearchPaths =
     {
-        "Assets/Gewu/Imitation/dataset",
-        "Assets/Imitation/dataset",
-        "Assets/Imatation/dataset",
+        "Assets/Gewu/Imitation/dataset/unitree_g1",
+        "Assets/Imitation/dataset/unitree_g1",
     };
 
     private List<float[]> refData = new List<float[]>();
@@ -141,6 +138,7 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
     public float rotationKd = 50f;
 
     private bool _isClone = false;
+    private bool isRobotSelectedInScene = true;
 
     // ── IMimicAgent surface ───────────────────────────────────────────────────
     public string RobotKey => string.IsNullOrWhiteSpace(robotKey) ? "unitree_g1" : robotKey.Trim();
@@ -151,7 +149,22 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
     public void RequestEndEpisode() => EndEpisode();
     public int ExpectedCsvColumns => 36;
 
-    public void BeginRealtimeCsv()
+    public void SetRobotSelectedInScene(bool isSelected)
+    {
+        isRobotSelectedInScene = isSelected;
+        if (isSelected) return;
+
+        UseExternalReplayData = false;
+        ReplayMode = false;
+        if (art0 != null)
+        {
+            art0.velocity = Vector3.zero;
+            art0.angularVelocity = Vector3.zero;
+            art0.immovable = true;
+        }
+    }
+
+    public bool BeginRealtimeCsv()
     {
         if (realtimePreviousMaxStep < 0)
         {
@@ -165,8 +178,7 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
         currentFrame = 0;
         realtimeFrameCursor = 0f;
         tt = 0;
-        UseExternalReplayData = true;
-        ReplayMode = true;
+        return true;
     }
 
     public void SetRealtimePlaybackRate(float framesPerSecond, float bufferSeconds)
@@ -177,7 +189,7 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
 
     public bool AppendRealtimeCsvRows(IReadOnlyList<float[]> rows)
     {
-        return ReplayCsvUtility.AppendRawRows(itpData, rows, ExpectedCsvColumns) > 0;
+        return ReplayCsvUtility.AppendRawRows(itpData, rows, ExpectedCsvColumns, copyRows: false) > 0;
     }
 
     public void EndRealtimeCsv()
@@ -443,7 +455,7 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
         List<string> csvFileNames = GetCsvFileNames(datasetPath);
         if (csvFileNames.Count == 0)
         {
-            UnityEngine.Debug.LogError("No csv files found in dataset path: " + datasetPath);
+            UnityEngine.Debug.LogWarning("[G1mimicAgent] No csv files found in dataset path: " + datasetPath);
             return false;
         }
 
@@ -497,6 +509,7 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
     private string ResolveDatasetPath()
     {
         List<string> candidates = new List<string>();
+        List<string> existingWithoutCsv = new List<string>();
 
         // 1) Inspector-configured paths first (so user overrides win).
         AddDatasetPathCandidate(candidates, datasetRelativePath);
@@ -513,12 +526,23 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
 
         foreach (string candidate in candidates)
         {
-            if (Directory.Exists(candidate)) return candidate;
+            if (!Directory.Exists(candidate))
+            {
+                continue;
+            }
+
+            if (GetCsvFileNames(candidate).Count > 0)
+            {
+                return candidate;
+            }
+
+            existingWithoutCsv.Add(candidate);
         }
 
         UnityEngine.Debug.LogWarning(
-            "[G1mimicAgent] Dataset folder not found. Tried: " + string.Join(" | ", candidates) +
-            "\nLive retargeting will still work once a CSV arrives via StartInput; on-disk replay will be unavailable until a dataset folder exists at one of the listed locations.");
+            "[G1mimicAgent] No usable G1 replay dataset found. Tried: " + string.Join(" | ", candidates) +
+            (existingWithoutCsv.Count > 0 ? "\nExisting folders without CSV: " + string.Join(" | ", existingWithoutCsv) : string.Empty) +
+            "\nLive retargeting still works once a CSV arrives via StartInput.");
         return string.Empty;
     }
 
@@ -664,6 +688,11 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
 
     public override void OnEpisodeBegin()
     {
+        if (!isRobotSelectedInScene)
+        {
+            return;
+        }
+
         // ── CRITICAL: restore immovable=false BEFORE any articulation-cache
         // writes. The previous OnEpisodeBegin (last line below) sets
         // arts[0].immovable = true so the root stays put during replay. That
@@ -824,6 +853,11 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
 
     public override void OnActionReceived(ActionBuffers actionBuffers)
     {
+        if (!isRobotSelectedInScene)
+        {
+            return;
+        }
+
         var continuousActions = actionBuffers.ContinuousActions;
         var kk = 0.9f;
         float kb = 50;
@@ -838,6 +872,11 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent
 
     void FixedUpdate()
     {
+        if (!isRobotSelectedInScene)
+        {
+            return;
+        }
+
         if (itpData != null && itpData.Count > 0)
         {
             if (useExternalReplayData)

@@ -25,17 +25,14 @@ public class Replay : MonoBehaviour
     [SerializeField] private bool stopRealtimeTrackingOnReplay = true;
 
     [Header("Replay Dataset")]
-    [Tooltip("Primary folder containing the replay CSV files. If missing, the script tries " +
-             "each path in replayDatasetExtraFallbacks before giving up.")]
+    [Tooltip("Dataset root containing per-robot replay CSV folders. Replay resolves the active robot to a child folder.")]
     [SerializeField] private string replayDatasetRelativePath = "Assets/Gewu/Imitation/dataset";
     [SerializeField] private string replayDatasetFallbackRelativePath = "Assets/Imitation/dataset";
-    [Tooltip("Extra fallback dataset paths tried in order after the two above. Lets the script " +
-             "keep working when scenes carry stale serialized paths.")]
+    [Tooltip("Extra dataset roots tried in order after the two above.")]
     [SerializeField] private List<string> replayDatasetExtraFallbacks = new List<string>
     {
         "Assets/Gewu/Imitation/dataset",
         "Assets/Imitation/dataset",
-        "Assets/Imatation/dataset",
     };
 
     private Button replayButton;
@@ -51,6 +48,17 @@ public class Replay : MonoBehaviour
             { "X02", "x02lite" },
             { "X02Lite", "x02lite" },
             { "OpenLoong", "openloong" },
+        };
+
+    private static readonly Dictionary<string, string> RobotDatasetFolders =
+        new Dictionary<string, string>(System.StringComparer.OrdinalIgnoreCase)
+        {
+            { "unitree_g1", "unitree_g1" },
+            { "unitree_g1_with_hands", "unitree_g1" },
+            { "unitree_h1", "unitree_h1" },
+            { "unitree_h1_2", "unitree_h1" },
+            { "x02lite", "x02lite" },
+            { "openloong", "openloong" },
         };
 
     void Awake()
@@ -90,18 +98,12 @@ public class Replay : MonoBehaviour
             return;
         }
 
-        // Resolve both the absolute file path and the legacy index. The path
-        // is the primary handle — different agents (G1, H1, ...) interpret
-        // MotionId against their own dataset layout, so it is only meaningful
-        // as a fallback. The absolute path is universal: each agent's
-        // LoadReplayCsvFromPath knows how to parse a flat CSV in its own
-        // expected column layout.
-        string csvAbsolutePath = ResolveCsvAbsolutePath(selectedCsvName);
-        int motionId = ResolveMotionIdByName(selectedCsvName);
+        string csvAbsolutePath = ResolveCsvAbsolutePath(selectedCsvName, agent.RobotKey);
+        int motionId = ResolveMotionIdByName(selectedCsvName, agent.RobotKey);
 
-        if (string.IsNullOrEmpty(csvAbsolutePath) && motionId < 0)
+        if (string.IsNullOrEmpty(csvAbsolutePath))
         {
-            Debug.LogWarning($"在 replay 数据集中未找到所选 csv: {selectedCsvName}");
+            Debug.LogWarning($"[Replay] Selected CSV path was not resolved: {selectedCsvName}. Replay will not fall back to MotionId.");
             return;
         }
 
@@ -110,64 +112,43 @@ public class Replay : MonoBehaviour
             startInput.StopStartPipeline();
         }
 
-        // Path A — try LoadReplayCsvFromPath first. This is the only route
-        // that works correctly when the active agent's on-disk dataset layout
-        // differs from the dropdown's source folder. Example:
-        //   - Dropdown lists flat CSVs from Assets/Gewu/Imitation/dataset/.
-        //   - H1 normally pulls 3-file folders from StreamingAssets/h1_dataset/.
-        // Sending the dropdown's MotionId straight at H1 indexes into the
-        // wrong list, producing the "fixed action" bug the user hit. Feeding
-        // the absolute CSV path lets H1.LoadReplayCsvFromPath parse the flat
-        // CSV directly (it consumes the first 26 columns: 3 pos + 4 quat + 19
-        // DOFs) so the picked motion drives H1.
-        bool loadedViaPath = false;
-        if (!string.IsNullOrEmpty(csvAbsolutePath))
+        // LoadReplayCsvFromPath is the only supported route. MotionId is kept
+        // only for display/compat bookkeeping and is resolved inside the active
+        // robot's own dataset folder, never from the legacy dataset root.
+        bool loadedViaPath;
+        try
         {
-            try
-            {
-                loadedViaPath = agent.LoadReplayCsvFromPath(csvAbsolutePath, keepProgress: false);
-            }
-            catch (System.Exception e)
-            {
-                Debug.LogWarning($"[Replay] LoadReplayCsvFromPath threw on {agent.RobotKey}: {e.Message}");
-                loadedViaPath = false;
-            }
+            loadedViaPath = agent.LoadReplayCsvFromPath(csvAbsolutePath, keepProgress: false);
+        }
+        catch (System.Exception e)
+        {
+            Debug.LogWarning($"[Replay] LoadReplayCsvFromPath threw on {agent.RobotKey}: {e.Message}");
+            loadedViaPath = false;
         }
 
-        if (loadedViaPath)
+        if (!loadedViaPath)
         {
-            // External CSV is now in the agent's replay buffers. Mark it so
-            // OnEpisodeBegin's on-disk reload branch is skipped (it would
-            // overwrite the freshly-loaded buffers otherwise).
-            agent.UseExternalReplayData = true;
-            agent.ReplayMode = true;
-            agent.MotionId = motionId >= 0 ? motionId : 0;
-            agent.RequestEndEpisode();
-
-            Debug.Log($"开始 replay (path): robot={agent.RobotKey}, csv={selectedCsvName}, path={csvAbsolutePath}");
+            Debug.LogWarning($"[Replay] Failed to load selected CSV for robot={agent.RobotKey}: {csvAbsolutePath}. Replay will not fall back to MotionId.");
             return;
         }
 
-        // Path B — legacy fallback: tell the agent the dropdown index and let
-        // its OnEpisodeBegin pull from its own dataset. Works for G1 (whose
-        // dataset matches the dropdown source) and as a last-resort for any
-        // agent that doesn't yet support LoadReplayCsvFromPath.
-        agent.UseExternalReplayData = false;
+        // External CSV is now in the agent's replay buffers. Mark it so
+        // OnEpisodeBegin's on-disk reload branch is skipped (it would
+        // overwrite the freshly-loaded buffers otherwise).
+        agent.UseExternalReplayData = true;
         agent.ReplayMode = true;
         agent.MotionId = motionId >= 0 ? motionId : 0;
         agent.RequestEndEpisode();
 
-        Debug.Log($"开始 replay (fallback motion_id): robot={agent.RobotKey}, csv={selectedCsvName}, motion_id={motionId}");
+        Debug.Log($"开始 replay (path): robot={agent.RobotKey}, csv={selectedCsvName}, path={csvAbsolutePath}");
     }
 
     /// <summary>
     /// Resolve the absolute filesystem path of the dropdown-selected CSV by
     /// scanning the same candidate dataset folders that <see cref="ResolveMotionIdByName"/>
-    /// uses. Returns an empty string when no matching file exists; the caller
-    /// then falls back to the legacy MotionId path so old G1-only behaviour
-    /// keeps working.
+    /// uses. Returns an empty string when no matching file exists.
     /// </summary>
-    private string ResolveCsvAbsolutePath(string selectedCsvName)
+    private string ResolveCsvAbsolutePath(string selectedCsvName, string robotKey)
     {
         if (string.IsNullOrWhiteSpace(selectedCsvName)) return string.Empty;
 
@@ -180,7 +161,7 @@ public class Replay : MonoBehaviour
             }
         }
 
-        string datasetPath = ResolveReplayDatasetPath();
+        string datasetPath = ResolveReplayDatasetPath(robotKey);
         if (string.IsNullOrEmpty(datasetPath)) return string.Empty;
 
         string selectedNoExt = Path.GetFileNameWithoutExtension(selectedCsvName).Trim();
@@ -342,9 +323,9 @@ public class Replay : MonoBehaviour
         return false;
     }
 
-    private int ResolveMotionIdByName(string selectedCsvName)
+    private int ResolveMotionIdByName(string selectedCsvName, string robotKey)
     {
-        string datasetPath = ResolveReplayDatasetPath();
+        string datasetPath = ResolveReplayDatasetPath(robotKey);
         if (string.IsNullOrEmpty(datasetPath))
         {
             return -1;
@@ -365,19 +346,26 @@ public class Replay : MonoBehaviour
         return -1;
     }
 
-    private string ResolveReplayDatasetPath()
+    private string ResolveReplayDatasetPath(string robotKey)
     {
         var candidatePaths = new List<string>();
 
         // 1) Inspector-configured primary + secondary paths.
-        AddDatasetPathCandidate(candidatePaths, replayDatasetRelativePath);
-        AddDatasetPathCandidate(candidatePaths, replayDatasetFallbackRelativePath);
+        string robotFolder = ResolveRobotDatasetFolder(robotKey);
+        if (string.IsNullOrWhiteSpace(robotFolder))
+        {
+            Debug.LogWarning($"[Replay] Unknown robot key '{robotKey}', cannot resolve a robot-specific replay dataset.");
+            return string.Empty;
+        }
+
+        AddRobotDatasetCandidate(candidatePaths, replayDatasetRelativePath, robotFolder);
+        AddRobotDatasetCandidate(candidatePaths, replayDatasetFallbackRelativePath, robotFolder);
 
         // 2) Built-in fallback list — catches stale serialized typos.
         if (replayDatasetExtraFallbacks != null)
         {
             foreach (string extra in replayDatasetExtraFallbacks)
-                AddDatasetPathCandidate(candidatePaths, extra);
+                AddRobotDatasetCandidate(candidatePaths, extra, robotFolder);
         }
 
         foreach (string candidatePath in candidatePaths)
@@ -392,14 +380,29 @@ public class Replay : MonoBehaviour
         return string.Empty;
     }
 
-    private void AddDatasetPathCandidate(List<string> candidatePaths, string configuredPath)
+    private static string ResolveRobotDatasetFolder(string robotKey)
     {
-        if (string.IsNullOrWhiteSpace(configuredPath))
+        string normalized = NormalizeRobotKey(robotKey);
+        return RobotDatasetFolders.TryGetValue(normalized, out string folder) ? folder : string.Empty;
+    }
+
+    private void AddRobotDatasetCandidate(List<string> candidatePaths, string configuredPath, string robotFolder)
+    {
+        if (string.IsNullOrWhiteSpace(configuredPath) || string.IsNullOrWhiteSpace(robotFolder))
         {
             return;
         }
 
-        string absolutePath = ToAbsoluteProjectPath(configuredPath);
+        string absoluteRoot = ToAbsoluteProjectPath(configuredPath);
+        if (string.IsNullOrWhiteSpace(absoluteRoot))
+        {
+            return;
+        }
+
+        string absolutePath = string.Equals(Path.GetFileName(absoluteRoot), robotFolder, System.StringComparison.OrdinalIgnoreCase)
+            ? absoluteRoot
+            : Path.Combine(absoluteRoot, robotFolder);
+
         if (!string.IsNullOrWhiteSpace(absolutePath) && !candidatePaths.Contains(absolutePath))
         {
             candidatePaths.Add(absolutePath);

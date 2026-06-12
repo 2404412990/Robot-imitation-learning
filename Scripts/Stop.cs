@@ -1,3 +1,4 @@
+using System;
 using UnityEngine;
 using UnityEngine.UI;
 using Gewu.Imitation;
@@ -99,6 +100,13 @@ public class Stop : MonoBehaviour
     private void ResetAgent(IMimicAgent agent)
     {
         agent.UseExternalReplayData = false;
+        if (string.Equals(agent.RobotKey, "x02lite", System.StringComparison.OrdinalIgnoreCase))
+        {
+            agent.ReplayMode = false;
+            agent.ResetToInitialState();
+            return;
+        }
+
         agent.ReplayMode = true;
         agent.RequestEndEpisode();
     }
