@@ -1,6 +1,7 @@
 import os
 import subprocess
 import time
+from contextlib import nullcontext
 import mujoco as mj
 import mujoco.viewer as mjv
 import imageio
@@ -56,6 +57,8 @@ class RobotMotionViewer:
         video_path=None,
         video_width=640,
         video_height=480,
+        window_width=None,
+        window_height=None,
         keyboard_callback=None,
         robot_path=None,
         camera_lookat_height_offset=0.75,
@@ -80,6 +83,8 @@ class RobotMotionViewer:
         self.camera_distance_scale = float(camera_distance_scale)
         self.camera_azimuth = camera_azimuth
         self.record_video = record_video
+        self.window_width = window_width
+        self.window_height = window_height
 
         # --- Fix HiDPI + fullscreen issues on Linux ---
         # On Wayland / X11, tell GLFW to respect the requested window size
@@ -118,7 +123,10 @@ class RobotMotionViewer:
         self.viewer.opt.flags[mj.mjtVisFlag.mjVIS_TRANSPARENT] = transparent_robot
 
         # Best-effort window resize via X11 tools (no-op on pure Wayland).
-        self._fix_window_size(1200, 900)
+        target_window_width = int(window_width) if window_width is not None else 1200
+        target_window_height = int(window_height) if window_height is not None else 900
+        if not self._set_glfw_window_size(self.viewer, target_window_width, target_window_height):
+            self._fix_window_size(target_window_width, target_window_height)
         
         if self.record_video:
             assert video_path is not None, "Please provide video path for recording"
@@ -133,6 +141,30 @@ class RobotMotionViewer:
             # Initialize renderer for video recording
             self.renderer = mj.Renderer(self.model, height=video_height, width=video_width)
         
+    @staticmethod
+    def _set_glfw_window_size(viewer_handle, width, height):
+        """Resize the MuJoCo viewer when the GLFW window handle is reachable."""
+        candidates = [
+            viewer_handle,
+            getattr(viewer_handle, "_viewer", None),
+            getattr(viewer_handle, "_sim", None),
+        ]
+
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            for attr in ("_window", "window"):
+                window = getattr(candidate, attr, None)
+                if window is None:
+                    continue
+                try:
+                    glfw.set_window_size(window, int(width), int(height))
+                    return True
+                except Exception:
+                    continue
+
+        return False
+
     @staticmethod
     def _fix_window_size(width, height):
         """Try to resize the MuJoCo viewer window to *width* x *height*.
@@ -187,38 +219,51 @@ class RobotMotionViewer:
         if rate_limit is True, the motion will be visualized at the same rate as the motion data.
         else, the motion will be visualized as fast as possible.
         """
-        
-        self.data.qpos[:3] = root_pos
-        self.data.qpos[3:7] = root_rot # quat need to be scalar first! for mujoco
-        self.data.qpos[7:] = dof_pos
-        
-        mj.mj_forward(self.model, self.data)
-        
-        if follow_camera:
-            try:
-                lookat = self.data.xpos[self.model.body(self.robot_base).id].copy()
-            except Exception:
-                lookat = np.asarray(self.data.qpos[:3], dtype=np.float64).copy()
-            lookat[2] += self.camera_lookat_height_offset
-            self.viewer.cam.lookat = lookat
-            self.viewer.cam.distance = self.viewer_cam_distance * max(0.1, self.camera_distance_scale)
-            self.viewer.cam.elevation = self.camera_elevation
-            if self.camera_azimuth is not None:
-                self.viewer.cam.azimuth = float(self.camera_azimuth)
-        
-        if human_motion_data is not None:
-            # Clean custom geometry
-            self.viewer.user_scn.ngeom = 0
-            # Draw the task targets for reference
-            for human_body_name, (pos, rot) in human_motion_data.items():
-                draw_frame(
-                    pos,
-                    R.from_quat(np.asarray(rot)[[1, 2, 3, 0]]).as_matrix(),  # wxyz -> xyzw
-                    self.viewer,
-                    human_point_scale,
-                    pos_offset=human_pos_offset,
-                    joint_name=human_body_name if show_human_body_name else None
-                    )
+
+        root_pos = np.asarray(root_pos, dtype=np.float64)
+        root_rot = np.asarray(root_rot, dtype=np.float64)
+        dof_pos = np.asarray(dof_pos, dtype=np.float64)
+        expected_dofs = int(self.model.nq) - 7
+        if root_pos.shape[0] != 3 or root_rot.shape[0] != 4 or dof_pos.shape[0] != expected_dofs:
+            raise ValueError(
+                f"Viewer qpos shape mismatch for {self.robot_type}: "
+                f"root_pos={root_pos.shape[0]}, root_rot={root_rot.shape[0]}, "
+                f"dof_pos={dof_pos.shape[0]}, expected_dof={expected_dofs}, model_nq={self.model.nq}"
+            )
+
+        lock_context = self.viewer.lock() if hasattr(self.viewer, "lock") else nullcontext()
+        with lock_context:
+            self.data.qpos[:3] = root_pos
+            self.data.qpos[3:7] = root_rot # quat need to be scalar first! for mujoco
+            self.data.qpos[7:] = dof_pos
+
+            mj.mj_forward(self.model, self.data)
+
+            if follow_camera:
+                try:
+                    lookat = self.data.xpos[self.model.body(self.robot_base).id].copy()
+                except Exception:
+                    lookat = np.asarray(self.data.qpos[:3], dtype=np.float64).copy()
+                lookat[2] += self.camera_lookat_height_offset
+                self.viewer.cam.lookat[:] = lookat
+                self.viewer.cam.distance = self.viewer_cam_distance * max(0.1, self.camera_distance_scale)
+                self.viewer.cam.elevation = self.camera_elevation
+                if self.camera_azimuth is not None:
+                    self.viewer.cam.azimuth = float(self.camera_azimuth)
+
+            if human_motion_data is not None:
+                # Clean custom geometry
+                self.viewer.user_scn.ngeom = 0
+                # Draw the task targets for reference
+                for human_body_name, (pos, rot) in human_motion_data.items():
+                    draw_frame(
+                        pos,
+                        R.from_quat(np.asarray(rot)[[1, 2, 3, 0]]).as_matrix(),  # wxyz -> xyzw
+                        self.viewer,
+                        human_point_scale,
+                        pos_offset=human_pos_offset,
+                        joint_name=human_body_name if show_human_body_name else None
+                        )
 
         self.viewer.sync()
         if rate_limit is True:

@@ -23,6 +23,12 @@ import psutil
 import tracemalloc
 
 
+def _extract_qpos(retarget_result):
+    if isinstance(retarget_result, tuple):
+        return retarget_result[0]
+    return retarget_result
+
+
 def check_memory(threshold_gb=30):  # adjust based on your available memory
     mem = psutil.virtual_memory()
     used_memory_gb = (mem.total - mem.available) / (1024 ** 3)
@@ -83,7 +89,7 @@ def process_file(smplx_file_path, tgt_file_path, tgt_robot, SMPLX_FOLDER, tgt_fo
     )
     qpos_list = []
     for smplx_frame_data in smplx_frame_data_list:
-        qpos = retargeter.retarget(smplx_frame_data)
+        qpos = _extract_qpos(retargeter.retarget(smplx_frame_data))
         qpos_list.append(qpos.copy())
 
     qpos_list = np.array(qpos_list)
@@ -91,7 +97,11 @@ def process_file(smplx_file_path, tgt_file_path, tgt_robot, SMPLX_FOLDER, tgt_fo
     log_memory("After retargeting")
     
     device = "cuda:0"
-    kinematics_model = KinematicsModel(retargeter.xml_file, device=device)
+    kinematics_model = KinematicsModel(
+        retargeter.xml_file,
+        device=device,
+        root_body_name=retargeter.robot_root_name,
+    )
 
     try:
         root_pos = qpos_list[:, :3]

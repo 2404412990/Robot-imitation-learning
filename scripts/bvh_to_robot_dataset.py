@@ -13,6 +13,12 @@ from general_motion_retargeting import GeneralMotionRetargeting as GMR
 from rich import print
 
 
+def _extract_qpos(retarget_result):
+    if isinstance(retarget_result, tuple):
+        return retarget_result[0]
+    return retarget_result
+
+
 if __name__ == "__main__":
     HERE = pathlib.Path(__file__).parent
 
@@ -97,7 +103,7 @@ if __name__ == "__main__":
                 smplx_data = lafan1_data_frames[curr_frame]
                 
                 # Retarget till convergence
-                qpos = retarget.retarget(smplx_data)
+                qpos = _extract_qpos(retarget.retarget(smplx_data))
                 
                 qpos_list.append(qpos.copy())
             
@@ -105,7 +111,11 @@ if __name__ == "__main__":
 
             # Initialize the forward kinematics
             device = "cuda:0"
-            kinematics_model = KinematicsModel(retarget.xml_file, device=device)
+            kinematics_model = KinematicsModel(
+                retarget.xml_file,
+                device=device,
+                root_body_name=retarget.robot_root_name,
+            )
             
             root_pos = qpos_list[:, :3]
             root_rot = qpos_list[:, 3:7]

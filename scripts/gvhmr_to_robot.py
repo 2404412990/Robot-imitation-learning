@@ -11,6 +11,13 @@ from general_motion_retargeting.utils.smpl import load_gvhmr_pred_file, get_gvhm
 
 from rich import print
 
+
+def _extract_qpos(retarget_result):
+    if isinstance(retarget_result, tuple):
+        return retarget_result[0]
+    return retarget_result
+
+
 if __name__ == "__main__":
     
     HERE = pathlib.Path(__file__).parent
@@ -29,7 +36,7 @@ if __name__ == "__main__":
         choices=["unitree_g1", "unitree_g1_with_hands", "unitree_h1", "unitree_h1_2",
                  "booster_t1", "booster_t1_29dof","stanford_toddy", "fourier_n1", 
                 "engineai_pm01", "kuavo_s45", "hightorque_hi", "galaxea_r1pro", "berkeley_humanoid_lite", "booster_k1",
-                "pnd_adam_lite", "openloong", "tienkung"],
+                "pnd_adam_lite", "x02lite", "openloong", "tienkung"],
         default="unitree_g1",
     )
     
@@ -127,7 +134,7 @@ if __name__ == "__main__":
         smplx_data = smplx_data_frames[i]
 
         # retarget
-        qpos = retarget.retarget(smplx_data)
+        qpos = _extract_qpos(retarget.retarget(smplx_data))
 
         # visualize
         robot_motion_viewer.step(

@@ -4,6 +4,13 @@ from general_motion_retargeting import RobotMotionViewer
 import threading
 import argparse
 
+
+def _extract_qpos(retarget_result):
+    if isinstance(retarget_result, tuple):
+        return retarget_result[0]
+    return retarget_result
+
+
 def main(args):
     # Check if firewall is disabled on this machine
     print("Make sure to disable firewall on both machines:")
@@ -37,7 +44,7 @@ def main(args):
     while True:
         frame = client.get_frame()
         frame_number = client.get_frame_number()
-        qpos = retarget.retarget(frame)
+        qpos = _extract_qpos(retarget.retarget(frame))
         viewer.step(
             root_pos=qpos[:3],
             root_rot=qpos[3:7],
@@ -54,4 +61,3 @@ if __name__ == "__main__":
     parser.add_argument("--robot", type=str, default="unitree_g1")
     args = parser.parse_args()
     main(args)
-    

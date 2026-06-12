@@ -21,6 +21,12 @@ from general_motion_retargeting import RobotMotionViewer
 g_running = True
 
 
+def _extract_qpos(retarget_result):
+    if isinstance(retarget_result, tuple):
+        return retarget_result[0]
+    return retarget_result
+
+
 def signal_handler(signum, frame):
     global g_running
     print(f"\nReceived signal {signum}, shutting down...")
@@ -156,7 +162,7 @@ if __name__ == "__main__":
 
             # Retarget
             try:
-                qpos = retargeter.retarget(human_frame, offset_to_ground=True)
+                qpos = _extract_qpos(retargeter.retarget(human_frame, offset_to_ground=True))
             except Exception as e:
                 print(f"Retargeting failed: {e}")
                 dropped_frames += 1

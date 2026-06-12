@@ -14,6 +14,7 @@ $ErrorActionPreference = "Stop"
 
 # Ensure local packages are importable.
 $env:PYTHONPATH = "$PWD$([IO.Path]::PathSeparator)$env:PYTHONPATH"
+$env:PYTHONUNBUFFERED = "1"
 
 # =========================
 # Default values (mirrors run.sh)
@@ -24,25 +25,124 @@ function _env { param([string]$name, [string]$default)
     if ($v) { return $v } else { return $default }
 }
 
-$WHAM_ENV     = _env WHAM_ENV     "wham_gmr"
-$GMR_ENV      = _env GMR_ENV      "wham_gmr"
+function Add-UniqueString {
+    param(
+        [System.Collections.Generic.List[string]]$List,
+        [string]$Value
+    )
 
-# Auto-detect Python path from conda env; fall back to PATH python.
-$_autoPy = $null
-# 1) CONDA_PREFIX (set when conda env is activated)
-if ($env:CONDA_PREFIX) {
-    $p = Join-Path $env:CONDA_PREFIX "python.exe"
-    if (Test-Path $p) { $_autoPy = $p }
-}
-# 2) Scan common conda install locations
-if (-not $_autoPy) {
-    foreach ($_base in @("$env:USERPROFILE\.conda", "$env:USERPROFILE\anaconda3", "$env:USERPROFILE\miniconda3")) {
-        $p = Join-Path $_base "envs\$WHAM_ENV\python.exe"
-        if (Test-Path $p) { $_autoPy = $p; break }
+    if (-not [string]::IsNullOrWhiteSpace($Value) -and -not $List.Contains($Value)) {
+        $List.Add($Value) | Out-Null
     }
 }
-# 3) Last resort: use python from PATH
-if (-not $_autoPy) { $_autoPy = "python" }
+
+function Test-PythonModuleAvailable {
+    param(
+        [string]$PyBin,
+        [string]$ModuleName
+    )
+
+    if ([string]::IsNullOrWhiteSpace($PyBin)) {
+        return $false
+    }
+
+    try {
+        & $PyBin -c "import importlib.util, sys; raise SystemExit(0 if importlib.util.find_spec('$ModuleName') else 1)" *> $null
+        return ($LASTEXITCODE -eq 0)
+    } catch {
+        return $false
+    }
+}
+
+function Get-CondaEnvPythonCandidates {
+    param([string]$EnvName)
+
+    $roots = New-Object 'System.Collections.Generic.List[string]'
+    Add-UniqueString $roots (Join-Path $env:USERPROFILE ".conda")
+    Add-UniqueString $roots (Join-Path $env:USERPROFILE "anaconda3")
+    Add-UniqueString $roots (Join-Path $env:USERPROFILE "miniconda3")
+    Add-UniqueString $roots $env:_CONDA_ROOT
+
+    if ($env:CONDA_EXE) {
+        try {
+            $condaScriptsDir = Split-Path -Parent $env:CONDA_EXE
+            $condaRoot = Split-Path -Parent $condaScriptsDir
+            Add-UniqueString $roots $condaRoot
+        } catch { }
+    }
+
+    Add-UniqueString $roots "D:\anaconda3"
+    Add-UniqueString $roots "D:\miniconda3"
+
+    $candidates = New-Object 'System.Collections.Generic.List[string]'
+    if ($env:CONDA_PREFIX) {
+        try {
+            $activeEnvName = Split-Path $env:CONDA_PREFIX -Leaf
+            if ($activeEnvName -ieq $EnvName) {
+                Add-UniqueString $candidates (Join-Path $env:CONDA_PREFIX "python.exe")
+            }
+        } catch { }
+    }
+
+    foreach ($root in $roots) {
+        try {
+            $py = Join-Path $root "envs\$EnvName\python.exe"
+            if (Test-Path $py -PathType Leaf) {
+                Add-UniqueString $candidates $py
+            }
+        } catch { }
+    }
+
+    return $candidates
+}
+
+function Resolve-PreferredPython {
+    param(
+        [string]$EnvName,
+        [string]$RequiredModule,
+        [string]$FallbackPython
+    )
+
+    $preferredCandidates = Get-CondaEnvPythonCandidates $EnvName
+    foreach ($candidate in $preferredCandidates) {
+        if (Test-PythonModuleAvailable $candidate $RequiredModule) {
+            return $candidate
+        }
+    }
+
+    foreach ($candidate in $preferredCandidates) {
+        if (Test-Path $candidate -PathType Leaf) {
+            return $candidate
+        }
+    }
+
+    $fallbackCandidates = New-Object 'System.Collections.Generic.List[string]'
+    if ($env:CONDA_PREFIX) {
+        Add-UniqueString $fallbackCandidates (Join-Path $env:CONDA_PREFIX "python.exe")
+    }
+    Add-UniqueString $fallbackCandidates $FallbackPython
+
+    foreach ($candidate in $fallbackCandidates) {
+        if (Test-PythonModuleAvailable $candidate $RequiredModule) {
+            return $candidate
+        }
+    }
+
+    foreach ($candidate in $fallbackCandidates) {
+        if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+            return $candidate
+        }
+    }
+
+    return "python"
+}
+
+$WHAM_ENV     = _env WHAM_ENV     "wham_gmr"
+$GMR_ENV      = _env GMR_ENV      "wham_gmr"
+$E2E_VALIDATE_ENV_ONLY = _env E2E_VALIDATE_ENV_ONLY "0"
+
+# Prefer the named WHAM env over any unrelated active base env inherited by Unity.
+$_autoPy = Resolve-PreferredPython $WHAM_ENV "smplx" "python"
 $WHAM_PYTHON  = _env WHAM_PYTHON $_autoPy
 $GMR_PYTHON   = _env GMR_PYTHON   $WHAM_PYTHON
 
@@ -121,6 +221,17 @@ $CAMERA_DISTANCE_SCALE       = _env CAMERA_DISTANCE_SCALE       "1.3"
 $CAMERA_AZIMUTH              = _env CAMERA_AZIMUTH              ""
 $TCP                         = _env TCP                         "0"
 
+Write-Host "[E2E] Python selection: WHAM_ENV=$WHAM_ENV GMR_ENV=$GMR_ENV CONDA_PREFIX=$(if ($env:CONDA_PREFIX) { $env:CONDA_PREFIX } else { '<unset>' }) WHAM_PYTHON=$WHAM_PYTHON GMR_PYTHON=$GMR_PYTHON"
+if (-not (Test-PythonModuleAvailable $WHAM_PYTHON "smplx")) {
+    $expectedWhamPy = Join-Path $env:USERPROFILE ".conda\envs\$WHAM_ENV\python.exe"
+    Write-Error "[E2E] Selected WHAM_PYTHON cannot import 'smplx': $WHAM_PYTHON. Expected a Python from conda env '$WHAM_ENV', e.g. '$expectedWhamPy'."
+    exit 1
+}
+if ($E2E_VALIDATE_ENV_ONLY -eq "1") {
+    Write-Host "[E2E] Environment validation only; exiting before pipeline start."
+    exit 0
+}
+
 # Create output directories.
 foreach ($d in @(
     $OUTPUT_DIR,
@@ -143,11 +254,12 @@ Remove-Item -Force -ErrorAction SilentlyContinue $GMR_READY_FLAG
 Remove-Item -Force -ErrorAction SilentlyContinue $STREAM_TAIL_PATH
 
 $_display = if ($env:DISPLAY) { $env:DISPLAY } else { '<unset>' }
-Write-Host "[E2E] Render flags: RECORD_WHAMVIDEO=$RECORD_WHAMVIDEO RECORD_GMRVIDEO=$RECORD_GMRVIDEO USE_XVFB_GMR=$USE_XVFB_GMR DISPLAY=$_display"
+Write-Host "[E2E] Render flags: RECORD_WHAMVIDEO=$RECORD_WHAMVIDEO RECORD_GMRVIDEO=$RECORD_GMRVIDEO TCP=$TCP USE_XVFB_GMR=$USE_XVFB_GMR DISPLAY=$_display"
 Write-Host "[E2E] Camera params: follow=$CAMERA_FOLLOW track=$TRACK lookat_h=$CAMERA_LOOKAT_HEIGHT_OFFSET elev=$CAMERA_ELEVATION dist_scale=$CAMERA_DISTANCE_SCALE azimuth=$(if ($CAMERA_AZIMUTH) { $CAMERA_AZIMUTH } else { '<auto>' })"
 Write-Host "[E2E] WHAM perf params: amp=$WHAM_USE_AMP detect_interval=$WHAM_DETECT_INTERVAL infer_interval=$WHAM_INFER_INTERVAL seq_len=$WHAM_STREAM_SEQ_LEN input_scale=$WHAM_INPUT_SCALE"
 Write-Host "[E2E] WHAM stream mode=tail (fixed)"
 Write-Host "[E2E] GMR torch_device=$GMR_TORCH_DEVICE"
+Write-Host "[E2E] Source params: VIDEO=$VIDEO TIME=$TIME ROBOT=$ROBOT OUTPUT_ROOT=$(if ($OUTPUT_ROOT) { $OUTPUT_ROOT } else { '<default>' }) CSV_PATH=$CSV_PATH TCP=$TCP"
 Write-Host "[E2E] GMR viewer mode: async thread + low-latency fixed profile (ready_timeout=$GMR_VIEWER_READY_TIMEOUT_SEC s, join_timeout=$GMR_VIEWER_THREAD_JOIN_TIMEOUT_SEC s)"
 Write-Host "[E2E] Warmup: enabled=$E2E_WARMUP once=$E2E_WARMUP_ONCE force=$E2E_WARMUP_FORCE"
 
@@ -271,6 +383,8 @@ if ($TRACK -eq "1") {
 
 if ($TCP -eq "1") {
     $INTEGRATED_CMD += "--tcp"
+} else {
+    $INTEGRATED_CMD += "--no-tcp"
 }
 
 if ($CAMERA_AZIMUTH) {
@@ -303,7 +417,13 @@ if ($RECORD_GMRVIDEO -eq "1") {
 # xvfb-run is unavailable on Windows — always run directly.
 $exe = $INTEGRATED_CMD[0]
 $cmdArgs = if ($INTEGRATED_CMD.Length -gt 1) { $INTEGRATED_CMD[1..($INTEGRATED_CMD.Length - 1)] } else { @() }
+Write-Host "[E2E] Integrated command: $($INTEGRATED_CMD -join ' ')"
 & $exe $cmdArgs
+$integratedExitCode = $LASTEXITCODE
+if ($integratedExitCode -ne 0) {
+    Write-Error "[E2E] Integrated WHAM + GMR command failed with exit code $integratedExitCode."
+    exit $integratedExitCode
+}
 
 Write-Host "[E2E] Done."
 Write-Host "  CSV: $CSV_PATH"

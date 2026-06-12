@@ -1,3 +1,4 @@
+import os
 import xml.etree.ElementTree as ET
 
 import numpy as np
@@ -66,9 +67,10 @@ class Joint:
     
     
 class KinematicsModel:
-    def __init__(self, file_path, device):
+    def __init__(self, file_path, device, root_body_name=None):
         self._device = device
         self._file_path = file_path
+        self._root_body_name = root_body_name.strip() if root_body_name else None
         
         self._build_kinematics_model()
         self._set_dof_indices()
@@ -98,17 +100,67 @@ class KinematicsModel:
             self._dof_lower_limits = torch.deg2rad(self._dof_lower_limits)
             self._dof_upper_limits = torch.deg2rad(self._dof_upper_limits)
         
-    def _parse_xml(self):
-        tree = ET.parse(self._file_path)
+    def _find_robot_body_root(self, xml_doc_root):
+        world_bodies = xml_doc_root.findall("worldbody")
+        if self._root_body_name:
+            for xml_world_body in world_bodies:
+                for candidate in xml_world_body.iter("body"):
+                    if candidate.attrib.get("name") == self._root_body_name:
+                        return candidate
+
+        for xml_world_body in world_bodies:
+            xml_body_root = xml_world_body.find("body")
+            if xml_body_root is not None:
+                return xml_body_root
+
+        for xml_world_body in world_bodies:
+            for candidate in xml_world_body.iter("body"):
+                return candidate
+
+        return None
+
+    def _resolve_xml_robot_root(self, file_path, visited=None):
+        if visited is None:
+            visited = set()
+
+        resolved_path = os.path.abspath(file_path)
+        if resolved_path in visited:
+            return None, None, None, sorted(visited)
+        visited.add(resolved_path)
+
+        tree = ET.parse(resolved_path)
         xml_doc_root = tree.getroot()
-        xml_world_body = xml_doc_root.find("worldbody")
-        assert xml_world_body is not None, "worldbody not found"
-        
-        xml_body_root = xml_world_body.find("body")
-        assert xml_body_root is not None, "body not found"
-        
         compiler_data = xml_doc_root.find("compiler")
-        self._rot_unit = compiler_data.attrib.get("angle", "degree")
+        rot_unit = compiler_data.attrib.get("angle", "degree") if compiler_data is not None else None
+
+        xml_body_root = self._find_robot_body_root(xml_doc_root)
+        if xml_body_root is not None:
+            return xml_doc_root, xml_body_root, rot_unit, sorted(visited)
+
+        include_dir = os.path.dirname(resolved_path)
+        for include_node in xml_doc_root.findall(".//include"):
+            include_file = include_node.attrib.get("file")
+            if not include_file:
+                continue
+            include_path = os.path.join(include_dir, include_file)
+            if not os.path.exists(include_path):
+                continue
+            included_root, included_body, included_rot_unit, _ = self._resolve_xml_robot_root(include_path, visited)
+            if included_body is not None:
+                return included_root, included_body, included_rot_unit or rot_unit, sorted(visited)
+
+        return xml_doc_root, None, rot_unit, sorted(visited)
+
+    def _parse_xml(self):
+        xml_doc_root, xml_body_root, resolved_rot_unit, visited_files = self._resolve_xml_robot_root(self._file_path)
+
+        assert xml_body_root is not None, (
+            f"body not found in '{self._file_path}'"
+            + (f" for root '{self._root_body_name}'" if self._root_body_name else "")
+            + f". searched: {visited_files}"
+        )
+
+        self._rot_unit = resolved_rot_unit or "degree"
         assert self._rot_unit in ["degree", "radian"], f"Invalid rotation unit: {self._rot_unit}"
         
         def _add_xml_body(xml_node, parent_index, body_index):

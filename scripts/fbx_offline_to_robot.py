@@ -9,6 +9,13 @@ import os
 import numpy as np
 import pickle
 
+
+def _extract_qpos(retarget_result):
+    if isinstance(retarget_result, tuple):
+        return retarget_result[0]
+    return retarget_result
+
+
 def load_optitrack_fbx_motion_file(motion_file):
     with open(motion_file, "rb") as f:
         motion_data = pickle.load(f)
@@ -139,7 +146,7 @@ if __name__ == "__main__":
         smplx_data = data_frames[i]
 
         # retarget
-        qpos = retargeter.retarget(smplx_data)
+        qpos = _extract_qpos(retargeter.retarget(smplx_data))
 
         # visualize
         robot_motion_viewer.step(
@@ -179,5 +186,5 @@ if __name__ == "__main__":
 
     # Close progress bar
     pbar.close()
-    
-    robot_motion_viewer.close() 
+
+    robot_motion_viewer.close()

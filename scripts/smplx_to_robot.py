@@ -14,6 +14,12 @@ from general_motion_retargeting.kinematics_model import KinematicsModel
 from rich import print
 
 
+def _extract_qpos(retarget_result):
+    if isinstance(retarget_result, tuple):
+        return retarget_result[0]
+    return retarget_result
+
+
 def _exp_smooth(x, alpha):
     if x.shape[0] <= 1 or alpha >= 0.999:
         return x
@@ -26,6 +32,7 @@ def _exp_smooth(x, alpha):
 def postprocess_qpos(
     qpos_seq,
     xml_file,
+    root_body_name=None,
     smooth_alpha=0.35,
     height_adjust=True,
     root_origin_offset=True,
@@ -55,7 +62,7 @@ def postprocess_qpos(
         return qpos
 
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    kinematics_model = KinematicsModel(xml_file, device=device)
+    kinematics_model = KinematicsModel(xml_file, device=device, root_body_name=root_body_name)
 
     root_pos = qpos[:, :3].copy()
     root_rot_xyzw = qpos[:, 3:7][:, [1, 2, 3, 0]].copy()
@@ -99,7 +106,7 @@ if __name__ == "__main__":
         choices=["unitree_g1", "unitree_g1_with_hands", "unitree_h1", "unitree_h1_2",
                  "booster_t1", "booster_t1_29dof","stanford_toddy", "fourier_n1", 
                 "engineai_pm01", "kuavo_s45", "hightorque_hi", "galaxea_r1pro", "berkeley_humanoid_lite", "booster_k1",
-                "pnd_adam_lite", "openloong", "tienkung", "fourier_gr3"],
+                "pnd_adam_lite", "x02lite", "openloong", "tienkung", "fourier_gr3"],
         default="unitree_g1",
     )
     
@@ -192,13 +199,14 @@ if __name__ == "__main__":
     # Retarget all frames first so we can apply stable post-processing.
     qpos_seq = []
     for smplx_data_frame in smplx_data_frames:
-        qpos = retarget.retarget(smplx_data_frame)
+        qpos = _extract_qpos(retarget.retarget(smplx_data_frame))
         qpos_seq.append(qpos.copy())
 
     qpos_seq = np.asarray(qpos_seq, dtype=np.float32)
     qpos_seq = postprocess_qpos(
         qpos_seq,
         xml_file=retarget.xml_file,
+        root_body_name=retarget.robot_root_name,
         smooth_alpha=max(0.0, min(1.0, args.smooth_alpha)),
         height_adjust=args.height_adjust,
         root_origin_offset=args.root_origin_offset,
@@ -257,7 +265,11 @@ if __name__ == "__main__":
         dof_pos = qpos_seq[:, 7:].copy()
 
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        kinematics_model = KinematicsModel(retarget.xml_file, device=device)
+        kinematics_model = KinematicsModel(
+            retarget.xml_file,
+            device=device,
+            root_body_name=retarget.robot_root_name,
+        )
         with torch.no_grad():
             fk_root_pos = torch.zeros((dof_pos.shape[0], 3), device=device)
             fk_root_rot = torch.zeros((dof_pos.shape[0], 4), device=device)

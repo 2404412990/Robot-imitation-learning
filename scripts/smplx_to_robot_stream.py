@@ -41,19 +41,44 @@ def _resolve_torch_device(requested):
     req = str(requested).strip().lower()
     if req == "cpu":
         return "cpu"
-    if req == "cuda":
+
+    allow_cuda_postprocessor = os.environ.get("GMR_ALLOW_CUDA_POSTPROCESSOR", "0") == "1"
+    if req in ("cuda", "cuda:0", "auto") and not allow_cuda_postprocessor:
+        print(
+            "[Stream] GMR postprocessor uses CPU by default to avoid CUDA NVRTC "
+            "architecture errors. Set GMR_ALLOW_CUDA_POSTPROCESSOR=1 to override."
+        )
+        return "cpu"
+
+    if req.startswith("cuda"):
         if torch.cuda.is_available():
             return "cuda:0"
         print("[Stream] Warning: --torch_device=cuda but CUDA is unavailable, fallback to CPU.")
         return "cpu"
-    # auto
-    return "cuda:0" if torch.cuda.is_available() else "cpu"
+
+    return "cpu"
+
+
+def _is_nvrtc_arch_error(exc):
+    msg = str(exc).lower()
+    return "nvrtc" in msg and (
+        "gpu-architecture" in msg or
+        "--gpu-architecture" in msg or
+        "-arch" in msg
+    )
+
+
+def _extract_qpos(retarget_result):
+    if isinstance(retarget_result, tuple):
+        return retarget_result[0]
+    return retarget_result
 
 
 class OnlineQposPostprocessor:
     def __init__(
         self,
         xml_file,
+        root_body_name=None,
         smooth_alpha=0.25,
         height_adjust=True,
         root_origin_offset=True,
@@ -64,10 +89,27 @@ class OnlineQposPostprocessor:
         self.root_origin_offset = bool(root_origin_offset)
         self.prev_qpos = None
         self.xy_origin = None
+        self.xml_file = xml_file
+        self.root_body_name = root_body_name
 
         device = _resolve_torch_device(torch_device)
+        self._set_kinematics_device(device)
+
+    def _set_kinematics_device(self, device):
         self.device = device
-        self.kinematics_model = KinematicsModel(xml_file, device=device)
+        self.kinematics_model = KinematicsModel(
+            self.xml_file,
+            device=device,
+            root_body_name=self.root_body_name,
+        )
+
+    def _forward_kinematics_for_height(self, q):
+        root_pos = torch.from_numpy(q[:3][None]).to(self.device, dtype=torch.float32)
+        root_rot_xyzw = torch.from_numpy(q[3:7][[1, 2, 3, 0]][None]).to(self.device, dtype=torch.float32)
+        dof_pos = torch.from_numpy(q[7:][None]).to(self.device, dtype=torch.float32)
+        with torch.no_grad():
+            body_pos, _ = self.kinematics_model.forward_kinematics(root_pos, root_rot_xyzw, dof_pos)
+            return torch.min(body_pos[..., 2]).item()
 
     def process(self, qpos):
         q = np.asarray(qpos, dtype=np.float32).copy()
@@ -86,12 +128,15 @@ class OnlineQposPostprocessor:
             q[7:] = _exp_smooth(q[7:], self.prev_qpos[7:], self.smooth_alpha)
 
         if self.height_adjust:
-            root_pos = torch.from_numpy(q[:3][None]).to(self.device, dtype=torch.float32)
-            root_rot_xyzw = torch.from_numpy(q[3:7][[1, 2, 3, 0]][None]).to(self.device, dtype=torch.float32)
-            dof_pos = torch.from_numpy(q[7:][None]).to(self.device, dtype=torch.float32)
-            with torch.no_grad():
-                body_pos, _ = self.kinematics_model.forward_kinematics(root_pos, root_rot_xyzw, dof_pos)
-                lowest_height = torch.min(body_pos[..., 2]).item()
+            try:
+                lowest_height = self._forward_kinematics_for_height(q)
+            except RuntimeError as e:
+                if self.device != "cpu" and _is_nvrtc_arch_error(e):
+                    print("[Stream] Warning: CUDA NVRTC architecture error in GMR postprocessor; fallback to CPU.")
+                    self._set_kinematics_device("cpu")
+                    lowest_height = self._forward_kinematics_for_height(q)
+                else:
+                    raise
             q[2] -= lowest_height
 
         if self.root_origin_offset:
@@ -103,24 +148,36 @@ class OnlineQposPostprocessor:
         return q
 
 
-def write_motion_pkl(save_path, qpos_seq, fps, xml_file, torch_device="auto"):
+def write_motion_pkl(save_path, qpos_seq, fps, xml_file, root_body_name=None, torch_device="auto"):
     qpos_seq = np.asarray(qpos_seq, dtype=np.float32)
     root_pos = qpos_seq[:, :3].copy()
     root_rot = qpos_seq[:, 3:7][:, [1, 2, 3, 0]].copy()  # wxyz -> xyzw
     dof_pos = qpos_seq[:, 7:].copy()
 
     device = _resolve_torch_device(torch_device)
-    kinematics_model = KinematicsModel(xml_file, device=device)
-    with torch.no_grad():
-        fk_root_pos = torch.zeros((dof_pos.shape[0], 3), device=device)
-        fk_root_rot = torch.zeros((dof_pos.shape[0], 4), device=device)
-        fk_root_rot[:, -1] = 1.0
-        local_body_pos, _ = kinematics_model.forward_kinematics(
-            fk_root_pos,
-            fk_root_rot,
-            torch.from_numpy(dof_pos).to(device=device, dtype=torch.float32),
-        )
-        local_body_pos = local_body_pos.detach().cpu().numpy()
+
+    def _compute_local_body_pos(dev):
+        model = KinematicsModel(xml_file, device=dev, root_body_name=root_body_name)
+        with torch.no_grad():
+            fk_root_pos = torch.zeros((dof_pos.shape[0], 3), device=dev)
+            fk_root_rot = torch.zeros((dof_pos.shape[0], 4), device=dev)
+            fk_root_rot[:, -1] = 1.0
+            body_pos, _ = model.forward_kinematics(
+                fk_root_pos,
+                fk_root_rot,
+                torch.from_numpy(dof_pos).to(device=dev, dtype=torch.float32),
+            )
+            return body_pos.detach().cpu().numpy(), model
+
+    try:
+        local_body_pos, kinematics_model = _compute_local_body_pos(device)
+    except RuntimeError as e:
+        if device != "cpu" and _is_nvrtc_arch_error(e):
+            print("[Stream] Warning: CUDA NVRTC architecture error while writing motion PKL; fallback to CPU.")
+            device = "cpu"
+            local_body_pos, kinematics_model = _compute_local_body_pos(device)
+        else:
+            raise
 
     motion_data = {
         "fps": float(fps),
@@ -179,6 +236,7 @@ if __name__ == "__main__":
             "berkeley_humanoid_lite",
             "booster_k1",
             "pnd_adam_lite",
+            "x02lite",
             "openloong",
             "tienkung",
             "fourier_gr3",
@@ -586,6 +644,7 @@ if __name__ == "__main__":
 
         state["postprocessor"] = OnlineQposPostprocessor(
             state["retarget"].xml_file,
+            root_body_name=state["retarget"].robot_root_name,
             smooth_alpha=max(0.0, min(1.0, args.smooth_alpha)),
             height_adjust=args.height_adjust,
             root_origin_offset=args.root_origin_offset,
@@ -625,7 +684,7 @@ if __name__ == "__main__":
             init_retarget_if_needed(actual_human_height=actual_human_height)
 
         for frame in smplx_frames:
-            qpos = state["retarget"].retarget(frame)
+            qpos = _extract_qpos(state["retarget"].retarget(frame))
             qpos = state["postprocessor"].process(qpos)
             qpos_history.append(qpos.copy())
 
@@ -652,7 +711,7 @@ if __name__ == "__main__":
                 human_height = 1.66 + 0.1 * float(betas[0])
             init_retarget_if_needed(actual_human_height=human_height)
 
-        qpos = state["retarget"].retarget(smplx_frame)
+        qpos = _extract_qpos(state["retarget"].retarget(smplx_frame))
         qpos = state["postprocessor"].process(qpos)
         qpos_history.append(qpos.copy())
 
@@ -899,6 +958,7 @@ if __name__ == "__main__":
             qpos_history,
             aligned_fps_holder[0],
             state["retarget"].xml_file,
+            root_body_name=state["retarget"].robot_root_name,
             torch_device=args.torch_device,
         )
         print(f"[Stream] Saved motion pkl: {args.save_path}")

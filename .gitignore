@@ -131,3 +131,7 @@ wham-gmr_local.tar.gz
 *.meta
 
 *.cmake.meta
+
+LaTeX2e*
+
+results

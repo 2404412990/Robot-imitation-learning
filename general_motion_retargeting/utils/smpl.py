@@ -42,6 +42,10 @@ def _apply_yup_to_zup(root_orient, trans):
     return root_orient, trans
 
 
+def _scipy_quat_to_wxyz(q_xyzw):
+    return np.asarray(q_xyzw)[[3, 0, 1, 2]]
+
+
 def _should_apply_yup_to_zup(smplx_data, smplx_file, coord_fix):
     if coord_fix == "yup_to_zup":
         return True
@@ -186,7 +190,7 @@ def get_smplx_data(smplx_data, body_model, smplx_output, curr_frame):
                 full_body_pose[i].squeeze()
             )
         joint_orientations.append(rot)
-        result[joint_name] = (joints[i], rot.as_quat())
+        result[joint_name] = (joints[i], _scipy_quat_to_wxyz(rot.as_quat()))
 
   
     return result
@@ -311,7 +315,7 @@ def get_smplx_data_offline_fast(smplx_data, body_model, smplx_output, tgt_fps=30
                     single_full_body_pose[i].squeeze()
                 )
             joint_orientations.append(rot)
-            result[joint_name] = (single_joints[i], rot.as_quat())
+            result[joint_name] = (single_joints[i], _scipy_quat_to_wxyz(rot.as_quat()))
 
 
         smplx_data_frames.append(result)
@@ -405,14 +409,14 @@ def get_gvhmr_data_offline_fast(smplx_data, body_model, smplx_output, tgt_fps=30
                     single_full_body_pose[i].squeeze()
                 )
             joint_orientations.append(rot)
-            result[joint_name] = (single_joints[i], rot.as_quat())
+            result[joint_name] = (single_joints[i], _scipy_quat_to_wxyz(rot.as_quat()))
 
 
         smplx_data_frames.append(result)
         
     # add correct rotations
     rotation_matrix = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]])
-    rotation_quat = R.from_matrix(rotation_matrix).as_quat()
+    rotation_quat = _scipy_quat_to_wxyz(R.from_matrix(rotation_matrix).as_quat())
     for result in smplx_data_frames:
         for joint_name in result.keys():
             orientation = utils.quat_mul(rotation_quat, result[joint_name][1])

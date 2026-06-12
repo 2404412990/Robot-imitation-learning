@@ -122,8 +122,15 @@ def run_stream_mt(
     smpl = build_body_model('cpu')
     network = build_network(cfg, smpl)
     network.eval()
+
+    if use_amp:
+        network = network.half()
+        extractor.model = extractor.model.half()
+        smpl = smpl.float()  # shared ref was converted by network.half(); revert for build_wham_inits
+        logger.info("FP16: WHAM network + HMR2 extractor converted to half precision")
+
     keypoints_normalizer = Normalizer(cfg)
-    
+
     if is_webcam:
         cap = cv2.VideoCapture(0)
     else:
@@ -631,9 +638,9 @@ def run_stream_mt(
     def build_wham_inits(init_data_hist, first_norm_kp2d):
         with torch.inference_mode():
             init_output = smpl.get_output(
-                global_orient=init_data_hist['init_global_orient'].to(device),
-                body_pose=init_data_hist['init_body_pose'].to(device),
-                betas=init_data_hist['init_betas'].to(device),
+                global_orient=init_data_hist['init_global_orient'].float().to(device),
+                body_pose=init_data_hist['init_body_pose'].float().to(device),
+                betas=init_data_hist['init_betas'].float().to(device),
                 pose2rot=False,
                 return_full_pose=True
             )

@@ -11,8 +11,8 @@ https://borealisdata.ca/dataset.xhtml?persistentId=doi:10.5683/SP2/JRHDRN
 示例命令：
 
 ```bash
-$env:OUTPUT_ROOT='output/h1_run' 
-$env:ROBOT='unitree_h1' 
+$env:OUTPUT_ROOT='output/x02lite_run' 
+$env:ROBOT='x02lite' 
 $env:RECORD_GMRVIDEO=1 
 $env:RECORD_WHAMVIDEO=1 
 $env:VIDEO='examples/drone_video.mp4' 

@@ -22,6 +22,133 @@ from scripts.smplx_to_robot_stream import OnlineQposPostprocessor
 
 SMPLX_FOLDER = HERE / "assets" / "body_models"
 
+EXPECTED_CSV_COLUMNS_BY_ROBOT = {
+    "unitree_g1": 36,
+    "unitree_h1": 26,
+    "x02lite": 25,
+    "openloong": 38,
+}
+
+X02LITE_HEALTH_LIMITS = {
+    "L_shoulder_pitch": (-1.5708, 3.14159),
+    "L_shoulder_roll": (0.0, 3.14159),
+    "L_shoulder_yaw": (-2.26893, 2.26893),
+    "L_elbow": (0.0, 2.53073),
+    "R_shoulder_pitch": (-1.5708, 3.14159),
+    "R_shoulder_roll": (0.0, 3.14159),
+    "R_shoulder_yaw": (-2.26893, 2.26893),
+    "R_elbow": (0.0, 1.5708),
+    "L_hip_yaw": (-0.785398, 0.785398),
+    "L_hip_roll": (-0.261799, 0.785398),
+    "L_hip_pitch": (-0.523599, 2.00713),
+    "L_knee_pitch": (-2.44346, 0.0872665),
+    "L_ankle_pitch": (-1.39626, 1.0472),
+    "R_hip_yaw": (-0.785398, 0.785398),
+    "R_hip_roll": (-0.261799, 0.785398),
+    "R_hip_pitch": (-0.523599, 2.00713),
+    "R_knee_pitch": (-2.44346, 0.0872665),
+    "R_ankle_pitch": (-1.39626, 1.0472),
+}
+
+X02LITE_DOF_NAMES = list(X02LITE_HEALTH_LIMITS.keys())
+
+
+def _expected_csv_columns_for_robot(robot: str | None) -> int | None:
+    key = (robot or "").strip().lower()
+    if key == "g1":
+        key = "unitree_g1"
+    elif key == "h1":
+        key = "unitree_h1"
+    elif key in ("x02", "x02lite"):
+        key = "x02lite"
+    elif key in ("openloong", "loong"):
+        key = "openloong"
+    return EXPECTED_CSV_COLUMNS_BY_ROBOT.get(key)
+
+
+def _build_unity_csv_row(qpos, robot: str, csv_path: str, frame_id: int):
+    q = np.asarray(qpos)
+    row = np.concatenate([q[:3], q[3:7][[1, 2, 3, 0]], q[7:]], axis=0)
+    expected_cols = _expected_csv_columns_for_robot(robot)
+    if expected_cols is not None and int(row.shape[0]) != expected_cols:
+        raise RuntimeError(
+            f"[GMR] CSV column mismatch: robot={robot} expected_cols={expected_cols} "
+            f"actual_cols={int(row.shape[0])} qpos_len={len(q)} frame={frame_id} csv={csv_path}. "
+            "Check ROBOT env/--robot and the loaded MuJoCo XML before feeding Unity."
+        )
+    return row
+
+
+def _x02lite_fk_ankles(qpos, postprocessor, state):
+    if postprocessor is None or getattr(postprocessor, "kinematics_model", None) is None:
+        return None, None
+
+    kinematics_model = postprocessor.kinematics_model
+    cached = state.get("_x02lite_ankle_indices")
+    if cached is None:
+        body_names = list(getattr(kinematics_model, "body_names", []))
+        if "L_ankle_pitch_Link" not in body_names or "R_ankle_pitch_Link" not in body_names:
+            return None, None
+        cached = (
+            body_names.index("L_ankle_pitch_Link"),
+            body_names.index("R_ankle_pitch_Link"),
+        )
+        state["_x02lite_ankle_indices"] = cached
+
+    idx_l, idx_r = cached
+    device = postprocessor.device
+    q = np.asarray(qpos, dtype=np.float32)
+    root_pos = torch.from_numpy(q[:3][None]).to(device=device, dtype=torch.float32)
+    root_rot_xyzw = torch.from_numpy(q[3:7][[1, 2, 3, 0]][None]).to(device=device, dtype=torch.float32)
+    dof_pos = torch.from_numpy(q[7:][None]).to(device=device, dtype=torch.float32)
+    with torch.no_grad():
+        body_pos, _ = kinematics_model.forward_kinematics(root_pos, root_rot_xyzw, dof_pos)
+    left = body_pos[0, idx_l].detach().cpu().numpy()
+    right = body_pos[0, idx_r].detach().cpu().numpy()
+    return left, right
+
+
+def _log_x02lite_qpos_health(qpos, postprocessor, frame_id, state):
+    q = np.asarray(qpos, dtype=np.float64)
+    dof = q[7:]
+    if dof.shape[0] != len(X02LITE_DOF_NAMES):
+        logger.warning(
+            f"[X02Lite/Health] unexpected dof count={dof.shape[0]} "
+            f"(expected {len(X02LITE_DOF_NAMES)}) frame={frame_id}"
+        )
+        return
+
+    margin = np.deg2rad(5.0)
+    saturated = []
+    for idx, name in enumerate(X02LITE_DOF_NAMES):
+        low, high = X02LITE_HEALTH_LIMITS[name]
+        value = float(dof[idx])
+        if value <= low + margin or value >= high - margin:
+            saturated.append(f"{name}={value:.3f}")
+
+    root_z = float(q[2])
+    health_parts = [f"root_z={root_z:.3f}"]
+
+    if root_z < 0.82 or root_z > 1.08:
+        health_parts.append("root_height_out_of_band")
+
+    try:
+        left_ankle, right_ankle = _x02lite_fk_ankles(q, postprocessor, state)
+        if left_ankle is not None and right_ankle is not None:
+            lateral_sep = abs(float(left_ankle[1] - right_ankle[1]))
+            planar_sep = float(np.linalg.norm(left_ankle[:2] - right_ankle[:2]))
+            health_parts.append(f"ankle_lateral_sep={lateral_sep:.3f}")
+            health_parts.append(f"ankle_planar_sep={planar_sep:.3f}")
+            if lateral_sep < 0.05 or planar_sep < 0.08:
+                health_parts.append("ankles_too_close")
+    except Exception as exc:
+        health_parts.append(f"ankle_fk_error={exc}")
+
+    if saturated:
+        health_parts.append("near_limits=" + ";".join(saturated[:8]))
+
+    logger.info(f"[X02Lite/Health] frame={frame_id} " + " ".join(health_parts))
+
 def _align_tail_betas(raw_betas, body_model):
     betas = np.asarray(raw_betas, dtype=np.float32).reshape(-1)
     target_dim = int(getattr(body_model, "num_betas", betas.shape[0]))
@@ -50,7 +177,13 @@ class TcpStreamSender:
 
     def connect(self) -> bool:
         try:
+            if self._sock is not None:
+                try:
+                    self._sock.close()
+                except Exception:
+                    pass
             self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             self._sock.settimeout(3.0)
             self._sock.connect((self._host, self._port))
             self._sock.settimeout(5.0)
@@ -64,7 +197,8 @@ class TcpStreamSender:
     def send_frame(self, stream_id: int, bgr: "np.ndarray", quality: int = 80) -> bool:
         with self._lock:
             if self._sock is None:
-                return False
+                if not self.connect():
+                    return False
             try:
                 ok, jpg = cv2.imencode('.jpg', bgr, [cv2.IMWRITE_JPEG_QUALITY, quality])
                 if not ok:
@@ -137,6 +271,65 @@ from scripts.stream_demo_common import (
     sanitize_preview_frame,
 )
 
+class _HeadlessViewer:
+    """Minimal MuJoCo viewer for headless offscreen rendering (no GLFW/X11 needed).
+
+    Replicates the essential API of RobotMotionViewer without any display
+    dependencies.  Used for screenshot capture and TCP streaming on headless servers.
+    """
+
+    def __init__(self, robot_type, camera_follow=True, motion_fps=30,
+                 camera_lookat_height_offset=0.75, camera_elevation=-5.0,
+                 camera_distance_scale=1.0, camera_azimuth=None,
+                 robot_path=None, **_kwargs):
+        from general_motion_retargeting.params import ROBOT_XML_DICT, ROBOT_BASE_DICT, VIEWER_CAM_DISTANCE_DICT
+
+        xml_path = robot_path if robot_path and str(robot_path).strip() else ROBOT_XML_DICT[robot_type]
+        self.model = mj.MjModel.from_xml_path(str(xml_path))
+        self.data = mj.MjData(self.model)
+        self.robot_base = ROBOT_BASE_DICT[robot_type]
+        self.viewer_cam_distance = VIEWER_CAM_DISTANCE_DICT[robot_type]
+        mj.mj_step(self.model, self.data)
+
+        self.motion_fps = motion_fps
+        self.camera_follow = camera_follow
+        self.camera_lookat_height_offset = float(camera_lookat_height_offset)
+        self.camera_elevation = float(camera_elevation)
+        self.camera_distance_scale = float(camera_distance_scale)
+        self.camera_azimuth = camera_azimuth
+
+        self._cam = mj.MjvCamera()
+        self._cam.lookat[:] = [0.0, 0.0, 1.0]
+        self._cam.distance = self.viewer_cam_distance * max(0.1, self.camera_distance_scale)
+        self._cam.elevation = self.camera_elevation
+        self._cam.azimuth = float(self.camera_azimuth) if self.camera_azimuth is not None else 90.0
+
+        self.viewer = type('_CamHolder', (), {'cam': self._cam})()
+
+    def step(self, root_pos, root_rot, dof_pos, human_motion_data=None,
+             show_human_body_name=False, human_pos_offset=None, rate_limit=False,
+             follow_camera=True, human_point_scale=0.1):
+        self.data.qpos[:3] = root_pos
+        self.data.qpos[3:7] = root_rot
+        self.data.qpos[7:] = dof_pos
+        mj.mj_forward(self.model, self.data)
+
+        if follow_camera:
+            try:
+                lookat = self.data.xpos[self.model.body(self.robot_base).id].copy()
+            except Exception:
+                lookat = np.asarray(self.data.qpos[:3], dtype=np.float64).copy()
+            lookat[2] += self.camera_lookat_height_offset
+            self._cam.lookat[:] = lookat
+            self._cam.distance = self.viewer_cam_distance * max(0.1, self.camera_distance_scale)
+            self._cam.elevation = self.camera_elevation
+            if self.camera_azimuth is not None:
+                self._cam.azimuth = float(self.camera_azimuth)
+
+    def close(self):
+        pass
+
+
 STREAM_SEQ_LEN = 16
 
 def xyxy_to_cxcys(bbox, s_factor=1.2):
@@ -154,8 +347,28 @@ def run_stream_mt(
     capture_time=0.0,
     gmr_args=None,
     stream_npz_dir=None,
+    capture_interval=0,
+    capture_dir="results/screenshots",
 ):
     os.makedirs(output_dir, exist_ok=True)
+
+    is_webcam = video_path == '0' or video_path == 0
+
+    # Screenshot capture setup
+    cap_orig = None
+    if capture_interval > 0 and not is_webcam:
+        os.makedirs(capture_dir, exist_ok=True)
+        cap_orig = cv2.VideoCapture(video_path)
+        if not cap_orig.isOpened():
+            logger.warning(f"Cannot open {video_path} for original-frame capture; screenshots disabled.")
+            cap_orig = None
+            capture_interval = 0
+        else:
+            # Create subdirectories for each screenshot layer
+            for sub in ("orig", "wham", "mujoco"):
+                os.makedirs(os.path.join(capture_dir, sub), exist_ok=True)
+            logger.info(f"Capture screenshots every {capture_interval} frames → {capture_dir}")
+
     device = cfg.DEVICE.lower()
     is_cuda_device = str(device).startswith('cuda') and torch.cuda.is_available()
     use_amp = env_flag('WHAM_USE_AMP', True) and is_cuda_device
@@ -176,7 +389,6 @@ def run_stream_mt(
         return nullcontext()
 
     root_dir = os.path.abspath(os.path.dirname(__file__))
-    is_webcam = video_path == '0' or video_path == 0
     webcam_capture_time = max(0.0, float(capture_time))
     webcam_start_ts = None
     preview_window_name = 'WHAM Stream'
@@ -187,6 +399,12 @@ def run_stream_mt(
         f"Perf opts: amp={int(use_amp)} detect_interval={detect_interval} "
         f"infer_interval={infer_interval} seq_len={stream_seq_len} device={device} "
         "stream_mode=tail"
+    )
+    heartbeat_frames = max(1, int(os.environ.get('PIPELINE_HEARTBEAT_FRAMES', '30')))
+    logger.info(
+        f"[Input] source={'webcam:0' if is_webcam else video_path} capture_time={webcam_capture_time:.2f}s "
+        f"record_whamvideo={int(record_whamvideo)} tcp_requested={int(bool(getattr(gmr_args, 'tcp', False)))} "
+        f"heartbeat_frames={heartbeat_frames}"
     )
     if preview_window_enabled and os.name != 'nt' and not os.environ.get('DISPLAY'):
         logger.warning("RECORD_WHAMVIDEO=1 but DISPLAY is not set; preview window disabled.")
@@ -217,8 +435,15 @@ def run_stream_mt(
     smpl = build_body_model('cpu')
     network = build_network(cfg, smpl)
     network.eval()
+
+    if use_amp:
+        network = network.half()
+        extractor.model = extractor.model.half()
+        smpl = smpl.float()  # shared ref was converted by network.half(); revert for build_wham_inits
+        logger.info("FP16: WHAM network + HMR2 extractor converted to half precision")
+
     keypoints_normalizer = Normalizer(cfg)
-    
+
     if is_webcam:
         cap = cv2.VideoCapture(0)
     else:
@@ -255,7 +480,22 @@ def run_stream_mt(
     if is_webcam:
         webcam_start_ts = time.time()
     height, width = first_frame.shape[:2]
-    logger.info(f"Effective input size: {width}x{height} (scale={input_scale:.3f})")
+    logger.info(f"[Input] first frame read; fps={fps:.2f}, effective_size={width}x{height} (scale={input_scale:.3f})")
+
+    def gmr_renderer_size(for_capture: bool = False):
+        if for_capture and not bool(getattr(gmr_args, "tcp", False)):
+            return 480, 640, "screenshot capture"
+
+        base_h = max(120, int(os.environ.get("GMR_TCP_RENDER_HEIGHT", "240")))
+        aspect = max(0.1, min(10.0, width / max(float(height), 1.0)))
+        base_w = max(2, int(round(base_h * aspect)))
+        return base_h, base_w, f"Unity streaming aspect={aspect:.3f}"
+
+    def gmr_window_size():
+        max_w = max(320, int(os.environ.get("GMR_VIEWER_MAX_WIDTH", str(preview_max_w))))
+        max_h = max(240, int(os.environ.get("GMR_VIEWER_MAX_HEIGHT", str(preview_max_h))))
+        scale = min(max_w / max(float(width), 1.0), max_h / max(float(height), 1.0), 1.0)
+        return max(1, int(round(width * scale))), max(1, int(round(height * scale)))
 
     if preview_window_enabled:
         logger.info("WHAM preview window will be initialized in render thread.")
@@ -296,6 +536,12 @@ def run_stream_mt(
     render_Q = Queue(maxsize=max(8, int(os.environ.get('WHAM_RENDER_QUEUE_SIZE', '120'))))
     render_thread = None
     render_drop_count = 0
+
+    def safe_qsize(q):
+        try:
+            return q.qsize()
+        except Exception:
+            return -1
 
     def extract_latest_vertices(pred):
         verts = pred['verts_cam']
@@ -586,6 +832,7 @@ def run_stream_mt(
                     break
                 except Full:
                     continue
+            logger.info(f"[Input] queued first frame={frame_id} read_Q={safe_qsize(read_Q)}")
             frame_id += 1
 
         while cap.isOpened() and not stop_event.is_set():
@@ -605,6 +852,8 @@ def run_stream_mt(
                     break
                 except Full:
                     continue
+            if frame_id % heartbeat_frames == 0:
+                logger.info(f"[Input] queued frame={frame_id} read_Q={safe_qsize(read_Q)}")
             frame_id += 1
         try:
             read_Q.put(None, timeout=0.2)
@@ -635,11 +884,15 @@ def run_stream_mt(
             track_id = None
             kp2d = None
             bbox_c = None
+            poses_count = -1
+            valid_count = -1
 
             need_detect = (frame_id - last_detect_frame) >= detect_interval or last_track_id is None
             if need_detect:
                 detector.track(frame, fps, 1000)
                 poses = detector.pose_results_last
+                poses_count = len(poses)
+                valid_count = 0
 
                 if len(poses) > 0:
                     valid_poses = []
@@ -647,6 +900,7 @@ def run_stream_mt(
                         valid = (pose['keypoints'][:, -1] > 0.3).sum()
                         if valid >= 6:
                             valid_poses.append(pose)
+                    valid_count = len(valid_poses)
 
                     best_pose = None
                     if len(valid_poses) > 0:
@@ -681,6 +935,12 @@ def run_stream_mt(
                 track_id = last_track_id
                 kp2d = None if last_kp2d is None else last_kp2d.copy()
                 bbox_c = None if last_bbox_c is None else last_bbox_c.copy()
+
+            if frame_id == 0 or frame_id % heartbeat_frames == 0:
+                logger.info(
+                    f"[Detect] frame={frame_id} need_detect={int(need_detect)} poses={poses_count} "
+                    f"valid={valid_count} selected_track={selected_track_id} track_id={track_id} det_Q={safe_qsize(det_Q)}"
+                )
             
             while not stop_event.is_set():
                 try:
@@ -728,6 +988,8 @@ def run_stream_mt(
                         break
                     except Full:
                         continue
+                if frame_id == 0 or frame_id % heartbeat_frames == 0:
+                    logger.info(f"[Extract] frame={frame_id} track_id={track_id} feature=1 ext_Q={safe_qsize(ext_Q)}")
             else:
                 while not stop_event.is_set():
                     try:
@@ -735,13 +997,15 @@ def run_stream_mt(
                         break
                     except Full:
                         continue
+                if frame_id == 0 or frame_id % heartbeat_frames == 0:
+                    logger.warning(f"[Extract] frame={frame_id} has no tracked person; ext_Q={safe_qsize(ext_Q)}")
                 
     def build_wham_inits(init_data_hist, first_norm_kp2d):
         with torch.inference_mode():
             init_output = smpl.get_output(
-                global_orient=init_data_hist['init_global_orient'].to(device),
-                body_pose=init_data_hist['init_body_pose'].to(device),
-                betas=init_data_hist['init_betas'].to(device),
+                global_orient=init_data_hist['init_global_orient'].float().to(device),
+                body_pose=init_data_hist['init_body_pose'].float().to(device),
+                betas=init_data_hist['init_betas'].float().to(device),
                 pose2rot=False,
                 return_full_pose=True
             )
@@ -832,6 +1096,7 @@ def run_stream_mt(
                 init_root = hist['cached_init_root']
 
                 try:
+                    _t_infer0 = time.perf_counter()
                     with torch.inference_mode():
                         with autocast_ctx():
                             pred = network(
@@ -848,9 +1113,12 @@ def run_stream_mt(
                                 refine_traj=False,
                                 states=None
                             )
+                    _t_infer_ms = (time.perf_counter() - _t_infer0) * 1000
 
                     verts_cam = extract_latest_vertices(pred).detach().cpu().numpy()
                     smplx_params = extract_latest_smplx_params(pred)
+                    if frame_id % 10 == 0:
+                        logger.info(f"[WHAM] infer_ms={_t_infer_ms:.1f}  frame={frame_id}")
                     hist['last_pred'] = (verts_cam.copy(), {k: v.copy() for k, v in smplx_params.items()})
                     while not stop_event.is_set():
                         try:
@@ -873,6 +1141,8 @@ def run_stream_mt(
                         break
                     except Full:
                         continue
+                if frame_id == 0 or frame_id % heartbeat_frames == 0:
+                    logger.warning(f"[WHAM] frame={frame_id} skipped because no tracked person; wham_Q={safe_qsize(wham_Q)}")
 
     t1 = threading.Thread(target=reader_thread, daemon=True)
     t2 = threading.Thread(target=detector_thread, daemon=True)
@@ -899,7 +1169,9 @@ def run_stream_mt(
 
     
     logger.info("Pipeline started.")
-    
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
     # GMR State Setup
     gmr_state = {
         "retarget": None,
@@ -920,6 +1192,7 @@ def run_stream_mt(
     qpos_history = []
     csv_file = None
     csv_writer = None
+    csv_row_count = 0
     
     if gmr_args is not None:
         csv_dir = os.path.dirname(gmr_args.csv_path)
@@ -927,8 +1200,11 @@ def run_stream_mt(
             os.makedirs(csv_dir, exist_ok=True)
         csv_file = open(gmr_args.csv_path, "w", newline="")
         csv_writer = csv.writer(csv_file)
+        logger.info(f"[GMR] CSV output opened: {gmr_args.csv_path}")
         
     def tail_params_to_smplx_frame(params):
+        _dev = torch.device(gmr_args.torch_device) if gmr_args and gmr_args.torch_device != "cpu" else torch.device("cpu")
+
         if gmr_state["tail_body_model"] is None:
             bm = smplx.create(
                 str(SMPLX_FOLDER),
@@ -936,6 +1212,7 @@ def run_stream_mt(
                 gender="neutral",
                 use_pca=False,
             )
+            bm = bm.to(_dev)
             gmr_state["tail_body_model"] = bm
             gmr_state["tail_joint_names"] = JOINT_NAMES[:len(bm.parents)]
             gmr_state["tail_parents"] = bm.parents
@@ -955,15 +1232,15 @@ def run_stream_mt(
 
         with torch.no_grad():
             s_out = bm(
-                betas=torch.from_numpy(betas).float().view(1, -1),
-                global_orient=torch.from_numpy(rorient).float(),
-                body_pose=torch.from_numpy(bpose).float(),
-                transl=torch.from_numpy(trans).float(),
-                left_hand_pose=torch.zeros(1, 45).float(),
-                right_hand_pose=torch.zeros(1, 45).float(),
-                jaw_pose=torch.zeros(1, 3).float(),
-                leye_pose=torch.zeros(1, 3).float(),
-                reye_pose=torch.zeros(1, 3).float(),
+                betas=torch.from_numpy(betas).float().to(_dev).view(1, -1),
+                global_orient=torch.from_numpy(rorient).float().to(_dev),
+                body_pose=torch.from_numpy(bpose).float().to(_dev),
+                transl=torch.from_numpy(trans).float().to(_dev),
+                left_hand_pose=torch.zeros(1, 45).float().to(_dev),
+                right_hand_pose=torch.zeros(1, 45).float().to(_dev),
+                jaw_pose=torch.zeros(1, 3).float().to(_dev),
+                leye_pose=torch.zeros(1, 3).float().to(_dev),
+                reye_pose=torch.zeros(1, 3).float().to(_dev),
                 return_full_pose=True,
             )
 
@@ -993,22 +1270,53 @@ def run_stream_mt(
             r_kwargs["robot_path"] = gmr_args.robot_path
         
         gmr_state["retarget"] = GMR(**r_kwargs)
+        # GMR_MAX_ITER: reduce from default 10 to speed up IK at the cost of
+        # slightly lower convergence.  4–5 iterations are sufficient for
+        # streaming use where the pose changes slowly between frames.
+        expected_cols = _expected_csv_columns_for_robot(gmr_args.robot)
+        model_nq = int(gmr_state["retarget"].model.nq)
+        logger.info(
+            f"[GMR] initialized robot={gmr_args.robot} model_nq={model_nq} "
+            f"model_nv={int(gmr_state['retarget'].model.nv)} model_nu={int(gmr_state['retarget'].model.nu)} "
+            f"expected_csv_cols={expected_cols if expected_cols is not None else '<unchecked>'} "
+            f"xml={gmr_state['retarget'].xml_file}"
+        )
+        if expected_cols is not None and model_nq != expected_cols:
+            raise RuntimeError(
+                f"[GMR] Robot model qpos length mismatch: robot={gmr_args.robot} "
+                f"model_nq={model_nq} expected_csv_cols={expected_cols} xml={gmr_state['retarget'].xml_file}"
+            )
+
+        default_gmr_max_iter = "20" if (gmr_args.robot or "").strip().lower() == "openloong" else "10"
+        _gmr_max_iter = int(os.environ.get("GMR_MAX_ITER", default_gmr_max_iter))
+        gmr_state["retarget"].max_iter = _gmr_max_iter
+        logger.info(f"[GMR] max_iter={_gmr_max_iter}")
         gmr_state["postprocessor"] = OnlineQposPostprocessor(
             gmr_state["retarget"].xml_file,
+            root_body_name=gmr_state["retarget"].robot_root_name,
             smooth_alpha=max(0.0, min(1.0, gmr_args.smooth_alpha)),
             height_adjust=gmr_args.height_adjust,
             root_origin_offset=gmr_args.root_origin_offset,
             torch_device=gmr_args.torch_device,
         )
         
-        if gmr_args.record_gmrvideo:
+        # Create MuJoCo viewer when needed: recording, screenshot capture, or TCP streaming
+        _need_viewer = gmr_args.record_gmrvideo or capture_interval > 0 or gmr_args.tcp
+        _is_headless = not os.environ.get('DISPLAY')
+        if _need_viewer:
             v_kws = dict(
                 robot_type=gmr_args.robot,
                 motion_fps=30.0,
                 transparent_robot=0,
-                record_video=True,
+                record_video=gmr_args.record_gmrvideo,
                 video_path=gmr_args.video_path,
             )
+            gmr_window_w, gmr_window_h = gmr_window_size()
+            v_kws["video_width"] = gmr_window_w
+            v_kws["video_height"] = gmr_window_h
+            v_kws["window_width"] = gmr_window_w
+            v_kws["window_height"] = gmr_window_h
+            logger.info(f"GMR viewer/window target size: {gmr_window_w}x{gmr_window_h} (input aspect {width / max(float(height), 1.0):.3f})")
             v_kws["camera_follow"] = getattr(gmr_args, "camera_follow", False) or getattr(gmr_args, "track", False)
             if hasattr(gmr_args, 'camera_lookat_height_offset'):
                 v_kws["camera_lookat_height_offset"] = gmr_args.camera_lookat_height_offset
@@ -1020,19 +1328,42 @@ def run_stream_mt(
                 v_kws["camera_azimuth"] = gmr_args.camera_azimuth
             if getattr(gmr_args, 'robot_path', None) is not None:
                 v_kws['robot_path'] = gmr_args.robot_path
-                
-            try:
-                gmr_state["viewer"] = RobotMotionViewer(**v_kws)
-                logger.info(f"Initialized GMR viewer for {gmr_args.robot}")
 
-                # Offscreen renderer for TCP streaming to Unity (streamId=1)
-                if gmr_args.tcp:
-                    v = gmr_state["viewer"]
-                    gmr_state["renderer"] = mj.Renderer(v.model, height=240, width=320)
-                    logger.info("Initialized GMR offscreen renderer (240x320) for Unity streaming")
-            except Exception as e:
-                logger.error(f"Failed to initialize GMR viewer: {e}")
-                gmr_state["viewer"] = None
+            # On headless servers, use the minimal offscreen viewer (no GLFW needed)
+            if _is_headless and not gmr_args.record_gmrvideo:
+                try:
+                    gmr_state["viewer"] = _HeadlessViewer(**v_kws)
+                    logger.info(f"Initialized headless GMR viewer for {gmr_args.robot}")
+                except Exception as e:
+                    logger.error(f"Failed to initialize headless GMR viewer: {e}")
+                    gmr_state["viewer"] = None
+
+                if gmr_state["viewer"] is not None and (gmr_args.tcp or capture_interval > 0):
+                    try:
+                        v = gmr_state["viewer"]
+                        h, w, render_reason = gmr_renderer_size(capture_interval > 0)
+                        gmr_state["renderer"] = mj.Renderer(v.model, height=h, width=w)
+                        logger.info(f"Initialized GMR offscreen renderer ({w}x{h}) for {render_reason}")
+                    except Exception as e:
+                        logger.error(f"Failed to create offscreen renderer (MuJoCo needs EGL/GPU): {e}")
+                        logger.error("  Try: export MUJOCO_GL=egl  or  pip install mujoco[egl]")
+                        gmr_state["renderer"] = None
+            else:
+                if _is_headless and gmr_args.record_gmrvideo:
+                    logger.warning("Video recording requires a display server; may fail on headless.")
+                try:
+                    gmr_state["viewer"] = RobotMotionViewer(**v_kws)
+                    logger.info(f"Initialized GMR viewer for {gmr_args.robot}")
+
+                    # Offscreen renderer for TCP streaming and screenshot capture
+                    if gmr_args.tcp or capture_interval > 0:
+                        v = gmr_state["viewer"]
+                        h, w, render_reason = gmr_renderer_size(capture_interval > 0)
+                        gmr_state["renderer"] = mj.Renderer(v.model, height=h, width=w)
+                        logger.info(f"Initialized GMR offscreen renderer ({w}x{h}) for {render_reason}")
+                except Exception as e:
+                    logger.error(f"Failed to initialize GMR viewer: {e}")
+                    gmr_state["viewer"] = None
 
     # TCP sender for streaming WHAM (streamId=0) and GMR (streamId=1) frames to Unity
     if gmr_args.tcp:
@@ -1049,6 +1380,12 @@ def run_stream_mt(
     frame_timestamp_map = {}
     max_frame_id = -1
 
+    # Per-component latency tracking (rolling 30-frame window)
+    _t_gmr_ik   = deque(maxlen=30)   # GMR IK solve (ms)
+    _t_gmr_post = deque(maxlen=30)   # post-processing (ms)
+    _t_wham_q   = deque(maxlen=30)   # wham_Q.get wait time (ms)
+    _t_adapt    = deque(maxlen=30)   # adaptation layer (ms)
+
     # Register SIGINT handler so Ctrl+C sets stop flags gracefully instead of
     # interrupting PyTorch / MuJoCo native code mid-operation (which causes segfaults).
     def _on_sigint(signum, frame):
@@ -1060,7 +1397,9 @@ def run_stream_mt(
 
     while True:
         try:
+            _t0_q = time.perf_counter()
             res_data = wham_Q.get(timeout=0.1)
+            _t_wham_q.append((time.perf_counter() - _t0_q) * 1000)
         except Empty:
             if stop_event.is_set():
                 # If stop is requested from terminal, exit promptly instead of waiting
@@ -1089,7 +1428,14 @@ def run_stream_mt(
             
             # Process via GMR immediately in queue thread
             if gmr_args is not None:
+                _t0_adapt = time.perf_counter()
                 sf, bt = tail_params_to_smplx_frame(gvhmr_params)
+
+                # Ablation switches (set via environment variables for benchmarking).
+                # Normal usage: all disabled (0) → full stabilization active.
+                _bench_no_vel  = os.environ.get("BENCH_DISABLE_VEL_INTEGRATION", "0") == "1"
+                _bench_no_disp = os.environ.get("BENCH_DISABLE_DISP_THRESH", "0") == "1"
+                _bench_no_quat = os.environ.get("BENCH_DISABLE_QUAT_CLAMP", "0") == "1"
 
                 # WHAM resets trans_world (cumsum from zero) each sliding window
                 # because we call with states=None.  Integrate root velocity
@@ -1100,7 +1446,7 @@ def run_stream_mt(
                     gmr_state["global_pelvis_pos"] = curr_raw.copy()
                     gmr_state["prev_raw_pelvis_pos"] = curr_raw.copy()
                     gmr_state["prev_frame_id"] = frame_id
-                else:
+                elif not _bench_no_vel:
                     vel_root = gvhmr_params.get('vel_root')
                     root_mat = gvhmr_params.get('poses_root_world_mat')
 
@@ -1112,11 +1458,11 @@ def run_stream_mt(
                         vel_world_zup = vel_world_yup @ R_yup2zup.T
                         # vel_world is per-frame displacement; add directly.
                         gmr_state["global_pelvis_pos"] += vel_world_zup
-                    else:
+                    elif not _bench_no_disp:
                         # Fallback: raw pelvis delta with tight threshold to
                         # reject WHAM origin resets (which produce large jumps).
                         raw_delta = curr_raw - gmr_state["prev_raw_pelvis_pos"]
-                        max_step = 0.15  # meters per frame at ~8 FPS ≈ 1.2 m/s
+                        max_step = float(os.environ.get("BENCH_DELTA_MAX", "0.15"))
                         if float(np.linalg.norm(raw_delta)) < max_step:
                             gmr_state["global_pelvis_pos"] += raw_delta
 
@@ -1134,7 +1480,7 @@ def run_stream_mt(
                 # large yaw jumps.  Clamp the pelvis quaternion change per
                 # frame to suppress these artifacts.
                 pelvis_quat = np.asarray(sf["pelvis"][1], dtype=np.float64)
-                if gmr_state["prev_pelvis_quat"] is not None:
+                if not _bench_no_quat and gmr_state["prev_pelvis_quat"] is not None:
                     prev_q = gmr_state["prev_pelvis_quat"]
                     # Ensure shortest path
                     if float(np.dot(pelvis_quat, prev_q)) < 0.0:
@@ -1153,11 +1499,27 @@ def run_stream_mt(
                         sf["pelvis"] = (sf["pelvis"][0], pelvis_quat)
                 gmr_state["prev_pelvis_quat"] = pelvis_quat.copy()
 
+                _t_adapt.append((time.perf_counter() - _t0_adapt) * 1000)
+
                 init_gmr(bt)
 
                 try:
-                    qp = gmr_state["retarget"].retarget(sf)
+                    _t0_ik = time.perf_counter()
+                    qp, ik_residuals = gmr_state["retarget"].retarget(sf)
+                    _t_gmr_ik.append((time.perf_counter() - _t0_ik) * 1000)
+                    _t0_post = time.perf_counter()
                     qp = gmr_state["postprocessor"].process(qp)
+                    _t_gmr_post.append((time.perf_counter() - _t0_post) * 1000)
+                    # Accumulate IK residuals for per-frame averaging
+                    if "ik_residuals_acc" not in gmr_state:
+                        gmr_state["ik_residuals_acc"] = []
+                        gmr_state["ik_pos_error_acc"] = []
+                    gmr_state["ik_residuals_acc"].append(ik_residuals)
+                    try:
+                        pos_err_mm = gmr_state["retarget"].decomposed_position_error_mm()
+                        gmr_state["ik_pos_error_acc"].append(pos_err_mm)
+                    except Exception:
+                        pass
                 except KeyboardInterrupt:
                     logger.info("KeyboardInterrupt during GMR processing, shutting down.")
                     terminal_stop_event.set()
@@ -1168,7 +1530,7 @@ def run_stream_mt(
                 # jitter from WHAM window resets.  The postprocessor already
                 # smooths, but large jumps can still slip through.
                 # NOTE: MuJoCo qpos uses wxyz (scalar-first); scipy uses xyzw.
-                if gmr_state.get("prev_qpos_quat") is not None:
+                if not _bench_no_quat and gmr_state.get("prev_qpos_quat") is not None:
                     prev_q = gmr_state["prev_qpos_quat"]       # wxyz
                     curr_q = np.asarray(qp[3:7], dtype=np.float64)  # wxyz
                     if float(np.dot(curr_q, prev_q)) < 0.0:
@@ -1187,10 +1549,19 @@ def run_stream_mt(
                         qp[3:7] = curr_q.astype(qp.dtype)
                 gmr_state["prev_qpos_quat"] = np.asarray(qp[3:7], dtype=np.float64).copy()  # wxyz
                 qpos_history.append(qp.copy())
+
+                if str(gmr_args.robot).strip().lower() == "x02lite" and (csv_row_count == 0 or frame_id % heartbeat_frames == 0):
+                    _log_x02lite_qpos_health(qp, gmr_state.get("postprocessor"), frame_id, gmr_state)
                 
-                row = np.concatenate([qp[:3], qp[3:7][[1, 2, 3, 0]], qp[7:]], axis=0)
+                row = _build_unity_csv_row(qp, gmr_args.robot, gmr_args.csv_path, frame_id)
                 csv_writer.writerow(row.tolist())
                 csv_file.flush()
+                csv_row_count += 1
+                if csv_row_count == 1 or frame_id % heartbeat_frames == 0:
+                    logger.info(
+                        f"[GMR] wrote CSV row={csv_row_count} frame={frame_id} robot={gmr_args.robot} "
+                        f"qpos_len={len(qp)} csv_cols={len(row)} csv={gmr_args.csv_path}"
+                    )
                 
                 if gmr_state["viewer"] is not None and (len(qpos_history) - 1) >= max(0, int(gmr_args.viewer_warmup_frames)):
                     try:
@@ -1212,9 +1583,17 @@ def run_stream_mt(
                             gmr_renderer.update_scene(gmr_state["viewer"].data, camera=gmr_state["viewer"].viewer.cam)
                             gmr_rgb = gmr_renderer.render()
                             gmr_bgr = cv2.cvtColor(gmr_rgb, cv2.COLOR_RGB2BGR)
-                            tcp.send_frame(1, gmr_bgr)
+                            if tcp.send_frame(1, gmr_bgr) and not gmr_state.get("_tcp_gmr_logged", False):
+                                logger.info("[TCP] Sent first GMR frame to Unity streamId=1")
+                                gmr_state["_tcp_gmr_logged"] = True
                     except Exception as e:
                         logger.error(f"GMR viewer error: {e}")
+        else:
+            if frame_id == 0 or frame_id % heartbeat_frames == 0:
+                logger.warning(
+                    f"[Main] frame={frame_id} has no WHAM params; success={success} track_id={pred_track_id} "
+                    f"queues read={safe_qsize(read_Q)} det={safe_qsize(det_Q)} ext={safe_qsize(ext_Q)} wham={safe_qsize(wham_Q)}"
+                )
         
         curr_time = time.time()
         throughput_time = curr_time - last_frame_time
@@ -1243,6 +1622,7 @@ def run_stream_mt(
             else:
                 cv2.putText(frame, f"Frame {frame_id} | FPS: {avg_fps:.1f} | Latency: {latency:.2f}s", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
             frame_out = sanitize_preview_frame(frame)
+            # Feed the render thread for video encoding + preview window
             packet = (frame_out.copy(), float(curr_time))
             try:
                 render_Q.put(packet, timeout=0.01)
@@ -1257,15 +1637,67 @@ def run_stream_mt(
                 except Full:
                     render_drop_count += 1
 
+        # Screenshot capture at specified intervals
+        if capture_interval > 0 and frame_id % capture_interval == 0 and cap_orig is not None:
+            capture_id = f"{frame_id:06d}"
+            # 1) Original video frame (seek in source video)
+            cap_orig.set(cv2.CAP_PROP_POS_FRAMES, frame_id)
+            ret_orig, orig_frame = cap_orig.read()
+            if ret_orig and orig_frame is not None:
+                cv2.imwrite(os.path.join(capture_dir, "orig", f"{capture_id}.png"), orig_frame)
+            # 2) WHAM visualization frame
+            if success and frame is not None:
+                cv2.imwrite(os.path.join(capture_dir, "wham", f"{capture_id}.png"), frame)
+            # 3) MuJoCo robot frame via offscreen renderer
+            _gmr_rend = gmr_state.get("renderer")
+            _gmr_view = gmr_state.get("viewer")
+            _gmr_render_failures = gmr_state.setdefault("_render_failures", 0)
+            if _gmr_rend is not None and _gmr_view is not None:
+                try:
+                    _gmr_rend.update_scene(_gmr_view.data, camera=_gmr_view.viewer.cam)
+                    gmr_rgb = _gmr_rend.render()
+                    gmr_bgr = cv2.cvtColor(gmr_rgb, cv2.COLOR_RGB2BGR)
+                    cv2.imwrite(os.path.join(capture_dir, "mujoco", f"{capture_id}.png"), gmr_bgr)
+                except Exception as e:
+                    _gmr_render_failures += 1
+                    gmr_state["_render_failures"] = _gmr_render_failures
+                    if _gmr_render_failures <= 3:
+                        logger.warning(f"MuJoCo screenshot render failed (attempt {_gmr_render_failures}): {e}")
+            if frame_id % (capture_interval * 5) == 0:
+                logger.info(f"[Capture] saved frame {capture_id} to {capture_dir}")
+
         # Send WHAM frame to Unity via TCP (streamId=0)
         tcp = gmr_state.get("tcp_sender")
         if tcp is not None and not tcp.connected:
             tcp.connect()
         if tcp is not None and frame is not None:
-            tcp.send_frame(0, frame)
+            if tcp.send_frame(0, frame) and not gmr_state.get("_tcp_wham_logged", False):
+                logger.info("[TCP] Sent first WHAM frame to Unity streamId=0")
+                gmr_state["_tcp_wham_logged"] = True
 
         if frame_id % 10 == 0:
-            logger.info(f"Frame {frame_id} processed | FPS: {avg_fps:.1f} | Latency: {latency:.3f} s")
+            _q_ms   = sum(_t_wham_q)   / len(_t_wham_q)   if _t_wham_q   else 0
+            _ad_ms  = sum(_t_adapt)    / len(_t_adapt)    if _t_adapt    else 0
+            _ik_ms  = sum(_t_gmr_ik)   / len(_t_gmr_ik)   if _t_gmr_ik   else 0
+            _po_ms  = sum(_t_gmr_post) / len(_t_gmr_post) if _t_gmr_post else 0
+            # Average IK residuals over the last 10-frame window
+            _ikr1 = 0.0; _ikr2 = 0.0; _pos_err = 0.0
+            acc = gmr_state.get("ik_residuals_acc", [])
+            if acc:
+                _ikr1 = float(np.mean([r[0] for r in acc]))
+                _ikr2 = float(np.mean([r[1] for r in acc]))
+            pos_acc = gmr_state.get("ik_pos_error_acc", [])
+            if pos_acc:
+                _pos_err = float(np.mean(pos_acc))
+            # Reset accumulators
+            gmr_state["ik_residuals_acc"] = []
+            gmr_state["ik_pos_error_acc"] = []
+            # Format the IK residual tag for benchmark parsing
+            logger.info(f"[IK] res1={_ikr1:.4f}  res2={_ikr2:.4f}  pos_err_mm={_pos_err:.2f}")
+            logger.info(
+                f"Frame {frame_id} | FPS: {avg_fps:.1f} | Latency: {latency:.3f}s | "
+                f"[Q-wait:{_q_ms:.1f}ms  Adapt:{_ad_ms:.1f}ms  IK:{_ik_ms:.1f}ms  Post:{_po_ms:.1f}ms]"
+            )
             
     if gmr_args is not None and csv_file is not None:
         csv_file.close()
@@ -1273,9 +1705,29 @@ def run_stream_mt(
         if len(qpos_history) > 0:
             logger.info(f"Saving motion PKL to {gmr_args.save_path}")
             try:
-                write_motion_pkl(gmr_args.save_path, qpos_history, fps=30.0, xml_file=gmr_state["retarget"].xml_file, torch_device=gmr_args.torch_device)
+                write_motion_pkl(
+                    gmr_args.save_path,
+                    qpos_history,
+                    fps=30.0,
+                    xml_file=gmr_state["retarget"].xml_file,
+                    root_body_name=gmr_state["retarget"].robot_root_name,
+                    torch_device=gmr_args.torch_device,
+                )
             except Exception as e:
                 logger.error(f"Failed to write motion pkl: {e}")
+        if cap_orig is not None:
+            # Log capture summary
+            _dirs = {"orig": 0, "wham": 0, "mujoco": 0}
+            for _sub in _dirs:
+                _p = os.path.join(capture_dir, _sub)
+                if os.path.isdir(_p):
+                    _dirs[_sub] = len([f for f in os.listdir(_p) if f.endswith(".png")])
+            logger.info(f"[Capture] summary: orig={_dirs['orig']} wham={_dirs['wham']} mujoco={_dirs['mujoco']}")
+            if _dirs["mujoco"] == 0 and (gmr_state.get("renderer") is None):
+                logger.warning("[Capture] No MuJoCo frames captured — renderer unavailable (try: export MUJOCO_GL=egl)")
+            elif _dirs["mujoco"] == 0:
+                logger.warning(f"[Capture] No MuJoCo frames captured — render failures={gmr_state.get('_render_failures', 0)}")
+            cap_orig.release()
         if gmr_state["viewer"] is not None:
             try:
                 gmr_state["viewer"].close()
@@ -1324,6 +1776,8 @@ def run_stream_mt(
         if first_valid is None:
             logger.warning("No valid WHAM parameters were collected. Skip GMR SMPL-X npz save.")
             cap.release()
+            if torch.cuda.is_available():
+                logger.info(f"[VRAM] peak_allocated_mb={torch.cuda.max_memory_allocated()/1024/1024:.0f}")
             logger.info("Stream processing finished.")
             return
 
@@ -1377,6 +1831,8 @@ def run_stream_mt(
         logger.info(f"Saved GMR SMPL-X npz to {gmr_smplx_npz} (frames={n_frames}, fps={output_fps:.2f})")
 
     cap.release()
+    if torch.cuda.is_available():
+        logger.info(f"[VRAM] peak_allocated_mb={torch.cuda.max_memory_allocated()/1024/1024:.0f}")
     logger.info("Stream processing finished.")
 
 if __name__ == '__main__':
@@ -1412,6 +1868,7 @@ if __name__ == '__main__':
     parser.set_defaults(track=False)
     parser.add_argument("--tcp", action="store_true", help="Enable TCP streaming to Unity (default: off)")
     parser.add_argument("--no-tcp", dest="tcp", action="store_false")
+    parser.add_argument("--no_tcp", dest="tcp", action="store_false")
     parser.set_defaults(tcp=False)
     parser.add_argument("--camera_lookat_height_offset", type=float, default=0.25)
     parser.add_argument("--camera_elevation", type=float, default=12.0)
@@ -1424,6 +1881,11 @@ if __name__ == '__main__':
     parser.add_argument("--root_origin_offset", action="store_true")
     parser.add_argument("--no-root_origin_offset", dest="root_origin_offset", action="store_false")
     parser.set_defaults(root_origin_offset=False)
+    parser.add_argument("--capture_interval", type=int, default=0,
+                        help="Save screenshots every N frames (0=disabled). "
+                             "Saves original video, WHAM viz, and MuJoCo robot frames.")
+    parser.add_argument("--capture_dir", type=str, default="results/screenshots",
+                        help="Directory for captured screenshots (default: results/screenshots)")
     parser.add_argument("--poll_interval", type=float, default=0.05)
     parser.add_argument("--idle_timeout", type=float, default=0.0)
     parser.add_argument("--done_grace_sec", type=float, default=2.0)
@@ -1448,4 +1910,6 @@ if __name__ == '__main__':
         capture_time=max(0.0, float(args.time)),
         gmr_args=args,
         stream_npz_dir=getattr(args, 'stream_npz_dir', None),
+        capture_interval=args.capture_interval,
+        capture_dir=args.capture_dir,
     )
