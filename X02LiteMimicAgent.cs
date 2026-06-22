@@ -234,10 +234,21 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
     private bool _isClone = false;
     private bool isRobotSelectedInScene = true;
 
-    // ── IMimicAgent surface ───────────────────────────────────────────────────
+    // IMimicAgent surface
     public string RobotKey => string.IsNullOrWhiteSpace(robotKey) ? "x02lite" : robotKey.Trim();
     public GameObject AgentGameObject => gameObject;
-    public bool UseExternalReplayData { get => useExternalReplayData; set => useExternalReplayData = value; }
+    public bool UseExternalReplayData
+    {
+        get => useExternalReplayData;
+        set
+        {
+            useExternalReplayData = value;
+            if (!value)
+            {
+                isLiveRealtimeCsv = false;
+            }
+        }
+    }
     public bool ReplayMode { get => replay; set => replay = value; }
     public int MotionId { get; set; }
     public void RequestEndEpisode()
@@ -359,7 +370,7 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
             utotal[i] = 0f;
         }
         currentFrame = useExternalReplayData ? 0 : frame0;
-        if (useExternalReplayData)
+        if (useExternalReplayData && isLiveRealtimeCsv)
         {
             realtimeFrameCursor = 0f;
         }
@@ -721,26 +732,13 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
 
     private string ResolveDatasetPath()
     {
-        List<string> candidates = new List<string>();
-
-        if (!string.IsNullOrWhiteSpace(datasetRelativePath))
-            candidates.Add(ToAbsoluteProjectPath(datasetRelativePath));
-
-        foreach (string fallback in DefaultDatasetSearchPaths)
+        if (ImitationDatasetPaths.TryResolveRobotDatasetPath("x02lite", datasetRelativePath, DefaultDatasetSearchPaths, out string resolved, out _))
         {
-            string abs = ToAbsoluteProjectPath(fallback);
-            if (!string.IsNullOrWhiteSpace(abs) && !candidates.Contains(abs))
-                candidates.Add(abs);
-        }
-
-        foreach (string candidate in candidates)
-        {
-            if (Directory.Exists(candidate)) return candidate;
+            return resolved;
         }
 
         return string.Empty;
     }
-
     private string ToAbsoluteProjectPath(string path)
     {
         string normalized = path.Replace('/', Path.DirectorySeparatorChar).Replace('\\', Path.DirectorySeparatorChar);
@@ -752,7 +750,7 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
         return Path.GetFullPath(Path.Combine(projectRoot, normalized));
     }
 
-    // ── safe articulation helpers ─────────────────────────────────────────────
+    // Safe articulation helpers
 
     private readonly List<float> _cacheProbe = new List<float>();
 
@@ -810,7 +808,7 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
         return result;
     }
 
-    // ── episode lifecycle ─────────────────────────────────────────────────────
+    // Episode lifecycle
 
     public override void OnEpisodeBegin()
     {
@@ -996,7 +994,7 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
         bool hasMotionData = itpData != null && itpData.Count > 0;
         if (hasMotionData)
         {
-            if (useExternalReplayData)
+            if (useExternalReplayData && isLiveRealtimeCsv)
             {
                 realtimeFrameCursor = Mathf.Clamp(realtimeFrameCursor, 0f, itpData.Count - 1);
                 if (ReplayCsvUtility.SampleRowsAtFrame(itpData, realtimeFrameCursor, ExpectedCsvColumns, realtimeSampledData))
@@ -1083,7 +1081,7 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
 
         if (itpData != null && currentFrame < itpData.Count - 1)
         {
-            if (useExternalReplayData)
+            if (useExternalReplayData && isLiveRealtimeCsv)
             {
                 realtimeFrameCursor = ReplayCsvUtility.AdvanceRealtimeCursor(
                     realtimeFrameCursor,

@@ -112,6 +112,15 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, I
     [SerializeField] private bool writeReplayJointPositionsDirectly = true;
     [SerializeField] private bool zeroReplayJointVelocitiesOnDirectWrite = true;
 
+    private enum ReplayDataMode
+    {
+        DatasetReplay,
+        ExternalCsvReplay,
+        LiveRealtimeCsv
+    }
+
+    private ReplayDataMode replayDataMode = ReplayDataMode.DatasetReplay;
+
     private static readonly string[] DefaultDatasetSearchPaths =
     {
         "Assets/Gewu/Imitation/dataset/openloong",
@@ -149,11 +158,27 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, I
 
     public string RobotKey => string.IsNullOrWhiteSpace(robotKey) ? "openloong" : robotKey.Trim();
     public GameObject AgentGameObject => gameObject;
-    public bool UseExternalReplayData { get => useExternalReplayData; set => useExternalReplayData = value; }
+    public bool UseExternalReplayData
+    {
+        get => useExternalReplayData;
+        set
+        {
+            useExternalReplayData = value;
+            if (!value)
+            {
+                replayDataMode = ReplayDataMode.DatasetReplay;
+            }
+            else if (replayDataMode != ReplayDataMode.LiveRealtimeCsv)
+            {
+                replayDataMode = ReplayDataMode.ExternalCsvReplay;
+            }
+        }
+    }
     public bool ReplayMode { get => replay; set => replay = value; }
     public int MotionId { get; set; }
     public void RequestEndEpisode() => EndEpisode();
     public int ExpectedCsvColumns => ExpectedCols;
+    private bool IsLiveRealtimeCsv => useExternalReplayData && replayDataMode == ReplayDataMode.LiveRealtimeCsv;
 
     public void SetRobotSelectedInScene(bool isSelected)
     {
@@ -170,6 +195,7 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, I
 
         UseExternalReplayData = false;
         ReplayMode = false;
+        replayDataMode = ReplayDataMode.DatasetReplay;
         rootArticulation.immovable = false;
         rootArticulation.TeleportRoot(pos0, rot0);
         rootArticulation.velocity = Vector3.zero;
@@ -199,6 +225,7 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, I
         }
 
         MaxStep = 0;
+        replayDataMode = ReplayDataMode.LiveRealtimeCsv;
         refData = new List<float[]>();
         itpData = new List<float[]>();
         currentFrame = 0;
@@ -228,6 +255,7 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, I
         }
 
         UseExternalReplayData = false;
+        replayDataMode = ReplayDataMode.DatasetReplay;
     }
 
     public override void Initialize()
@@ -303,7 +331,7 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, I
         Array.Clear(uff, 0, uff.Length);
         Array.Clear(utotal, 0, utotal.Length);
         currentFrame = useExternalReplayData ? 0 : frame0;
-        if (useExternalReplayData)
+        if (IsLiveRealtimeCsv)
         {
             realtimeFrameCursor = 0f;
         }
@@ -356,7 +384,7 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, I
             return;
         }
 
-        if (useExternalReplayData)
+        if (IsLiveRealtimeCsv)
         {
             realtimeFrameCursor = Mathf.Clamp(realtimeFrameCursor, 0f, itpData.Count - 1);
             ApplyInterpolatedRealtimeFrame(realtimeFrameCursor, teleportRoot: replay);
@@ -379,7 +407,7 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, I
 
         if (currentFrame < itpData.Count - 1)
         {
-            if (useExternalReplayData)
+            if (IsLiveRealtimeCsv)
             {
                 realtimeFrameCursor = ReplayCsvUtility.AdvanceRealtimeCursor(
                     realtimeFrameCursor,
@@ -422,6 +450,9 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, I
             return false;
         }
 
+        replayDataMode = ReplayDataMode.ExternalCsvReplay;
+        useExternalReplayData = true;
+        realtimeFrameCursor = 0f;
         return ApplyReplayData(data, keepProgress);
     }
 
@@ -429,6 +460,9 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, I
     {
         if (rootArticulation == null) return;
 
+        UseExternalReplayData = false;
+        ReplayMode = false;
+        replayDataMode = ReplayDataMode.DatasetReplay;
         rootArticulation.immovable = false;
         rootArticulation.TeleportRoot(pos0, rot0);
         rootArticulation.velocity = Vector3.zero;
@@ -479,6 +513,7 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, I
         {
             appliedRowDebugCount = 0;
         }
+        realtimeFrameCursor = currentFrame;
         return true;
     }
 
@@ -845,24 +880,13 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, I
 
     private string ResolveDatasetPath()
     {
-        var candidates = new List<string>();
-        if (!string.IsNullOrWhiteSpace(datasetRelativePath))
+        if (ImitationDatasetPaths.TryResolveRobotDatasetPath("openloong", datasetRelativePath, DefaultDatasetSearchPaths, out string resolved, out _))
         {
-            candidates.Add(ToAbsoluteProjectPath(datasetRelativePath));
+            return resolved;
         }
 
-        foreach (string fallback in DefaultDatasetSearchPaths)
-        {
-            string abs = ToAbsoluteProjectPath(fallback);
-            if (!string.IsNullOrWhiteSpace(abs) && !candidates.Contains(abs))
-            {
-                candidates.Add(abs);
-            }
-        }
-
-        return candidates.FirstOrDefault(Directory.Exists) ?? string.Empty;
+        return string.Empty;
     }
-
     private string ToAbsoluteProjectPath(string path)
     {
         string normalized = path.Replace('/', Path.DirectorySeparatorChar).Replace('\\', Path.DirectorySeparatorChar);

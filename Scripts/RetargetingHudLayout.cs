@@ -5,6 +5,7 @@ using System.Reflection;
 using TMPro;
 using UnityEngine;
 using UnityEngine.EventSystems;
+using UnityEngine.Rendering;
 using UnityEngine.SceneManagement;
 using UnityEngine.UI;
 
@@ -12,19 +13,24 @@ using UnityEngine.UI;
 [DefaultExecutionOrder(-10000)]
 public sealed class RetargetingHudLayout : MonoBehaviour
 {
-    private static readonly Color PanelBlue = new Color(0.58f, 0.75f, 0.86f, 0.42f);
-    private static readonly Color DrawerShell = new Color(0.55f, 0.78f, 0.92f, 0.38f);
+    private const string HudHostName = "RetargetingHudLayoutHost";
+    private const string HudRootName = "RuntimeHUDRoot";
+    private const string MainImitationScenePath = "Assets/Imitation/G1.unity";
+    private const string ReplayImitationScenePath = "Assets/Imitation/G1Replay.unity";
+
+    private static readonly Color PanelBlue = new Color(0.58f, 0.75f, 0.86f, 0.34f);
+    private static readonly Color DrawerShell = new Color(0.55f, 0.78f, 0.92f, 0.30f);
     private static readonly Color DrawerContent = new Color(0.06f, 0.12f, 0.18f, 0.68f);
     private static readonly Color DropdownCaption = new Color(0.56f, 0.72f, 0.82f, 0.52f);
     private static readonly Color DropdownList = new Color(0.02f, 0.06f, 0.11f, 0.98f);
-    private static readonly Color HomeColor = new Color(0.00f, 0.58f, 0.34f, 0.78f);
-    private static readonly Color StartColor = new Color(0.24f, 0.42f, 0.68f, 0.82f);
-    private static readonly Color ReplayColor = new Color(0.23f, 0.62f, 0.45f, 0.82f);
-    private static readonly Color StopColor = new Color(0.68f, 0.32f, 0.34f, 0.82f);
-    private static readonly Color SwitchColor = new Color(0.24f, 0.58f, 0.68f, 0.82f);
-    private static readonly Color WhamColor = new Color(0.02f, 0.42f, 0.78f, 0.96f);
-    private static readonly Color GmrColor = new Color(0.02f, 0.58f, 0.31f, 0.96f);
-    private static readonly Color ParamsColor = new Color(0.46f, 0.22f, 0.72f, 0.96f);
+    private static readonly Color HomeColor = new Color(0.00f, 0.78f, 0.40f, 0.78f);
+    private static readonly Color StartColor = new Color(0.00f, 0.30f, 1.00f, 0.82f);
+    private static readonly Color ReplayColor = new Color(0.00f, 0.84f, 0.38f, 0.82f);
+    private static readonly Color StopColor = new Color(1.00f, 0.04f, 0.06f, 0.82f);
+    private static readonly Color SwitchColor = new Color(0.00f, 0.72f, 1.00f, 0.78f);
+    private static readonly Color WhamColor = new Color(0.00f, 0.36f, 1.00f, 0.88f);
+    private static readonly Color GmrColor = new Color(0.00f, 0.78f, 0.32f, 0.88f);
+    private static readonly Color ParamsColor = new Color(0.72f, 0.16f, 1.00f, 0.88f);
     private static readonly Color CloseColor = new Color(1.0f, 0.12f, 0.14f, 0.96f);
 
     private readonly List<Graphic> ownedGraphics = new List<Graphic>();
@@ -55,6 +61,8 @@ public sealed class RetargetingHudLayout : MonoBehaviour
     private StreamReceiver streamReceiver;
     private StartInput startInput;
     private bool built;
+    private static Material unifiedBlurMaterial;
+    private static Material builtinBlurMaterial;
 
     private sealed class ParamControl
     {
@@ -74,13 +82,31 @@ public sealed class RetargetingHudLayout : MonoBehaviour
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
     private static void Bootstrap()
     {
+        SceneManager.sceneLoaded -= OnSceneLoaded;
+        SceneManager.sceneLoaded += OnSceneLoaded;
+        TryBootstrapForScene(SceneManager.GetActiveScene());
+    }
+
+    private static void OnSceneLoaded(Scene scene, LoadSceneMode mode)
+    {
+        TryBootstrapForScene(scene);
+    }
+
+    private static void TryBootstrapForScene(Scene scene)
+    {
+        if (!IsImitationScene(scene))
+        {
+            CleanupGeneratedHudObjects();
+            return;
+        }
+
         if (FindObjectOfType<RetargetingHudLayout>(true) != null)
         {
             return;
         }
 
         Canvas sceneCanvas = FindBestCanvasStatic();
-        var host = new GameObject("RetargetingHudLayoutHost", typeof(RectTransform));
+        var host = new GameObject(HudHostName, typeof(RectTransform));
         if (sceneCanvas != null)
         {
             host.transform.SetParent(sceneCanvas.transform, false);
@@ -98,7 +124,19 @@ public sealed class RetargetingHudLayout : MonoBehaviour
 
     private static void EnsureEditorHudHost()
     {
-        if (Application.isPlaying || FindObjectOfType<RetargetingHudLayout>(true) != null)
+        if (Application.isPlaying)
+        {
+            return;
+        }
+
+        Scene activeScene = SceneManager.GetActiveScene();
+        if (!IsImitationScene(activeScene))
+        {
+            CleanupGeneratedHudObjects();
+            return;
+        }
+
+        if (FindObjectOfType<RetargetingHudLayout>(true) != null)
         {
             return;
         }
@@ -109,10 +147,10 @@ public sealed class RetargetingHudLayout : MonoBehaviour
             return;
         }
 
-        var host = GameObject.Find("RetargetingHudLayoutHost");
+        var host = GameObject.Find(HudHostName);
         if (host == null)
         {
-            host = new GameObject("RetargetingHudLayoutHost", typeof(RectTransform));
+            host = new GameObject(HudHostName, typeof(RectTransform));
             host.transform.SetParent(sceneCanvas.transform, false);
             UnityEditor.Undo.RegisterCreatedObjectUndo(host, "Create retargeting HUD layout host");
         }
@@ -127,6 +165,13 @@ public sealed class RetargetingHudLayout : MonoBehaviour
 
     private void OnEnable()
     {
+        if (!IsImitationScene(gameObject.scene))
+        {
+            CleanupGeneratedHudObjects();
+            DestroyThisComponentHost();
+            return;
+        }
+
         Build();
     }
 
@@ -137,6 +182,13 @@ public sealed class RetargetingHudLayout : MonoBehaviour
 
     private void Update()
     {
+        if (!IsImitationScene(gameObject.scene))
+        {
+            CleanupGeneratedHudObjects();
+            DestroyThisComponentHost();
+            return;
+        }
+
         SelectedRobotCameraFollow.EnsureAtLeastOneRenderingCamera();
         SyncRealtimeUiState();
         UpdateProgressPanel();
@@ -145,13 +197,19 @@ public sealed class RetargetingHudLayout : MonoBehaviour
 
     private void Build()
     {
+        if (!IsImitationScene(gameObject.scene))
+        {
+            CleanupGeneratedHudObjects();
+            return;
+        }
+
         if (built)
         {
             return;
         }
 
         startInput = FindObjectOfType<StartInput>(true);
-        streamReceiver = FindObjectOfType<StreamReceiver>(true);
+        streamReceiver = ResolveStreamReceiverForHud();
         canvas = FindBestCanvas();
         if (canvas == null)
         {
@@ -163,7 +221,7 @@ public sealed class RetargetingHudLayout : MonoBehaviour
         EnsureCanvasScaler(canvas.gameObject);
         EnsureEventSystem();
 
-        var existingRoot = GameObject.Find("RuntimeHUDRoot");
+        var existingRoot = GameObject.Find(HudRootName);
         if (existingRoot != null)
         {
             DetachPreservedHudObjects(existingRoot.transform, canvas.transform);
@@ -177,7 +235,7 @@ public sealed class RetargetingHudLayout : MonoBehaviour
         paramStaticRows.Clear();
         paramGroups.Clear();
 
-        hudRoot = CreateRect("RuntimeHUDRoot", canvas.transform);
+        hudRoot = CreateRect(HudRootName, canvas.transform);
         Stretch(hudRoot);
 
         var movedRoots = new HashSet<Transform>();
@@ -190,7 +248,7 @@ public sealed class RetargetingHudLayout : MonoBehaviour
 
     private void BuildControlDock(HashSet<Transform> movedRoots)
     {
-        RectTransform controlDock = CreatePanel("ControlDock", hudRoot, PanelBlue);
+        RectTransform controlDock = CreatePanel("ControlDock", hudRoot, PanelBlue, blur: true);
         AnchorTopLeft(controlDock, new Vector2(24f, -18f), new Vector2(420f, 760f));
         controlDock.gameObject.AddComponent<HudDragHandle>().Initialize(controlDock, hudRoot);
 
@@ -248,7 +306,7 @@ public sealed class RetargetingHudLayout : MonoBehaviour
 
     private void BuildProgressPanel()
     {
-        RectTransform panel = CreatePanel("StartProgressPanel", hudRoot, new Color(0.02f, 0.05f, 0.08f, 0.72f));
+        RectTransform panel = CreatePanel("StartProgressPanel", hudRoot, new Color(0.02f, 0.05f, 0.08f, 0.72f), blur: true);
         panel.anchorMin = new Vector2(0.5f, 0f);
         panel.anchorMax = new Vector2(0.5f, 0f);
         panel.pivot = new Vector2(0.5f, 0f);
@@ -286,7 +344,7 @@ public sealed class RetargetingHudLayout : MonoBehaviour
         string placeholderText,
         HashSet<Transform> movedRoots)
     {
-        RectTransform panel = CreatePanel(name, hudRoot, DrawerShell);
+        RectTransform panel = CreatePanel(name, hudRoot, DrawerShell, blur: true);
         panel.anchorMin = new Vector2(0.5f, 0.5f);
         panel.anchorMax = new Vector2(0.5f, 0.5f);
         panel.pivot = new Vector2(0.5f, 0.5f);
@@ -341,7 +399,7 @@ public sealed class RetargetingHudLayout : MonoBehaviour
 
     private CanvasGroup CreateParamsDrawer()
     {
-        RectTransform panel = CreatePanel("PARAMSDrawer", hudRoot, DrawerShell);
+        RectTransform panel = CreatePanel("PARAMSDrawer", hudRoot, DrawerShell, blur: true);
         panel.anchorMin = new Vector2(0.5f, 0.5f);
         panel.anchorMax = new Vector2(0.5f, 0.5f);
         panel.pivot = new Vector2(0.5f, 0.5f);
@@ -673,7 +731,8 @@ public sealed class RetargetingHudLayout : MonoBehaviour
             return;
         }
 
-        if (startInput.TrySetRuntimeParameter(field.Name, value, out string error))
+        string error = string.Empty;
+        if (startInput.TrySetRuntimeParameter(field.Name, value, out error))
         {
             return;
         }
@@ -938,11 +997,18 @@ public sealed class RetargetingHudLayout : MonoBehaviour
         }
     }
 
+    private static StreamReceiver ResolveStreamReceiverForHud()
+    {
+        return Application.isPlaying
+            ? StreamReceiver.EnsureReceiverHost()
+            : FindObjectOfType<StreamReceiver>(true);
+    }
+
     private void UpdateStreamReceiverStatus()
     {
         if (streamReceiver == null)
         {
-            streamReceiver = FindObjectOfType<StreamReceiver>(true);
+            streamReceiver = ResolveStreamReceiverForHud();
             BindStreamReceiverTargets();
         }
 
@@ -974,7 +1040,7 @@ public sealed class RetargetingHudLayout : MonoBehaviour
     {
         if (streamReceiver == null)
         {
-            streamReceiver = FindObjectOfType<StreamReceiver>(true);
+            streamReceiver = ResolveStreamReceiverForHud();
         }
 
         if (streamReceiver != null && whamVideoSurface != null && gmrVideoSurface != null)
@@ -1352,7 +1418,60 @@ public sealed class RetargetingHudLayout : MonoBehaviour
         return compact.Length <= maxChars ? compact : compact.Substring(0, Mathf.Max(0, maxChars - 3)) + "...";
     }
 
-    private RectTransform CreatePanel(string name, Transform parent, Color color)
+    private static bool IsImitationScene(Scene scene)
+    {
+        string path = scene.path ?? string.Empty;
+        if (string.Equals(path, MainImitationScenePath, StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(path, ReplayImitationScenePath, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        string name = scene.name ?? string.Empty;
+        return string.Equals(name, "G1", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(name, "G1Replay", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static void CleanupGeneratedHudObjects()
+    {
+        DestroyGeneratedObject(GameObject.Find(HudRootName));
+        DestroyGeneratedObject(GameObject.Find(HudHostName));
+    }
+
+    private void DestroyThisComponentHost()
+    {
+        if (this == null)
+        {
+            return;
+        }
+
+        if (gameObject.name == HudHostName)
+        {
+            DestroyGeneratedObject(gameObject);
+            return;
+        }
+
+        DestroyGeneratedObject(this);
+    }
+
+    private static void DestroyGeneratedObject(UnityEngine.Object target)
+    {
+        if (target == null)
+        {
+            return;
+        }
+
+        if (Application.isPlaying)
+        {
+            Destroy(target);
+        }
+        else
+        {
+            DestroyImmediate(target);
+        }
+    }
+
+    private RectTransform CreatePanel(string name, Transform parent, Color color, bool blur = false)
     {
         RectTransform rect = CreateRect(name, parent);
         Image image = rect.gameObject.AddComponent<Image>();
@@ -1360,9 +1479,86 @@ public sealed class RetargetingHudLayout : MonoBehaviour
         image.fillCenter = true;
         image.preserveAspect = false;
         image.color = color;
+        if (blur)
+        {
+            ApplyUnifiedBlurMaterial(image);
+        }
         image.raycastTarget = true;
         ownedGraphics.Add(image);
         return rect;
+    }
+
+    private static void ApplyUnifiedBlurMaterial(Graphic graphic)
+    {
+        Material material = ResolveUnifiedBlurMaterial();
+        graphic.material = material;
+    }
+
+    private static Material ResolveUnifiedBlurMaterial()
+    {
+        if (!IsUniversalRenderPipelineActive())
+        {
+            return ResolveBuiltinBlurMaterial();
+        }
+
+        if (unifiedBlurMaterial != null)
+        {
+            return unifiedBlurMaterial;
+        }
+
+        unifiedBlurMaterial = Resources.Load<Material>("RetargetingUniversalBlur");
+        if (unifiedBlurMaterial != null)
+        {
+            return unifiedBlurMaterial;
+        }
+
+        Shader shader = Shader.Find("Unify/UI/Tinted Blur");
+        if (shader != null)
+        {
+            unifiedBlurMaterial = new Material(shader)
+            {
+                name = "Runtime Retargeting Universal Blur"
+            };
+        }
+
+        return unifiedBlurMaterial;
+    }
+
+    private static Material ResolveBuiltinBlurMaterial()
+    {
+        if (builtinBlurMaterial != null)
+        {
+            return builtinBlurMaterial;
+        }
+
+        builtinBlurMaterial = Resources.Load<Material>("RetargetingBuiltinUIBlur");
+        if (builtinBlurMaterial != null)
+        {
+            return builtinBlurMaterial;
+        }
+
+        Shader shader = Shader.Find("UI/Blur");
+        if (shader != null)
+        {
+            builtinBlurMaterial = new Material(shader)
+            {
+                name = "Runtime Retargeting Builtin UI Blur"
+            };
+            builtinBlurMaterial.SetFloat("_Opacity", 0.72f);
+            builtinBlurMaterial.SetFloat("_Size", 2.4f);
+        }
+
+        return builtinBlurMaterial;
+    }
+
+    private static bool IsUniversalRenderPipelineActive()
+    {
+        RenderPipelineAsset active = GraphicsSettings.currentRenderPipeline != null
+            ? GraphicsSettings.currentRenderPipeline
+            : QualitySettings.renderPipeline;
+        string typeName = active != null ? active.GetType().FullName : string.Empty;
+        return !string.IsNullOrEmpty(typeName) &&
+               typeName.IndexOf("UniversalRenderPipelineAsset", StringComparison.OrdinalIgnoreCase) >= 0;
     }
 
     private static Canvas FindBestCanvas()
@@ -1617,9 +1813,9 @@ public sealed class HudButtonFeedback : MonoBehaviour, IPointerEnterHandler, IPo
         image = GetComponent<Image>();
         button = GetComponent<Button>();
         normal = normalColor;
-        hover = Color.Lerp(normalColor, Color.black, 0.18f);
+        hover = Color.Lerp(normalColor, Color.black, 0.22f);
         hover.a = Mathf.Clamp01(normalColor.a + 0.12f);
-        pressed = Color.Lerp(normalColor, Color.black, 0.36f);
+        pressed = Color.Lerp(normalColor, Color.black, 0.42f);
         pressed.a = Mathf.Clamp01(normalColor.a + 0.14f);
         disabled = new Color(0.30f, 0.34f, 0.38f, 0.42f);
         Apply();

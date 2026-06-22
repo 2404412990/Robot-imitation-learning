@@ -2287,6 +2287,11 @@ public class StartInput : MonoBehaviour
         bool effectiveTcpStreaming = streamWhamToUnity || streamGmrToUnity;
         bool effectiveRecordGmrVideo = recordGmrVideo && !(enableTcpStreaming && disablePreviewVideoWhenTcpStreaming);
         bool effectiveRecordWhamVideo = recordWhamVideo && !(enableTcpStreaming && disablePreviewVideoWhenTcpStreaming);
+        if (effectiveTcpStreaming && !EnsureUnityStreamReceiverReady(streamWhamToUnity, streamGmrToUnity))
+        {
+            return false;
+        }
+
         ClearDisabledStreamReceiverTargets(streamWhamToUnity, streamGmrToUnity);
         ClearDisabledRecordingOutputs(resolvedOutputRootPath, effectiveRecordWhamVideo, effectiveRecordGmrVideo);
         string requestedGmrTorchDevice = string.IsNullOrWhiteSpace(gmrTorchDevice) ? "cpu" : gmrTorchDevice.Trim();
@@ -2493,6 +2498,21 @@ public class StartInput : MonoBehaviour
         {
             receiver.ClearStream(1);
         }
+    }
+
+    private bool EnsureUnityStreamReceiverReady(bool streamWhamToUnity, bool streamGmrToUnity)
+    {
+        StreamReceiver receiver = StreamReceiver.EnsureReceiverHost();
+        if (receiver == null || !receiver.IsListening)
+        {
+            SetPipelineStartupError("Unity TCP StreamReceiver is not listening; Python would receive WinError 10061.");
+            return false;
+        }
+
+        Debug.Log(
+            $"[StartInput] Unity TCP StreamReceiver ready on {receiver.BindAddress}:{receiver.Port} " +
+            $"(WHAM={(streamWhamToUnity ? "on" : "off")}, GMR={(streamGmrToUnity ? "on" : "off")}).");
+        return true;
     }
 
     private void ClearDisabledRecordingOutputs(string outputRootPath, bool effectiveRecordWhamVideo, bool effectiveRecordGmrVideo)
@@ -2798,7 +2818,7 @@ public class StartInput : MonoBehaviour
     {
         csvWorkerRunning = true;
         int sleepMs = System.Math.Max(20, (int)System.Math.Round(csvPollInterval * 1000f));
-        float emptyWarningSeconds = System.Math.Max(1f, csvNoDataWarningSeconds);
+        float emptyWarningSeconds = System.Math.Max(60f, csvNoDataWarningSeconds);
         bool logChanges = logCsvChangeEvents && emitRealtimeCsvAppendLogsToConsole;
         bool estimateProducerFps = estimateRealtimeCsvProducerFps;
         float configuredFallbackFps = ClampRealtimeCsvFps(defaultRealtimeCsvFps);
@@ -2880,7 +2900,8 @@ public class StartInput : MonoBehaviour
                     }
 
                     System.DateTime nowUtc = System.DateTime.UtcNow;
-                    if ((nowUtc - monitorStartUtc).TotalSeconds >= emptyWarningSeconds &&
+                    double emptyElapsedSeconds = (nowUtc - monitorStartUtc).TotalSeconds;
+                    if (emptyElapsedSeconds >= emptyWarningSeconds &&
                         (lastEmptyWarningUtc == System.DateTime.MinValue || (nowUtc - lastEmptyWarningUtc).TotalSeconds >= emptyWarningSeconds))
                     {
                         bool processAlive = false;
@@ -2893,10 +2914,14 @@ public class StartInput : MonoBehaviour
                         }
                         catch { }
 
+                        QueuedUnityLogType emptyLogType = (!processAlive || emptyElapsedSeconds >= System.Math.Max(120f, emptyWarningSeconds * 2f))
+                            ? QueuedUnityLogType.Warning
+                            : QueuedUnityLogType.Log;
+
                         QueueUnityLog(
-                            $"[StartInput] live_motion.csv is still empty. elapsed={(nowUtc - monitorStartUtc).TotalSeconds:F1}s, " +
+                            $"[StartInput] live_motion.csv is still empty. elapsed={emptyElapsedSeconds:F1}s, " +
                             $"processAlive={processAlive}, pid={pid}, csv='{csvPath}'. Check [Pipeline]/[Pipeline-ERR] logs.",
-                            QueuedUnityLogType.Warning);
+                            emptyLogType);
                         lastEmptyWarningUtc = nowUtc;
                     }
 

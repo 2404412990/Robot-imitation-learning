@@ -115,10 +115,7 @@ public class FileBrowser : MonoBehaviour
         string resolved = ResolveExistingFolderPath();
         if (string.IsNullOrEmpty(resolved))
         {
-            string tried = folderPath +
-                (fallbackFolderPaths != null && fallbackFolderPaths.Count > 0
-                    ? " | " + string.Join(" | ", fallbackFolderPaths)
-                    : string.Empty);
+            ImitationDatasetPaths.TryResolveDatasetPath(folderPath, fallbackFolderPaths, out _, out string tried);
             Debug.LogWarning($"[FileBrowser] Folder path not found. Tried: {tried}");
 
             if (preserveManualOptionsOnFailure && dropdown.options != null && dropdown.options.Count > 0)
@@ -159,46 +156,9 @@ public class FileBrowser : MonoBehaviour
 
     private string ResolveExistingFolderPath()
     {
-        if (TryResolveAbsolute(folderPath, out string abs) && Directory.Exists(abs)) return abs;
-
-        if (fallbackFolderPaths != null)
-        {
-            foreach (string candidate in fallbackFolderPaths)
-            {
-                if (TryResolveAbsolute(candidate, out string fb) && Directory.Exists(fb)) return fb;
-            }
-        }
-        return string.Empty;
-    }
-
-    private static bool TryResolveAbsolute(string raw, out string absolute)
-    {
-        absolute = null;
-        if (string.IsNullOrWhiteSpace(raw)) return false;
-
-        string normalized = raw.Trim()
-            .Replace('/', Path.DirectorySeparatorChar)
-            .Replace('\\', Path.DirectorySeparatorChar);
-
-        try
-        {
-            if (Path.IsPathRooted(normalized))
-            {
-                absolute = Path.GetFullPath(normalized);
-                return true;
-            }
-
-            string projectRoot = Directory.GetParent(Application.dataPath)?.FullName;
-            if (string.IsNullOrWhiteSpace(projectRoot)) return false;
-
-            absolute = Path.GetFullPath(Path.Combine(projectRoot, normalized));
-            return true;
-        }
-        catch
-        {
-            absolute = null;
-            return false;
-        }
+        return ImitationDatasetPaths.TryResolveDatasetPath(folderPath, fallbackFolderPaths, out string resolved, out _)
+            ? resolved
+            : string.Empty;
     }
 
     private void PopulateStaticOptions()

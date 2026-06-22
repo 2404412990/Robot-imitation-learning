@@ -59,6 +59,15 @@ public class StreamReceiver : MonoBehaviour
     private long _gmrReceivedFrames;
     private long _whamShownFrames;
     private long _gmrShownFrames;
+    private long _lastWhamReceivedSample;
+    private long _lastGmrReceivedSample;
+    private long _lastWhamShownSample;
+    private long _lastGmrShownSample;
+    private float _lastFpsSampleTime = -1f;
+    private float _whamReceiveFps;
+    private float _gmrReceiveFps;
+    private float _whamShownFps;
+    private float _gmrShownFps;
     private float _lastWhamFrameTime = -1f;
     private float _lastGmrFrameTime = -1f;
     private readonly Dictionary<RawImage, Vector2> _initialImageSizes = new Dictionary<RawImage, Vector2>();
@@ -105,6 +114,51 @@ public class StreamReceiver : MonoBehaviour
     private readonly List<TcpClient> _activeClients = new List<TcpClient>();
 
     public bool IsListening => _listener != null;
+    public string BindAddress => bindAddress;
+    public int Port => port;
+
+    public static StreamReceiver EnsureReceiverHost()
+    {
+        StreamReceiver receiver = FindObjectOfType<StreamReceiver>(true);
+        if (receiver == null || !receiver.gameObject.activeInHierarchy)
+        {
+            GameObject host = GameObject.Find("StreamReceiverHost");
+            if (host == null)
+            {
+                host = new GameObject("StreamReceiverHost");
+            }
+
+            receiver = host.GetComponent<StreamReceiver>();
+            if (receiver == null)
+            {
+                receiver = host.AddComponent<StreamReceiver>();
+            }
+        }
+
+        receiver.EnsureListening();
+        return receiver;
+    }
+
+    public bool EnsureListening()
+    {
+        if (!gameObject.activeSelf)
+        {
+            gameObject.SetActive(true);
+        }
+
+        if (!enabled)
+        {
+            enabled = true;
+        }
+
+        _running = true;
+        if (_listener == null)
+        {
+            StartListener();
+        }
+
+        return _listener != null;
+    }
 
     public void ConfigureTargets(RawImage whamTarget, RawImage gmrTarget)
     {
@@ -138,14 +192,26 @@ public class StreamReceiver : MonoBehaviour
     {
         RawImage target = streamId == 0 ? whamRawImage : gmrRawImage;
         Texture texture = target != null ? target.texture : null;
-        long received = streamId == 0 ? _whamReceivedFrames : _gmrReceivedFrames;
-        long shown = streamId == 0 ? _whamShownFrames : _gmrShownFrames;
-        float lastTime = streamId == 0 ? _lastWhamFrameTime : _lastGmrFrameTime;
-        string client = HasClient ? "client: connected" : "client: waiting";
+        long received;
+        long shown;
+        float receiveFps;
+        float shownFps;
+        float lastTime;
+        bool hasClient;
+        lock (_lock)
+        {
+            received = streamId == 0 ? _whamReceivedFrames : _gmrReceivedFrames;
+            shown = streamId == 0 ? _whamShownFrames : _gmrShownFrames;
+            receiveFps = streamId == 0 ? _whamReceiveFps : _gmrReceiveFps;
+            shownFps = streamId == 0 ? _whamShownFps : _gmrShownFps;
+            lastTime = streamId == 0 ? _lastWhamFrameTime : _lastGmrFrameTime;
+            hasClient = _activeClients.Count > 0;
+        }
+        string client = hasClient ? "client: connected" : "client: waiting";
         string last = lastTime >= 0f ? $"{Time.unscaledTime - lastTime:F1}s ago" : "never";
         string tex = texture != null ? $"{texture.width}x{texture.height}" : "none";
         string rect = target != null ? $"{Mathf.RoundToInt(target.rectTransform.rect.width)}x{Mathf.RoundToInt(target.rectTransform.rect.height)}" : "missing";
-        return $"{label} | {bindAddress}:{port} | {(IsListening ? "listening" : "closed")} | {client} | rx {received} / shown {shown} | last {last} | tex {tex} | target {rect}";
+        return $"{label} | {bindAddress}:{port} | {(IsListening ? "listening" : "closed")} | {client} | rx(TCP) {received} @ {receiveFps:F1} fps | shown(UI) {shown} @ {shownFps:F1} fps | last {last} | tex {tex} | target {rect}";
     }
 
     // ── Unity 生命周期 ────────────────────────────────────────────────────
@@ -203,6 +269,41 @@ public class StreamReceiver : MonoBehaviour
         {
             _activeClients.RemoveAll(c => !c.Connected);
         }
+
+        UpdateRollingFps(now);
+    }
+
+    private void UpdateRollingFps(float now)
+    {
+        lock (_lock)
+        {
+            if (_lastFpsSampleTime < 0f)
+            {
+                _lastFpsSampleTime = now;
+                _lastWhamReceivedSample = _whamReceivedFrames;
+                _lastGmrReceivedSample = _gmrReceivedFrames;
+                _lastWhamShownSample = _whamShownFrames;
+                _lastGmrShownSample = _gmrShownFrames;
+                return;
+            }
+
+            float dt = now - _lastFpsSampleTime;
+            if (dt < 1f)
+            {
+                return;
+            }
+
+            _whamReceiveFps = (_whamReceivedFrames - _lastWhamReceivedSample) / dt;
+            _gmrReceiveFps = (_gmrReceivedFrames - _lastGmrReceivedSample) / dt;
+            _whamShownFps = (_whamShownFrames - _lastWhamShownSample) / dt;
+            _gmrShownFps = (_gmrShownFrames - _lastGmrShownSample) / dt;
+
+            _lastFpsSampleTime = now;
+            _lastWhamReceivedSample = _whamReceivedFrames;
+            _lastGmrReceivedSample = _gmrReceivedFrames;
+            _lastWhamShownSample = _whamShownFrames;
+            _lastGmrShownSample = _gmrShownFrames;
+        }
     }
 
     // ── 监听 ──────────────────────────────────────────────────────────────
@@ -226,6 +327,8 @@ public class StreamReceiver : MonoBehaviour
         }
         catch (Exception e)
         {
+            try { _listener?.Stop(); } catch { }
+            _listener = null;
             Debug.LogError($"[StreamRecv] 启动监听失败: {e.Message}");
         }
     }

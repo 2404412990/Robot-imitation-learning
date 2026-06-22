@@ -1,4 +1,4 @@
-using System.Collections.Generic;
+﻿using System.Collections.Generic;
 using System.IO;
 using TMPro;
 using UnityEngine;
@@ -86,15 +86,14 @@ public class Replay : MonoBehaviour
         IMimicAgent agent = ResolveActiveAgent();
         if (agent == null)
         {
-            Debug.LogError("未找到任何已注册的 IMimicAgent，无法执行 replay。" +
-                           "\n请确认场景里至少挂有一个实现 IMimicAgent 的机器人脚本。");
+            Debug.LogError("[Replay] No registered IMimicAgent found. Add a robot agent implementing IMimicAgent to the scene.");
             return;
         }
 
         string selectedCsvName = GetSelectedCsvName();
         if (string.IsNullOrWhiteSpace(selectedCsvName))
         {
-            Debug.LogWarning("下拉列表没有可用的 csv 选项，无法执行 replay。");
+            Debug.LogWarning("[Replay] No CSV option is selected.");
             return;
         }
 
@@ -140,7 +139,7 @@ public class Replay : MonoBehaviour
         agent.MotionId = motionId >= 0 ? motionId : 0;
         agent.RequestEndEpisode();
 
-        Debug.Log($"开始 replay (path): robot={agent.RobotKey}, csv={selectedCsvName}, path={csvAbsolutePath}");
+        Debug.Log($"[Replay] Started replay from path: robot={agent.RobotKey}, csv={selectedCsvName}, path={csvAbsolutePath}");
     }
 
     /// <summary>
@@ -274,11 +273,11 @@ public class Replay : MonoBehaviour
             csvListDropdown = FindObjectOfType<TMP_Dropdown>();
         }
 
-        // targetAgentBehaviour is optional — resolution falls back to
+        // targetAgentBehaviour is optional; resolution falls back to
         // MimicAgentRegistry when it's left empty (see ResolveActiveAgent).
         if (targetAgentBehaviour != null && !(targetAgentBehaviour is IMimicAgent))
         {
-            Debug.LogWarning("[Replay] targetAgentBehaviour 不是 IMimicAgent 实现，已忽略。");
+            Debug.LogWarning("[Replay] targetAgentBehaviour does not implement IMimicAgent and will be ignored.");
             targetAgentBehaviour = null;
         }
 
@@ -305,7 +304,22 @@ public class Replay : MonoBehaviour
         }
 
         string selectedText = csvListDropdown.options[csvListDropdown.value].text;
-        return selectedText == "(未找到文件)" ? string.Empty : selectedText;
+        return IsMissingFileOption(selectedText) ? string.Empty : selectedText;
+    }
+
+    private static bool IsMissingFileOption(string selectedText)
+    {
+        if (string.IsNullOrWhiteSpace(selectedText))
+        {
+            return true;
+        }
+
+        string normalized = selectedText.Trim();
+        return string.Equals(normalized, "(No files found)", System.StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(normalized, "(No CSV files found)", System.StringComparison.OrdinalIgnoreCase) ||
+               (normalized.StartsWith("(") &&
+                normalized.EndsWith(")") &&
+                normalized.IndexOf(".csv", System.StringComparison.OrdinalIgnoreCase) < 0);
     }
 
     private bool HasPersistentReplayHandler(Button button)
@@ -348,8 +362,6 @@ public class Replay : MonoBehaviour
 
     private string ResolveReplayDatasetPath(string robotKey)
     {
-        var candidatePaths = new List<string>();
-
         // 1) Inspector-configured primary + secondary paths.
         string robotFolder = ResolveRobotDatasetFolder(robotKey);
         if (string.IsNullOrWhiteSpace(robotFolder))
@@ -358,26 +370,27 @@ public class Replay : MonoBehaviour
             return string.Empty;
         }
 
-        AddRobotDatasetCandidate(candidatePaths, replayDatasetRelativePath, robotFolder);
-        AddRobotDatasetCandidate(candidatePaths, replayDatasetFallbackRelativePath, robotFolder);
+        var fallbackPaths = new List<string>();
+        if (!string.IsNullOrWhiteSpace(replayDatasetFallbackRelativePath))
+        {
+            fallbackPaths.Add(replayDatasetFallbackRelativePath);
+        }
 
-        // 2) Built-in fallback list — catches stale serialized typos.
+        // 2) Built-in fallback list 鈥?catches stale serialized typos.
         if (replayDatasetExtraFallbacks != null)
         {
             foreach (string extra in replayDatasetExtraFallbacks)
-                AddRobotDatasetCandidate(candidatePaths, extra, robotFolder);
+                fallbackPaths.Add(extra);
         }
 
-        foreach (string candidatePath in candidatePaths)
+        if (ImitationDatasetPaths.TryResolveRobotDatasetPath(robotFolder, replayDatasetRelativePath, fallbackPaths, out string resolved, out string tried))
         {
-            if (Directory.Exists(candidatePath))
-            {
-                return candidatePath;
-            }
+            return resolved;
         }
 
-        Debug.LogError($"replay 数据集目录不存在，已尝试:\n  {string.Join("\n  ", candidatePaths)}");
+        Debug.LogError($"Replay dataset folder not found for robot '{robotKey}'. Tried:\n  {tried.Replace(" | ", "\n  ")}");
         return string.Empty;
+
     }
 
     private static string ResolveRobotDatasetFolder(string robotKey)
