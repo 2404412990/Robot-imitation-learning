@@ -36,6 +36,13 @@ public class Move : MonoBehaviour
     void Start()
     {
         // 进入场景时自动锁定鼠标
+        if (SelectedRobotCameraFollow.FixedCameraModeActive)
+        {
+            SetCursorState(false);
+            enabled = false;
+            return;
+        }
+
         SetCursorState(true);
     }
 

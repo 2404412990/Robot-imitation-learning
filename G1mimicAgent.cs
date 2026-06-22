@@ -10,6 +10,7 @@ using System.Diagnostics;
 using System.Linq;
 using System;
 using System.Globalization;
+using System.Reflection;
 using Gewu.Imitation;
 
 public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelectableMimicAgent
@@ -43,6 +44,64 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
              "(swapped left/right traversal, wrist after shoulder, etc.), retargeting will " +
              "look wrong even though no other code changed.")]
     [SerializeField] private bool logJointMappingOnStart = true;
+    [SerializeField] private bool logReplayMirrorDiagnostics = false;
+    [SerializeField] private int replayMirrorDiagnosticIntervalFrames = 120;
+    [Tooltip("G1-only Unity articulation axis signs. Keep CSV order unchanged; adjust only entries proven by mirror diagnostics.")]
+    [SerializeField] private float[] unityJointSigns = new float[29]
+    {
+        1f, 1f, 1f, 1f, 1f, 1f,
+        1f, 1f, 1f, 1f, 1f, 1f,
+        1f, 1f, 1f,
+        1f, 1f, 1f, 1f, 1f, 1f, 1f,
+        1f, 1f, 1f, 1f, 1f, 1f, 1f
+    };
+
+    private static readonly string[][] G1CsvJointAliases =
+    {
+        new[] { "left_hip_pitch_joint", "left_hip_pitch_link" },
+        new[] { "left_hip_roll_joint", "left_hip_roll_link" },
+        new[] { "left_hip_yaw_joint", "left_hip_yaw_link" },
+        new[] { "left_knee_joint", "left_knee_link" },
+        new[] { "left_ankle_pitch_joint", "left_ankle_pitch_link", "left_ankle_joint", "left_ankle_link" },
+        new[] { "left_ankle_roll_joint", "left_ankle_roll_link" },
+
+        new[] { "right_hip_pitch_joint", "right_hip_pitch_link" },
+        new[] { "right_hip_roll_joint", "right_hip_roll_link" },
+        new[] { "right_hip_yaw_joint", "right_hip_yaw_link" },
+        new[] { "right_knee_joint", "right_knee_link" },
+        new[] { "right_ankle_pitch_joint", "right_ankle_pitch_link", "right_ankle_joint", "right_ankle_link" },
+        new[] { "right_ankle_roll_joint", "right_ankle_roll_link" },
+
+        new[] { "waist_yaw_joint", "waist_yaw_link" },
+        new[] { "waist_roll_joint", "waist_roll_link" },
+        new[] { "waist_pitch_joint", "waist_pitch_link", "torso_link" },
+
+        new[] { "left_shoulder_pitch_joint", "left_shoulder_pitch_link" },
+        new[] { "left_shoulder_roll_joint", "left_shoulder_roll_link" },
+        new[] { "left_shoulder_yaw_joint", "left_shoulder_yaw_link" },
+        new[] { "left_elbow_joint", "left_elbow_link" },
+        new[] { "left_wrist_roll_joint", "left_wrist_roll_link" },
+        new[] { "left_wrist_pitch_joint", "left_wrist_pitch_link" },
+        new[] { "left_wrist_yaw_joint", "left_wrist_yaw_link" },
+
+        new[] { "right_shoulder_pitch_joint", "right_shoulder_pitch_link" },
+        new[] { "right_shoulder_roll_joint", "right_shoulder_roll_link" },
+        new[] { "right_shoulder_yaw_joint", "right_shoulder_yaw_link" },
+        new[] { "right_elbow_joint", "right_elbow_link" },
+        new[] { "right_wrist_roll_joint", "right_wrist_roll_link" },
+        new[] { "right_wrist_pitch_joint", "right_wrist_pitch_link" },
+        new[] { "right_wrist_yaw_joint", "right_wrist_yaw_link" },
+    };
+
+    private bool g1JointMapValid;
+    private bool hasLoggedInvalidJointMap;
+    private bool hasLoggedDirectJointStateError;
+    private bool hasLoggedPartialDirectJointStateError;
+    private readonly List<Collider> replayMirrorColliders = new List<Collider>();
+    private readonly List<bool> replayMirrorColliderStates = new List<bool>();
+    private bool replayMirrorCollidersDisabled;
+    private static readonly PropertyInfo ArticulationJointNameProperty =
+        typeof(ArticulationBody).GetProperty("jointName", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
 
     /// <summary>
     /// Dump the Unity-joint-index → joint-name correspondence to the Console.
@@ -52,7 +111,7 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
     private void DumpJointMapping()
     {
         var sb = new System.Text.StringBuilder();
-        sb.AppendLine($"[G1mimicAgent:{name}] Joint mapping (identity assumed):");
+        sb.AppendLine($"[G1mimicAgent:{name}] Joint mapping (explicit CSV index -> Unity joint, valid={g1JointMapValid}):");
         for (int i = 0; i < 29 && i < jh.Length; i++)
         {
             string jointName = (jh[i] != null) ? jh[i].name : "<null>";
@@ -66,6 +125,119 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
         sb.AppendLine("  22..28 right arm: same suborder");
         sb.AppendLine("If 15..21 are RIGHT arm names instead of left, the prefab's traversal swapped sides; needs a permutation.");
         UnityEngine.Debug.Log(sb.ToString());
+    }
+
+    private void BuildDeterministicG1JointMap(IReadOnlyList<ArticulationBody> revoluteJoints)
+    {
+        Array.Clear(jh, 0, jh.Length);
+        g1JointMapValid = false;
+        hasLoggedInvalidJointMap = false;
+        hasLoggedDirectJointStateError = false;
+        hasLoggedPartialDirectJointStateError = false;
+
+        var byName = new Dictionary<string, ArticulationBody>(StringComparer.Ordinal);
+        for (int i = 0; i < revoluteJoints.Count; i++)
+        {
+            ArticulationBody joint = revoluteJoints[i];
+            if (joint == null)
+            {
+                continue;
+            }
+
+            AddJointName(byName, GetSerializedJointName(joint), joint);
+            AddJointName(byName, joint.name, joint);
+            AddJointName(byName, joint.gameObject.name, joint);
+        }
+
+        var missing = new List<string>();
+        for (int i = 0; i < G1CsvJointAliases.Length && i < jh.Length; i++)
+        {
+            ArticulationBody joint = FindJointByAlias(byName, G1CsvJointAliases[i]);
+            if (joint != null)
+            {
+                jh[i] = joint;
+                continue;
+            }
+
+            missing.Add($"CSV[{i}] expected one of [{string.Join(", ", G1CsvJointAliases[i])}]");
+        }
+
+        if (missing.Count == 0)
+        {
+            g1JointMapValid = true;
+            return;
+        }
+
+        // Keep traversal bindings for non-replay code paths, but refuse qpos mirroring.
+        for (int i = 0; i < jh.Length && i < revoluteJoints.Count; i++)
+        {
+            if (jh[i] == null)
+            {
+                jh[i] = revoluteJoints[i];
+            }
+        }
+
+        UnityEngine.Debug.LogError(
+            $"[G1mimicAgent:{name}] Explicit G1 joint map is incomplete. " +
+            "Replay/live qpos mirroring will be refused to avoid applying CSV values to wrong joints. " +
+            string.Join("; ", missing));
+    }
+
+    private static ArticulationBody FindJointByAlias(Dictionary<string, ArticulationBody> byName, string[] aliases)
+    {
+        if (aliases == null)
+        {
+            return null;
+        }
+
+        for (int i = 0; i < aliases.Length; i++)
+        {
+            string key = NormalizeJointName(aliases[i]);
+            if (!string.IsNullOrEmpty(key) && byName.TryGetValue(key, out ArticulationBody joint))
+            {
+                return joint;
+            }
+        }
+
+        return null;
+    }
+
+    private static void AddJointName(Dictionary<string, ArticulationBody> byName, string rawName, ArticulationBody joint)
+    {
+        string key = NormalizeJointName(rawName);
+        if (string.IsNullOrEmpty(key) || byName.ContainsKey(key))
+        {
+            return;
+        }
+
+        byName.Add(key, joint);
+    }
+
+    private static string GetSerializedJointName(ArticulationBody joint)
+    {
+        if (joint == null || ArticulationJointNameProperty == null)
+        {
+            return string.Empty;
+        }
+
+        try
+        {
+            return ArticulationJointNameProperty.GetValue(joint) as string ?? string.Empty;
+        }
+        catch
+        {
+            return string.Empty;
+        }
+    }
+
+    private static string NormalizeJointName(string rawName)
+    {
+        if (string.IsNullOrWhiteSpace(rawName))
+        {
+            return string.Empty;
+        }
+
+        return rawName.Trim().ToLowerInvariant();
     }
 
     float[] uff = new float[29] { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 ,0, 0, 0, 0, 0, 0, 0, 0, 0, 0 ,0, 0, 0, 0, 0, 0, 0, 0, 0};
@@ -96,6 +268,15 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
 
     private List<float[]> refData = new List<float[]>();
     private List<float[]> itpData = new List<float[]>();
+
+    private enum ReplayDataMode
+    {
+        DatasetReplay,
+        ExternalCsvReplay,
+        LiveRealtimeCsv
+    }
+
+    private ReplayDataMode replayDataMode = ReplayDataMode.DatasetReplay;
 
     private int currentFrame;
     private int realtimePreviousMaxStep = -1;
@@ -129,6 +310,7 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
     ArticulationBody[] jh = new ArticulationBody[29];
     ArticulationBody[] arts = new ArticulationBody[40];
     ArticulationBody art0;
+    private readonly List<float> replayZeroVelocities = new List<float>();
     int tt = 0;
     public int frame0 = 100;
 
@@ -143,11 +325,30 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
     // ── IMimicAgent surface ───────────────────────────────────────────────────
     public string RobotKey => string.IsNullOrWhiteSpace(robotKey) ? "unitree_g1" : robotKey.Trim();
     public GameObject AgentGameObject => gameObject;
-    public bool UseExternalReplayData { get => useExternalReplayData; set => useExternalReplayData = value; }
+    public bool UseExternalReplayData
+    {
+        get => useExternalReplayData;
+        set
+        {
+            useExternalReplayData = value;
+            if (!value)
+            {
+                replayDataMode = ReplayDataMode.DatasetReplay;
+                realtimeFrameCursor = 0f;
+                return;
+            }
+
+            if (replayDataMode != ReplayDataMode.LiveRealtimeCsv)
+            {
+                replayDataMode = ReplayDataMode.ExternalCsvReplay;
+            }
+        }
+    }
     public bool ReplayMode { get => replay; set => replay = value; }
     public int MotionId { get => motion_id; set => motion_id = value; }
     public void RequestEndEpisode() => EndEpisode();
     public int ExpectedCsvColumns => 36;
+    private bool IsLiveRealtimeCsv => useExternalReplayData && replayDataMode == ReplayDataMode.LiveRealtimeCsv;
 
     public void SetRobotSelectedInScene(bool isSelected)
     {
@@ -156,6 +357,7 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
 
         UseExternalReplayData = false;
         ReplayMode = false;
+        RestoreReplayMirrorColliders();
         if (art0 != null)
         {
             art0.velocity = Vector3.zero;
@@ -177,7 +379,10 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
         motion_name = "live_motion";
         currentFrame = 0;
         realtimeFrameCursor = 0f;
+        useExternalReplayData = true;
+        replayDataMode = ReplayDataMode.LiveRealtimeCsv;
         tt = 0;
+        DisableReplayMirrorColliders();
         return true;
     }
 
@@ -201,6 +406,8 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
         }
 
         UseExternalReplayData = false;
+        replayDataMode = ReplayDataMode.DatasetReplay;
+        RestoreReplayMirrorColliders();
     }
 
     /// <summary>
@@ -288,15 +495,15 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
     public override void Initialize()
     {
         arts = this.GetComponentsInChildren<ArticulationBody>();
-        int ActionNum = 0;
+        var revoluteJoints = new List<ArticulationBody>(29);
         for (int k = 0; k < arts.Length; k++)
         {
-            if (arts[k].jointType.ToString() == "RevoluteJoint")
+            if (arts[k].jointType == ArticulationJointType.RevoluteJoint)
             {
-                jh[ActionNum] = arts[k];
-                ActionNum++;
+                revoluteJoints.Add(arts[k]);
             }
         }
+        BuildDeterministicG1JointMap(revoluteJoints);
 
         body = arts[0].GetComponent<Transform>();
         art0 = body.GetComponent<ArticulationBody>();
@@ -444,7 +651,11 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
         }
 
         motion_name = Path.GetFileNameWithoutExtension(filePath);
-        return ApplyReplayData(data, keepProgress);
+        replayDataMode = ReplayDataMode.ExternalCsvReplay;
+        useExternalReplayData = true;
+        realtimeFrameCursor = 0f;
+        DisableReplayMirrorColliders();
+        return ApplyReplayData(data, keepProgress, resample30FpsToFixed50Hz: true, startAtFrameZero: true);
     }
 
     private bool TryLoadCurrentMotionData(bool keepProgress)
@@ -470,38 +681,32 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
             return false;
         }
 
-        return ApplyReplayData(data, keepProgress);
+        replayDataMode = ReplayDataMode.DatasetReplay;
+        return ApplyReplayData(data, keepProgress, resample30FpsToFixed50Hz: true, startAtFrameZero: false);
     }
 
-    private bool ApplyReplayData(List<float[]> data, bool keepProgress)
+    private bool ApplyReplayData(
+        List<float[]> data,
+        bool keepProgress,
+        bool resample30FpsToFixed50Hz,
+        bool startAtFrameZero)
     {
         if (data == null || data.Count == 0) return false;
 
         int oldFrame = currentFrame;
         refData = data;
 
-        if (refData.Count <= 1)
-        {
-            itpData = new List<float[]>(refData);
-        }
-        else
-        {
-            float[] refT = new float[refData.Count];
-            for (int i = 0; i < refT.Length; i++) refT[i] = i / 30f;
-
-            int newFrameCount = Mathf.Max(1, (int)(refData.Count * 50f / 30f) - 1);
-            float[] newT = new float[newFrameCount];
-            for (int i = 0; i < newT.Length; i++) newT[i] = i / 50f;
-
-            List<float[]> interpolated = Interpolate(refT, refData, newT);
-            itpData = interpolated ?? new List<float[]>(refData);
-        }
+        itpData = resample30FpsToFixed50Hz
+            ? ReplayCsvUtility.Resample30FpsToFixed50Hz(refData)
+            : ReplayCsvUtility.CopyRows(refData, ExpectedCsvColumns);
 
         if (itpData.Count == 0) return false;
 
+        int defaultStartFrame = startAtFrameZero ? 0 : frame0;
         currentFrame = keepProgress
             ? Mathf.Clamp(oldFrame, 0, itpData.Count - 1)
-            : Mathf.Clamp(frame0, 0, itpData.Count - 1);
+            : Mathf.Clamp(defaultStartFrame, 0, itpData.Count - 1);
+        realtimeFrameCursor = currentFrame;
 
         return true;
     }
@@ -709,6 +914,68 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
         //
         // Flipping immovable=false first restores cache size to 35 so the
         // restPositions write lands on the right slots.
+        if (replay || useExternalReplayData)
+        {
+            DisableReplayMirrorColliders();
+            for (int i = 0; i < 29; i++)
+            {
+                u[i] = 0f;
+                uff[i] = 0f;
+                utotal[i] = 0f;
+            }
+
+            currentFrame = useExternalReplayData ? 0 : frame0;
+            if (useExternalReplayData)
+            {
+                realtimeFrameCursor = 0f;
+            }
+
+            if (replay && !useExternalReplayData)
+            {
+                TryLoadCurrentMotionData(keepProgress: false);
+            }
+
+            List<float[]> replayData = useExternalReplayData ? itpData : refData;
+            if (replayData == null || replayData.Count == 0)
+            {
+                UnityEngine.Debug.LogError("replay data is empty, skip OnEpisodeBegin.");
+                return;
+            }
+
+            currentFrame = Mathf.Clamp(currentFrame, 0, replayData.Count - 1);
+            tt = 0;
+            currentData = replayData[currentFrame];
+            Array.Copy(currentData, 0, currentPos, 0, 3);
+            Array.Copy(currentData, 3, currentRot, 0, 4);
+            Array.Copy(currentData, 7, currentDof, 0, 29);
+
+            for (int i = 0; i < 29; i++)
+            {
+                float targetRad = ToUnityJointRadians(i, currentDof[i]);
+                uff[i] = targetRad * Mathf.Rad2Deg;
+                SetJointTargetDeg(jh[i], uff[i]);
+            }
+
+            this.newPosition = new Vector3(-currentPos[1], currentPos[2] + 0.04f, currentPos[0]);
+            this.newRotation = new Quaternion(
+                -currentRot[1],
+                 currentRot[2],
+                 currentRot[0],
+                -currentRot[3]
+            );
+            this.newPosition.x += pos0.x;
+            this.newPosition.z += pos0.z;
+
+            Physics.gravity = Vector3.zero;
+            arts[0].immovable = true;
+            arts[0].TeleportRoot(this.newPosition, this.newRotation);
+            arts[0].velocity = Vector3.zero;
+            arts[0].angularVelocity = Vector3.zero;
+            ApplyReplayFrameToArticulation();
+            return;
+        }
+
+        RestoreReplayMirrorColliders();
         arts[0].immovable       = false;
         arts[0].TeleportRoot(pos0, rot0);
         arts[0].velocity        = Vector3.zero;
@@ -766,10 +1033,17 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
         newPosition.x += pos0.x;
         newPosition.z += pos0.z;
 
-        arts[0].TeleportRoot(newPosition, newRotation);
-        arts[0].velocity        = Vector3.zero;
-        arts[0].angularVelocity = Vector3.zero;
-        arts[0].immovable       = true;
+        if (replay || useExternalReplayData)
+        {
+            ApplyReplayFrameToArticulation();
+        }
+        else
+        {
+            arts[0].TeleportRoot(newPosition, newRotation);
+            arts[0].velocity        = Vector3.zero;
+            arts[0].angularVelocity = Vector3.zero;
+            arts[0].immovable       = true;
+        }
     }
 
     List<float[]> Interpolate(float[] t, List<float[]> posList, float[] targetT)
@@ -858,10 +1132,14 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
             return;
         }
 
+        if (replay || useExternalReplayData)
+        {
+            return;
+        }
+
         var continuousActions = actionBuffers.ContinuousActions;
         var kk = 0.9f;
         float kb = 50;
-        if (replay) kb = 0;
         for (int i = 0; i < 29; i++)
         {
             u[i] = u[i] * kk + (1 - kk) * continuousActions[i];
@@ -881,11 +1159,19 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
         {
             if (useExternalReplayData)
             {
-                realtimeFrameCursor = Mathf.Clamp(realtimeFrameCursor, 0f, itpData.Count - 1);
-                if (ReplayCsvUtility.SampleRowsAtFrame(itpData, realtimeFrameCursor, ExpectedCsvColumns, realtimeSampledData))
+                if (IsLiveRealtimeCsv)
                 {
-                    currentData = realtimeSampledData;
-                    currentFrame = Mathf.Clamp(Mathf.FloorToInt(realtimeFrameCursor), 0, itpData.Count - 1);
+                    realtimeFrameCursor = Mathf.Clamp(realtimeFrameCursor, 0f, itpData.Count - 1);
+                    if (ReplayCsvUtility.SampleRowsAtFrame(itpData, realtimeFrameCursor, ExpectedCsvColumns, realtimeSampledData))
+                    {
+                        currentData = realtimeSampledData;
+                        currentFrame = Mathf.Clamp(Mathf.FloorToInt(realtimeFrameCursor), 0, itpData.Count - 1);
+                    }
+                    else
+                    {
+                        currentFrame = Mathf.Clamp(currentFrame, 0, itpData.Count - 1);
+                        currentData = itpData[currentFrame];
+                    }
                 }
                 else
                 {
@@ -914,10 +1200,9 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
             newPosition.x += pos0.x;
             newPosition.z += pos0.z;
 
-            if (replay)
+            if (replay || useExternalReplayData)
             {
-                Physics.gravity = Vector3.zero;
-                arts[0].TeleportRoot(newPosition, newRotation);
+                ApplyReplayFrameToArticulation();
             }
             else
             {
@@ -939,6 +1224,13 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
                     art0.AddTorque(0 * rotationTorque);
                 }
             }
+        }
+
+        if (replay || useExternalReplayData)
+        {
+            tt++;
+            AdvanceMotionFrameIfNeeded();
+            return;
         }
 
         tt++;
@@ -964,17 +1256,274 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
         var reward = live_reward + (rot_reward + pos_reward) * 1f + dof_reward;
         AddReward(reward);
 
+        AdvanceMotionFrameIfNeeded();
+    }
+
+    private void ApplyReplayFrameToArticulation()
+    {
+        if (arts == null || arts.Length == 0 || arts[0] == null)
+        {
+            return;
+        }
+
+        if (!g1JointMapValid)
+        {
+            if (!hasLoggedInvalidJointMap)
+            {
+                UnityEngine.Debug.LogError($"[G1mimicAgent:{name}] Replay/live qpos mirror skipped because the explicit G1 joint map is invalid.");
+                hasLoggedInvalidJointMap = true;
+            }
+            return;
+        }
+
+        Physics.gravity = Vector3.zero;
+        arts[0].immovable = true;
+        arts[0].TeleportRoot(newPosition, newRotation);
+        arts[0].velocity = Vector3.zero;
+        arts[0].angularVelocity = Vector3.zero;
+
+        int directWriteCount = 0;
+        for (int i = 0; i < 29; i++)
+        {
+            ArticulationBody joint = jh[i];
+            float targetRad = ToUnityJointRadians(i, currentDof[i]);
+            float targetDeg = targetRad * Mathf.Rad2Deg;
+            u[i] = 0f;
+            uff[i] = targetDeg;
+            utotal[i] = targetDeg;
+            SetJointTargetDeg(joint, targetDeg);
+            if (SetJointPositionRad(joint, targetRad))
+            {
+                directWriteCount++;
+            }
+        }
+
+        ZeroArticulationJointVelocities();
+        ZeroArticulationBodyVelocities();
+
+        if (directWriteCount == 0 && !hasLoggedDirectJointStateError)
+        {
+            UnityEngine.Debug.LogError($"[G1mimicAgent:{name}] Direct qpos mirror could not write any joint positions; all mapped joints reported empty reduced-space state.");
+            hasLoggedDirectJointStateError = true;
+        }
+        else if (directWriteCount != 29 && !hasLoggedPartialDirectJointStateError)
+        {
+            UnityEngine.Debug.LogWarning($"[G1mimicAgent:{name}] Direct qpos mirror wrote {directWriteCount}/29 joints. Partial reduced-space writes can cause localized twitching.");
+            hasLoggedPartialDirectJointStateError = true;
+        }
+        LogReplayMirrorDiagnosticsIfNeeded();
+    }
+
+    private float ToUnityJointRadians(int jointIndex, float csvRadians)
+    {
+        if (unityJointSigns == null || jointIndex < 0 || jointIndex >= unityJointSigns.Length)
+        {
+            return csvRadians;
+        }
+
+        float sign = Mathf.Approximately(unityJointSigns[jointIndex], 0f)
+            ? 1f
+            : Mathf.Sign(unityJointSigns[jointIndex]);
+        return csvRadians * sign;
+    }
+
+    private void ZeroArticulationJointVelocities()
+    {
+        if (arts == null || arts.Length == 0 || arts[0] == null)
+        {
+            return;
+        }
+
+        replayZeroVelocities.Clear();
+        arts[0].GetJointVelocities(replayZeroVelocities);
+        for (int i = 0; i < replayZeroVelocities.Count; i++)
+        {
+            replayZeroVelocities[i] = 0f;
+        }
+
+        SafeSetJointVelocities(replayZeroVelocities);
+    }
+
+    private void ZeroArticulationBodyVelocities()
+    {
+        if (arts == null)
+        {
+            return;
+        }
+
+        for (int i = 0; i < arts.Length; i++)
+        {
+            ArticulationBody bodyPart = arts[i];
+            if (bodyPart == null)
+            {
+                continue;
+            }
+
+            bodyPart.velocity = Vector3.zero;
+            bodyPart.angularVelocity = Vector3.zero;
+        }
+    }
+
+    private void DisableReplayMirrorColliders()
+    {
+        if (replayMirrorCollidersDisabled)
+        {
+            return;
+        }
+
+        replayMirrorColliders.Clear();
+        replayMirrorColliderStates.Clear();
+        Collider[] colliders = GetComponentsInChildren<Collider>(true);
+        for (int i = 0; i < colliders.Length; i++)
+        {
+            Collider collider = colliders[i];
+            if (collider == null)
+            {
+                continue;
+            }
+
+            replayMirrorColliders.Add(collider);
+            replayMirrorColliderStates.Add(collider.enabled);
+            collider.enabled = false;
+        }
+
+        replayMirrorCollidersDisabled = true;
+    }
+
+    private void RestoreReplayMirrorColliders()
+    {
+        if (!replayMirrorCollidersDisabled)
+        {
+            return;
+        }
+
+        int count = Mathf.Min(replayMirrorColliders.Count, replayMirrorColliderStates.Count);
+        for (int i = 0; i < count; i++)
+        {
+            Collider collider = replayMirrorColliders[i];
+            if (collider != null)
+            {
+                collider.enabled = replayMirrorColliderStates[i];
+            }
+        }
+
+        replayMirrorColliders.Clear();
+        replayMirrorColliderStates.Clear();
+        replayMirrorCollidersDisabled = false;
+    }
+
+    private bool SetJointPositionRad(ArticulationBody joint, float radians)
+    {
+        if (joint == null || joint.jointType != ArticulationJointType.RevoluteJoint)
+        {
+            return false;
+        }
+
+        try
+        {
+            ArticulationReducedSpace jointPosition = joint.jointPosition;
+            if (jointPosition.dofCount <= 0)
+            {
+                return false;
+            }
+
+            // Replay/live is a visual qpos mirror of GMR. Do not clamp to Unity
+            // drive limits here, or poses near the robot limits diverge from the
+            // MuJoCo preview and can look like localized twitching.
+            jointPosition[0] = radians;
+            joint.jointPosition = jointPosition;
+
+            ArticulationReducedSpace jointVelocity = joint.jointVelocity;
+            if (jointVelocity.dofCount > 0)
+            {
+                jointVelocity[0] = 0f;
+                joint.jointVelocity = jointVelocity;
+            }
+
+            joint.velocity = Vector3.zero;
+            joint.angularVelocity = Vector3.zero;
+            return true;
+        }
+        catch (Exception e)
+        {
+            UnityEngine.Debug.LogWarning($"[G1mimicAgent:{name}] Failed to write joint position for '{joint.name}': {e.Message}");
+            return false;
+        }
+    }
+
+    private float ClampJointRadiansToDrive(ArticulationBody joint, float radians)
+    {
+        if (joint == null)
+        {
+            return radians;
+        }
+
+        ArticulationDrive drive = joint.xDrive;
+        if (drive.lowerLimit >= drive.upperLimit)
+        {
+            return radians;
+        }
+
+        float degrees = Mathf.Clamp(radians * Mathf.Rad2Deg, drive.lowerLimit, drive.upperLimit);
+        return degrees * Mathf.Deg2Rad;
+    }
+
+    private void LogReplayMirrorDiagnosticsIfNeeded()
+    {
+        if (!logReplayMirrorDiagnostics)
+        {
+            return;
+        }
+
+        int interval = Mathf.Max(1, replayMirrorDiagnosticIntervalFrames);
+        if (Time.frameCount % interval != 0)
+        {
+            return;
+        }
+
+        int[] watch = { 0, 1, 2, 3, 15, 16, 17, 18, 19, 20, 21 };
+        var sb = new System.Text.StringBuilder();
+        sb.Append($"[G1mimicAgent:{name}] replay mirror joint errors rad:");
+        for (int i = 0; i < watch.Length; i++)
+        {
+            int jointIndex = watch[i];
+            ArticulationBody joint = jh[jointIndex];
+            if (joint == null || joint.jointPosition.dofCount == 0)
+            {
+                sb.Append($" jh[{jointIndex}]=missing");
+                continue;
+            }
+
+            float target = ToUnityJointRadians(jointIndex, currentDof[jointIndex]);
+            float actual = joint.jointPosition[0];
+            float error = Mathf.Abs(Mathf.DeltaAngle(actual * Mathf.Rad2Deg, target * Mathf.Rad2Deg)) * Mathf.Deg2Rad;
+            sb.Append($" jh[{jointIndex}]({joint.name}) target={target:F3} actual={actual:F3} err={error:F3}");
+        }
+
+        UnityEngine.Debug.Log(sb.ToString());
+    }
+
+    private void AdvanceMotionFrameIfNeeded()
+    {
         if (itpData != null && currentFrame < itpData.Count - 1)
         {
             if (useExternalReplayData)
             {
-                realtimeFrameCursor = ReplayCsvUtility.AdvanceRealtimeCursor(
-                    realtimeFrameCursor,
-                    itpData.Count,
-                    realtimePlaybackFps,
-                    Time.fixedDeltaTime,
-                    realtimePlaybackBufferSeconds);
-                currentFrame = Mathf.Clamp(Mathf.FloorToInt(realtimeFrameCursor), 0, itpData.Count - 1);
+                if (IsLiveRealtimeCsv)
+                {
+                    realtimeFrameCursor = ReplayCsvUtility.AdvanceRealtimeCursor(
+                        realtimeFrameCursor,
+                        itpData.Count,
+                        realtimePlaybackFps,
+                        Time.fixedDeltaTime,
+                        realtimePlaybackBufferSeconds);
+                    currentFrame = Mathf.Clamp(Mathf.FloorToInt(realtimeFrameCursor), 0, itpData.Count - 1);
+                }
+                else
+                {
+                    currentFrame = currentFrame + 1;
+                    realtimeFrameCursor = currentFrame;
+                }
             }
             else
             {
@@ -985,6 +1534,11 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
 
     void SetJointTargetDeg(ArticulationBody joint, float x)
     {
+        if (joint == null)
+        {
+            return;
+        }
+
         var drive = joint.xDrive;
         drive.stiffness = 180f;
         drive.damping = 8f;

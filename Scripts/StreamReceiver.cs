@@ -29,7 +29,7 @@ public class StreamReceiver : MonoBehaviour
     [Header("显示目标")]
     [SerializeField] private RawImage whamRawImage;
     [SerializeField] private RawImage gmrRawImage;
-    [SerializeField] private Color placeholderColor = new Color(0.15f, 0.15f, 0.15f);
+    [SerializeField] private Color placeholderColor = new Color(0.02f, 0.04f, 0.06f, 0.22f);
 
     [Header("Aspect")]
     [SerializeField] private bool preserveIncomingAspect = true;
@@ -55,8 +55,21 @@ public class StreamReceiver : MonoBehaviour
     private Texture2D _gmrTex;
     private float _nextWhamApplyTime;
     private float _nextGmrApplyTime;
+    private long _whamReceivedFrames;
+    private long _gmrReceivedFrames;
+    private long _whamShownFrames;
+    private long _gmrShownFrames;
+    private float _lastWhamFrameTime = -1f;
+    private float _lastGmrFrameTime = -1f;
     private readonly Dictionary<RawImage, Vector2> _initialImageSizes = new Dictionary<RawImage, Vector2>();
     private readonly ConcurrentQueue<QueuedStreamLog> _logQueue = new ConcurrentQueue<QueuedStreamLog>();
+
+    public void SetHudVideoDisplayOptions(bool hudManagedAspectFit, Color placeholder)
+    {
+        resizeRawImageRect = !hudManagedAspectFit;
+        preserveIncomingAspect = true;
+        placeholderColor = placeholder;
+    }
 
     private enum QueuedStreamLogType
     {
@@ -90,6 +103,50 @@ public class StreamReceiver : MonoBehaviour
         get { lock (_lock) return _activeClients.Count > 0; }
     }
     private readonly List<TcpClient> _activeClients = new List<TcpClient>();
+
+    public bool IsListening => _listener != null;
+
+    public void ConfigureTargets(RawImage whamTarget, RawImage gmrTarget)
+    {
+        whamRawImage = whamTarget;
+        gmrRawImage = gmrTarget;
+        CacheInitialRawImageSize(whamRawImage);
+        CacheInitialRawImageSize(gmrRawImage);
+        ApplyExistingTextureOrPlaceholder(_whamTex, whamRawImage);
+        ApplyExistingTextureOrPlaceholder(_gmrTex, gmrRawImage);
+    }
+
+    public void ClearStream(int streamId)
+    {
+        if (streamId == 0)
+        {
+            ClearStream(ref _whamTex, whamRawImage, isWham: true);
+        }
+        else if (streamId == 1)
+        {
+            ClearStream(ref _gmrTex, gmrRawImage, isWham: false);
+        }
+    }
+
+    public void ClearAllStreams()
+    {
+        ClearStream(0);
+        ClearStream(1);
+    }
+
+    public string GetStatusLine(string label, int streamId)
+    {
+        RawImage target = streamId == 0 ? whamRawImage : gmrRawImage;
+        Texture texture = target != null ? target.texture : null;
+        long received = streamId == 0 ? _whamReceivedFrames : _gmrReceivedFrames;
+        long shown = streamId == 0 ? _whamShownFrames : _gmrShownFrames;
+        float lastTime = streamId == 0 ? _lastWhamFrameTime : _lastGmrFrameTime;
+        string client = HasClient ? "client: connected" : "client: waiting";
+        string last = lastTime >= 0f ? $"{Time.unscaledTime - lastTime:F1}s ago" : "never";
+        string tex = texture != null ? $"{texture.width}x{texture.height}" : "none";
+        string rect = target != null ? $"{Mathf.RoundToInt(target.rectTransform.rect.width)}x{Mathf.RoundToInt(target.rectTransform.rect.height)}" : "missing";
+        return $"{label} | {bindAddress}:{port} | {(IsListening ? "listening" : "closed")} | {client} | rx {received} / shown {shown} | last {last} | tex {tex} | target {rect}";
+    }
 
     // ── Unity 生命周期 ────────────────────────────────────────────────────
 
@@ -253,8 +310,8 @@ public class StreamReceiver : MonoBehaviour
 
                 lock (_lock)
                 {
-                    if (streamId == 0) { _pendingWham = jpg; _whamDirty = true; }
-                    else if (streamId == 1) { _pendingGmr = jpg; _gmrDirty = true; }
+                    if (streamId == 0) { _pendingWham = jpg; _whamDirty = true; _whamReceivedFrames++; }
+                    else if (streamId == 1) { _pendingGmr = jpg; _gmrDirty = true; _gmrReceivedFrames++; }
                 }
 
                 if (logFrameReceive)
@@ -301,6 +358,71 @@ public class StreamReceiver : MonoBehaviour
             image.texture = tex;
             image.color = Color.white;
             FitRawImageToTexture(image, tex.width, tex.height);
+            if (image == whamRawImage)
+            {
+                _whamShownFrames++;
+                _lastWhamFrameTime = Time.unscaledTime;
+            }
+            else if (image == gmrRawImage)
+            {
+                _gmrShownFrames++;
+                _lastGmrFrameTime = Time.unscaledTime;
+            }
+        }
+    }
+
+    private void ApplyExistingTextureOrPlaceholder(Texture2D texture, RawImage image)
+    {
+        if (image == null)
+        {
+            return;
+        }
+
+        if (texture != null)
+        {
+            image.texture = texture;
+            image.color = Color.white;
+            FitRawImageToTexture(image, texture.width, texture.height);
+        }
+        else
+        {
+            image.texture = null;
+            image.color = placeholderColor;
+        }
+    }
+
+    private void ClearStream(ref Texture2D texture, RawImage image, bool isWham)
+    {
+        lock (_lock)
+        {
+            if (isWham)
+            {
+                _pendingWham = null;
+                _whamDirty = false;
+                _whamReceivedFrames = 0;
+                _whamShownFrames = 0;
+                _lastWhamFrameTime = -1f;
+            }
+            else
+            {
+                _pendingGmr = null;
+                _gmrDirty = false;
+                _gmrReceivedFrames = 0;
+                _gmrShownFrames = 0;
+                _lastGmrFrameTime = -1f;
+            }
+        }
+
+        if (texture != null)
+        {
+            Destroy(texture);
+            texture = null;
+        }
+
+        if (image != null)
+        {
+            image.texture = null;
+            image.color = placeholderColor;
         }
     }
 
@@ -333,7 +455,11 @@ public class StreamReceiver : MonoBehaviour
         if (image == null || image.rectTransform == null) return;
         if (_initialImageSizes.ContainsKey(image)) return;
 
-        Vector2 size = image.rectTransform.sizeDelta;
+        Vector2 size = image.rectTransform.rect.size;
+        if (size.x <= 0.0f || size.y <= 0.0f)
+        {
+            size = image.rectTransform.sizeDelta;
+        }
         if (size.x > 0.0f && size.y > 0.0f)
         {
             _initialImageSizes.Add(image, size);
@@ -346,11 +472,7 @@ public class StreamReceiver : MonoBehaviour
         if (image == null || image.rectTransform == null || width <= 0 || height <= 0) return;
 
         CacheInitialRawImageSize(image);
-        Vector2 box;
-        if (!_initialImageSizes.TryGetValue(image, out box) || box.x <= 0.0f || box.y <= 0.0f)
-        {
-            box = new Vector2(width, height);
-        }
+        Vector2 box = ResolveAspectFitBox(image, width, height);
 
         float frameAspect = width / (float)height;
         float boxAspect = box.x / box.y;
@@ -358,8 +480,35 @@ public class StreamReceiver : MonoBehaviour
             ? new Vector2(box.x, box.x / frameAspect)
             : new Vector2(box.y * frameAspect, box.y);
 
+        RectTransform rect = image.rectTransform;
+        rect.anchorMin = new Vector2(0.5f, 0.5f);
+        rect.anchorMax = new Vector2(0.5f, 0.5f);
+        rect.pivot = new Vector2(0.5f, 0.5f);
+        rect.anchoredPosition = Vector2.zero;
         image.rectTransform.SetSizeWithCurrentAnchors(RectTransform.Axis.Horizontal, fittedSize.x);
         image.rectTransform.SetSizeWithCurrentAnchors(RectTransform.Axis.Vertical, fittedSize.y);
+    }
+
+    private Vector2 ResolveAspectFitBox(RawImage image, int width, int height)
+    {
+        RectTransform rect = image != null ? image.rectTransform : null;
+        RectTransform parent = rect != null ? rect.parent as RectTransform : null;
+        if (parent != null && parent.rect.width > 1.0f && parent.rect.height > 1.0f)
+        {
+            return parent.rect.size;
+        }
+
+        if (rect != null && rect.rect.width > 1.0f && rect.rect.height > 1.0f)
+        {
+            return rect.rect.size;
+        }
+
+        if (image != null && _initialImageSizes.TryGetValue(image, out Vector2 cached) && cached.x > 1.0f && cached.y > 1.0f)
+        {
+            return cached;
+        }
+
+        return new Vector2(width, height);
     }
 
     public void ShowPlaceholder()

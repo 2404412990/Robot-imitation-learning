@@ -100,6 +100,7 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
     private float realtimeFrameCursor;
     private float realtimePlaybackFps = ReplayCsvUtility.SourceFps;
     private float realtimePlaybackBufferSeconds = 0.2f;
+    private bool hasExternalReplayCsv;
     
     Transform body;
 
@@ -121,7 +122,18 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
     // ── IMimicAgent surface ───────────────────────────────────────────────────
     public string RobotKey => string.IsNullOrWhiteSpace(robotKey) ? "unitree_h1" : robotKey.Trim();
     public GameObject AgentGameObject => gameObject;
-    public bool UseExternalReplayData { get => useExternalReplayData; set => useExternalReplayData = value; }
+    public bool UseExternalReplayData
+    {
+        get => useExternalReplayData;
+        set
+        {
+            useExternalReplayData = value;
+            if (!value)
+            {
+                hasExternalReplayCsv = false;
+            }
+        }
+    }
     public bool ReplayMode { get => replay; set => replay = value; }
     public int MotionId { get => motion_idx; set => motion_idx = value; }
     public void RequestEndEpisode() => EndEpisode();
@@ -134,6 +146,8 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
 
         UseExternalReplayData = false;
         ReplayMode = false;
+        hasExternalReplayCsv = false;
+        realtimeRawRows.Clear();
         if (art0 != null)
         {
             art0.velocity = Vector3.zero;
@@ -150,6 +164,7 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
         }
 
         MaxStep = 0;
+        hasExternalReplayCsv = false;
         realtimeRawRows.Clear();
         allDofData = new List<float[]>();
         allPosData = new List<float[]>();
@@ -170,7 +185,13 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
 
     public bool AppendRealtimeCsvRows(IReadOnlyList<float[]> rows)
     {
-        return ReplayCsvUtility.AppendRawRows(realtimeRawRows, rows, ExpectedCsvColumns, copyRows: false) > 0;
+        int appended = ReplayCsvUtility.AppendRawRows(realtimeRawRows, rows, ExpectedCsvColumns, copyRows: false);
+        if (appended > 0)
+        {
+            hasExternalReplayCsv = false;
+        }
+
+        return appended > 0;
     }
 
     public void EndRealtimeCsv()
@@ -182,6 +203,12 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
         }
 
         UseExternalReplayData = false;
+        ReplayMode = false;
+        hasExternalReplayCsv = false;
+        realtimeRawRows.Clear();
+        realtimeFrameCursor = 0f;
+        currentFrame = 0;
+        isEndEpisode = false;
     }
 
     /// <summary>
@@ -319,6 +346,12 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
             allDofData.Add(dof);
         }
         motion_name = Path.GetFileNameWithoutExtension(filePath);
+        realtimeRawRows.Clear();
+        realtimeFrameCursor = 0f;
+        hasExternalReplayCsv = true;
+        useExternalReplayData = true;
+        replay = true;
+        isEndEpisode = false;
 
         if (keepProgress)
             currentFrame = Mathf.Clamp(oldFrame, 0, allDofData.Count - 1);
@@ -610,7 +643,7 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
         float[] currentDof;
         float[] currentPos;
         float[] currentRot;
-        if (useExternalReplayData && realtimeRawRows.Count > 0)
+        if (useExternalReplayData && !hasExternalReplayCsv && realtimeRawRows.Count > 0)
         {
             float[] currentFlatRow = realtimeRawRows[0];
             currentPos = realtimeCurrentPos;
@@ -730,7 +763,7 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
         }
 
 	///////////////feedforward///////////////////////////////////////////////////////////
-    bool hasRealtimeRows = useExternalReplayData && realtimeRawRows.Count > 0;
+    bool hasRealtimeRows = useExternalReplayData && !hasExternalReplayCsv && realtimeRawRows.Count > 0;
 	if (hasRealtimeRows || allDofData.Count > 0)
 	{
         float[] currentDof;

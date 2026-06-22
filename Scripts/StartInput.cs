@@ -1,9 +1,11 @@
+using System;
 using System.Collections;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.Reflection;
 using System.Text;
 using System.Threading;
 using TMPro;
@@ -42,6 +44,15 @@ public class StartInput : MonoBehaviour
     [SerializeField] private bool disablePreviewVideoWhenTcpStreaming = true;
     [Tooltip("Input video path passed to run.ps1. Defaults to an examples video instead of webcam input.")]
     [SerializeField] private string videoPath = "examples/IMG_9732.mov";
+
+    [Header("GMR Viewer Camera")]
+    [SerializeField] private bool gmrCameraFollow = true;
+    [SerializeField] private float gmrCameraLookatHeightOffset = 0.50f;
+    [SerializeField] private float gmrCameraElevation = -28.0f;
+    [SerializeField] private float gmrCameraDistanceScale = 1.70f;
+    [SerializeField] private string gmrCameraAzimuth = "";
+    [SerializeField] private int gmrTcpRenderWidth = 960;
+    [SerializeField] private int gmrTcpRenderHeight = 720;
 
     [Header("WHAM Performance")]
     [Tooltip("Enable AMP (mixed precision) inference for WHAM (CUDA only).")]
@@ -151,6 +162,21 @@ public class StartInput : MonoBehaviour
     [Tooltip("Maximum pending Unity console log lines. Extra normal logs are dropped; warnings/errors are retained.")]
     [SerializeField] private int maxPendingUnityLogMessages = 200;
 
+    [Header("Realtime CSV Safety")]
+    [SerializeField] private bool enableRealtimeCsvSafetyGate = true;
+    [Tooltip("Reject one live CSV row if root translation jumps more than this many meters from the previous accepted row.")]
+    [SerializeField] private float realtimeMaxRootJumpMeters = 1.0f;
+    [Tooltip("Reject one live CSV row if root rotation jumps more than this many degrees from the previous accepted row.")]
+    [SerializeField] private float realtimeMaxRootRotationJumpDegrees = 120f;
+    [Tooltip("Reject one live CSV row if any joint jumps more than this many radians from the previous accepted row.")]
+    [SerializeField] private float realtimeMaxJointJumpRadians = 3.5f;
+    [Tooltip("Reject one live CSV row if any root position component exceeds this absolute meter value.")]
+    [SerializeField] private float realtimeMaxAbsRootPositionMeters = 50f;
+    [Tooltip("Reject one live CSV row if any joint value exceeds this absolute radian value.")]
+    [SerializeField] private float realtimeMaxAbsJointRadians = 20f;
+    [Tooltip("Abort live CSV ingestion after this many consecutive rejected rows to avoid feeding corrupt tail data into articulation bodies.")]
+    [SerializeField] private int realtimeMaxConsecutiveRejectedRows = 5;
+
     [Header("Debug")]
     [SerializeField] private bool verboseDebugLogging = false;
     [SerializeField] private bool logCsvChangeEvents = false;
@@ -189,6 +215,9 @@ public class StartInput : MonoBehaviour
     private long csvReadOffset;
     private string csvPendingText = string.Empty;
     private int realtimeSourceRowsRead;
+    private float[] lastAcceptedRealtimeRow;
+    private int consecutiveRejectedRealtimeRows;
+    private bool realtimeSafetyWarningLogged;
     private readonly List<float[]> pendingRealtimeRows = new List<float[]>();
     private IRealtimeCsvMimicAgent activeRealtimeCsvAgent;
     private IMimicAgent activeRealtimeMimicAgent;
@@ -205,6 +234,182 @@ public class StartInput : MonoBehaviour
     private Thread debugLogWriterThread;
     private volatile bool debugLogWriterRunning;
     private string resolvedDebugLogPath = string.Empty;
+    public GameObject CurrentSelectedRobotRoot { get; private set; }
+    public string CurrentSelectedRobotKey { get; private set; } = string.Empty;
+    public bool IsPipelineStopping => isStoppingPipeline;
+    public bool IsPipelineRunning
+    {
+        get
+        {
+            Process process = pythonProcess;
+            try
+            {
+                return process != null && !process.HasExited;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+    }
+
+    public bool IsRealtimeControlsLocked => PipelineStartupActive || (IsPipelineRunning && !isStoppingPipeline);
+    public bool PipelineStartupActive { get; private set; }
+    public float PipelineProgress01 { get; private set; }
+    public string PipelineStatusText { get; private set; } = string.Empty;
+    public string PipelineActivityText { get; private set; } = string.Empty;
+    public bool HasPipelineError { get; private set; }
+    public string LastPipelineError { get; private set; } = string.Empty;
+
+    public void ClearPipelineError()
+    {
+        HasPipelineError = false;
+        LastPipelineError = string.Empty;
+    }
+
+    public void SetGmrTcpRenderSizeFromHud(int width, int height)
+    {
+        gmrTcpRenderWidth = Mathf.Max(320, width);
+        gmrTcpRenderHeight = Mathf.Max(240, height);
+    }
+
+    public bool TryGetRuntimeParameterValue(string parameterName, out object value)
+    {
+        value = null;
+        FieldInfo field = FindRuntimeParameterField(parameterName);
+        if (field == null)
+        {
+            return false;
+        }
+
+        value = field.GetValue(this);
+        return true;
+    }
+
+    public bool TrySetRuntimeParameter(string parameterName, string rawValue, out string error)
+    {
+        error = string.Empty;
+        FieldInfo field = FindRuntimeParameterField(parameterName);
+        if (field == null)
+        {
+            error = $"Unknown StartInput parameter '{parameterName}'.";
+            return false;
+        }
+
+        if (IsRealtimeControlsLocked)
+        {
+            error = $"Cannot edit '{parameterName}' while the retargeting pipeline is running.";
+            return false;
+        }
+
+        if (!TryConvertRuntimeParameterValue(field.FieldType, rawValue, out object converted, out error))
+        {
+            error = $"Invalid value for '{parameterName}': {error}";
+            return false;
+        }
+
+        field.SetValue(this, converted);
+        return true;
+    }
+
+    public bool TrySetRuntimeParameter(string parameterName, bool value, out string error)
+    {
+        return TrySetRuntimeParameter(parameterName, value ? "true" : "false", out error);
+    }
+
+    private static FieldInfo FindRuntimeParameterField(string parameterName)
+    {
+        if (string.IsNullOrWhiteSpace(parameterName))
+        {
+            return null;
+        }
+
+        return typeof(StartInput).GetField(
+            parameterName,
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+    }
+
+    private static bool TryConvertRuntimeParameterValue(System.Type type, string rawValue, out object value, out string error)
+    {
+        value = null;
+        error = string.Empty;
+        string text = rawValue ?? string.Empty;
+
+        if (type == typeof(string))
+        {
+            value = text;
+            return true;
+        }
+
+        if (type == typeof(bool))
+        {
+            if (TryParseRuntimeBool(text, out bool boolValue))
+            {
+                value = boolValue;
+                return true;
+            }
+
+            error = "expected true/false, 1/0, on/off, or yes/no.";
+            return false;
+        }
+
+        if (type == typeof(int))
+        {
+            if (int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out int intValue))
+            {
+                value = intValue;
+                return true;
+            }
+
+            error = "expected an integer.";
+            return false;
+        }
+
+        if (type == typeof(float))
+        {
+            if (float.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out float floatValue))
+            {
+                value = floatValue;
+                return true;
+            }
+
+            error = "expected a floating point number.";
+            return false;
+        }
+
+        error = $"unsupported field type {type.Name}.";
+        return false;
+    }
+
+    private static bool TryParseRuntimeBool(string rawValue, out bool value)
+    {
+        value = false;
+        string text = (rawValue ?? string.Empty).Trim();
+        if (bool.TryParse(text, out value))
+        {
+            return true;
+        }
+
+        if (string.Equals(text, "1", System.StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(text, "yes", System.StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(text, "y", System.StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(text, "on", System.StringComparison.OrdinalIgnoreCase))
+        {
+            value = true;
+            return true;
+        }
+
+        if (string.Equals(text, "0", System.StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(text, "no", System.StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(text, "n", System.StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(text, "off", System.StringComparison.OrdinalIgnoreCase))
+        {
+            value = false;
+            return true;
+        }
+
+        return false;
+    }
 
     private static readonly HashSet<string> SupportedRobotNames = new HashSet<string>
     {
@@ -320,6 +525,8 @@ public class StartInput : MonoBehaviour
             AppendDebugLogLine(message);
         }
 
+        UpdatePipelineStartupFromUnityLog(message, type);
+
         int pendingLimit = System.Math.Max(1, maxPendingUnityLogMessages);
         if (type == QueuedUnityLogType.Log && unityLogQueue.Count >= pendingLimit)
         {
@@ -347,6 +554,7 @@ public class StartInput : MonoBehaviour
         AppendDebugLogLine(isErrorStream && logType == QueuedUnityLogType.Log
             ? $"[Pipeline/stderr] {data}"
             : line);
+        UpdatePipelineStartupFromPipelineLog(data, logType);
 
         if (!emitPipelineOutputToUnityConsole && !ShouldPromotePipelineLogLine(data))
         {
@@ -441,6 +649,151 @@ public class StartInput : MonoBehaviour
 
         int nextIndex = index + marker.Length;
         return nextIndex >= lower.Length || !char.IsDigit(lower[nextIndex]);
+    }
+
+    private void BeginPipelineStartupStatus(string activity)
+    {
+        ClearPipelineError();
+        PipelineStartupActive = true;
+        PipelineStatusText = "Preparing retargeting";
+        PipelineActivityText = activity;
+        PipelineProgress01 = 0.03f;
+    }
+
+    private void SetPipelineStartupError(string message)
+    {
+        HasPipelineError = true;
+        LastPipelineError = string.IsNullOrWhiteSpace(message) ? "Retargeting pipeline failed." : message;
+        PipelineStatusText = "Retargeting failed";
+        PipelineActivityText = LastPipelineError;
+        PipelineStartupActive = false;
+        PipelineProgress01 = 0f;
+    }
+
+    private void FinishPipelineStartup(string activity)
+    {
+        PipelineStatusText = "Retargeting running";
+        PipelineActivityText = string.IsNullOrWhiteSpace(activity) ? "Realtime playback started." : activity;
+        PipelineProgress01 = 1f;
+        PipelineStartupActive = false;
+    }
+
+    private void AdvancePipelineStartup(string status, string activity, float minimumProgress, float logStep = 0.012f)
+    {
+        if (!PipelineStartupActive)
+        {
+            return;
+        }
+
+        if (!string.IsNullOrWhiteSpace(status))
+        {
+            PipelineStatusText = status;
+        }
+
+        if (!string.IsNullOrWhiteSpace(activity))
+        {
+            PipelineActivityText = activity;
+        }
+
+        float stepped = Mathf.Min(0.94f, PipelineProgress01 + Mathf.Max(0f, logStep));
+        PipelineProgress01 = Mathf.Clamp01(Mathf.Max(PipelineProgress01, minimumProgress, stepped));
+    }
+
+    private void UpdatePipelineStartupFromPipelineLog(string data, QueuedUnityLogType logType)
+    {
+        if (string.IsNullOrWhiteSpace(data))
+        {
+            return;
+        }
+
+        string activity = CompactPipelineLogForHud(data);
+        if (logType == QueuedUnityLogType.Error)
+        {
+            SetPipelineStartupError(activity);
+            return;
+        }
+
+        string lower = data.ToLowerInvariant();
+        if (lower.Contains("loading models"))
+        {
+            AdvancePipelineStartup("Loading WHAM/GMR models", activity, 0.18f, 0.02f);
+        }
+        else if (lower.Contains("first frame read"))
+        {
+            AdvancePipelineStartup("Reading source video", activity, 0.32f, 0.02f);
+        }
+        else if (lower.Contains("pipeline started"))
+        {
+            AdvancePipelineStartup("Pipeline process started", activity, 0.42f, 0.02f);
+        }
+        else if (lower.Contains("csv output opened"))
+        {
+            AdvancePipelineStartup("Opening live CSV output", activity, 0.54f, 0.02f);
+        }
+        else if (lower.Contains("initialized robot="))
+        {
+            AdvancePipelineStartup("Initializing robot retargeter", activity, 0.66f, 0.02f);
+        }
+        else if (ContainsFirstCsvRowMarker(lower))
+        {
+            AdvancePipelineStartup("Writing first retargeted frame", activity, 0.78f, 0.02f);
+        }
+        else if (lower.Contains("connected to unity") || lower.Contains("sent first"))
+        {
+            AdvancePipelineStartup("Streaming preview frames", activity, 0.72f, 0.015f);
+        }
+        else
+        {
+            AdvancePipelineStartup(PipelineStatusText, activity, PipelineProgress01, 0.006f);
+        }
+    }
+
+    private void UpdatePipelineStartupFromUnityLog(string message, QueuedUnityLogType type)
+    {
+        if (string.IsNullOrWhiteSpace(message))
+        {
+            return;
+        }
+
+        if (type == QueuedUnityLogType.Error)
+        {
+            SetPipelineStartupError(message);
+            return;
+        }
+
+        string lower = message.ToLowerInvariant();
+        if (lower.Contains("csv file does not exist yet"))
+        {
+            AdvancePipelineStartup("Waiting for live CSV", message, 0.44f, 0.01f);
+        }
+        else if (lower.Contains("live_motion.csv is still empty"))
+        {
+            AdvancePipelineStartup("Waiting for GMR CSV rows", message, 0.58f, 0.01f);
+        }
+        else if (lower.Contains("realtime csv has data"))
+        {
+            AdvancePipelineStartup("Live CSV rows received", message, 0.84f, 0.02f);
+        }
+        else if (lower.Contains("realtime csv worker active"))
+        {
+            AdvancePipelineStartup("Starting CSV monitor", message, 0.38f, 0.02f);
+        }
+        else if (lower.Contains("csv appended"))
+        {
+            AdvancePipelineStartup("Receiving retargeted CSV rows", message, 0.88f, 0.012f);
+        }
+    }
+
+    private static string CompactPipelineLogForHud(string data)
+    {
+        string text = data.Trim();
+        int messageIndex = text.IndexOf(" - ", System.StringComparison.Ordinal);
+        if (messageIndex >= 0 && messageIndex + 3 < text.Length)
+        {
+            text = text.Substring(messageIndex + 3).Trim();
+        }
+
+        return text.Length <= 180 ? text : text.Substring(0, 177) + "...";
     }
 
     private void FlushUnityLogQueue()
@@ -753,7 +1106,14 @@ public class StartInput : MonoBehaviour
 
     void LateUpdate()
     {
+        if (IsRealtimeControlsLocked)
+        {
+            SetRuntimeColliderProxiesEnabledForCurrentState();
+            return;
+        }
+
         SyncRuntimeColliderProxies();
+        SetRuntimeColliderProxiesEnabledForCurrentState();
     }
 
     private void ConsumeRealtimeCsvQueues()
@@ -1124,6 +1484,24 @@ public class StartInput : MonoBehaviour
         }
     }
 
+    private void SetRuntimeColliderProxiesEnabledForCurrentState()
+    {
+        bool allowForSelected = !IsRealtimeControlsLocked;
+        foreach (var kv in _runtimeColliderProxies)
+        {
+            bool enableForRoot = allowForSelected && kv.Key != null && kv.Key == CurrentSelectedRobotRoot;
+            RuntimeRobotColliderProxy[] proxies = kv.Value;
+            if (proxies == null) continue;
+
+            for (int i = 0; i < proxies.Length; i++)
+            {
+                Collider collider = proxies[i]?.Collider;
+                if (collider == null) continue;
+                collider.enabled = enableForRoot && GetOriginalColliderEnabled(collider);
+            }
+        }
+    }
+
     private static void SyncRuntimeColliderProxies(RuntimeRobotColliderProxy[] proxies)
     {
         if (proxies == null) return;
@@ -1268,7 +1646,15 @@ public class StartInput : MonoBehaviour
     /// </summary>
     private void ApplyRobotVisibility(string selectedLabel, string selectedRobotKey)
     {
-        if (!hideInactiveRobotsOnSwitch) return;
+        CurrentSelectedRobotKey = !string.IsNullOrWhiteSpace(selectedRobotKey)
+            ? selectedRobotKey.Trim()
+            : TryResolveRobotKeyQuiet(selectedLabel);
+
+        if (!hideInactiveRobotsOnSwitch)
+        {
+            CurrentSelectedRobotRoot = ResolveSelectedRobotRootForCamera(selectedLabel, CurrentSelectedRobotKey);
+            return;
+        }
 
         // Collect every (GameObject, isSelected) pair we know about.
         // Using a dictionary keyed by GameObject so a robot listed in BOTH
@@ -1318,6 +1704,8 @@ public class StartInput : MonoBehaviour
             }
         }
 
+        AddFallbackSceneRobotRoster(roster, selectedLabel, selectedRobotKey);
+
         if (roster.Count == 0)
         {
             Debug.LogWarning("[StartInput] 没有可见性映射可用（sceneRobots 为空且没有 IMimicAgent 注册）—— 跳过可见性切换。");
@@ -1337,11 +1725,17 @@ public class StartInput : MonoBehaviour
         }
 
         int shown = 0, hidden = 0, bootstrapped = 0;
+        bool allowRuntimeColliderProxies = !IsRealtimeControlsLocked;
+        GameObject selectedRoot = null;
         foreach (var kv in roster)
         {
             GameObject root = kv.Key;
             bool isSelected = kv.Value;
             if (root == null) continue;
+            if (isSelected)
+            {
+                selectedRoot = root;
+            }
 
             // ── One-time SetActive(true) bootstrap for never-shown robots ─
             // If the scene shipped this robot SetActive(false) (typical for
@@ -1377,7 +1771,7 @@ public class StartInput : MonoBehaviour
                 if (renderers[i] != null) renderers[i].enabled = isSelected;
             }
 
-            if (isSelected)
+            if (isSelected && allowRuntimeColliderProxies)
             {
                 EnsureRuntimeCollidersForSelectedRobot(root);
                 SyncRuntimeColliderProxies(root);
@@ -1392,6 +1786,8 @@ public class StartInput : MonoBehaviour
                     if (_runtimeRobotColliders.Contains(collider))
                     {
                         ConfigureRuntimeRobotCollider(collider);
+                        collider.enabled = isSelected && allowRuntimeColliderProxies && GetOriginalColliderEnabled(collider);
+                        continue;
                     }
                     collider.enabled = isSelected && GetOriginalColliderEnabled(collider);
                 }
@@ -1423,7 +1819,123 @@ public class StartInput : MonoBehaviour
         {
             Debug.Log($"[StartInput] First-time activated {bootstrapped} robot(s) with SetActive(true) bootstrap.");
         }
+        CurrentSelectedRobotRoot = selectedRoot != null ? selectedRoot : ResolveSelectedRobotRootForCamera(selectedLabel, CurrentSelectedRobotKey);
         Debug.Log($"[StartInput] Visibility switch (Renderer+Collider mode): shown={shown}, hidden={hidden}, selected='{selectedLabel}'.");
+    }
+
+    private GameObject ResolveSelectedRobotRootForCamera(string selectedLabel, string selectedRobotKey)
+    {
+        string key = !string.IsNullOrWhiteSpace(selectedRobotKey)
+            ? selectedRobotKey.Trim()
+            : TryResolveRobotKeyQuiet(selectedLabel);
+
+        if (sceneRobots != null)
+        {
+            foreach (RobotSceneEntry entry in sceneRobots)
+            {
+                if (entry == null || entry.robotRoot == null)
+                {
+                    continue;
+                }
+
+                string entryLabel = (entry.label ?? string.Empty).Trim();
+                string entryKey = TryResolveRobotKeyQuiet(entryLabel);
+                if ((!string.IsNullOrWhiteSpace(entryLabel) &&
+                     string.Equals(entryLabel, selectedLabel, System.StringComparison.OrdinalIgnoreCase)) ||
+                    (!string.IsNullOrWhiteSpace(entryLabel) &&
+                     string.Equals(entryLabel, key, System.StringComparison.OrdinalIgnoreCase)) ||
+                    (!string.IsNullOrWhiteSpace(entryKey) &&
+                     string.Equals(entryKey, key, System.StringComparison.OrdinalIgnoreCase)))
+                {
+                    return entry.robotRoot;
+                }
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(key) && MimicAgentRegistry.Instance != null)
+        {
+            IMimicAgent agent = MimicAgentRegistry.Instance.FindByKey(key);
+            if (agent?.AgentGameObject != null)
+            {
+                return agent.AgentGameObject;
+            }
+        }
+
+        switch ((key ?? string.Empty).Trim().ToLowerInvariant())
+        {
+            case "unitree_g1":
+                return FindFallbackRobotRoot("G1", "unitree_g1", "g1_29dof_rev_1_0");
+            case "unitree_h1":
+                return FindFallbackRobotRoot("H1", "h1", "unitree_h1");
+            case "x02lite":
+                return FindFallbackRobotRoot("X02Lite", "x02lite", "X02");
+            case "openloong":
+                return FindFallbackRobotRoot("OpenLoong", "openloong");
+            default:
+                return FindFallbackRobotRoot(selectedLabel, key);
+        }
+    }
+
+    private void AddFallbackSceneRobotRoster(Dictionary<GameObject, bool> roster, string selectedLabel, string selectedRobotKey)
+    {
+        AddFallbackRobotRoot(roster, selectedLabel, selectedRobotKey, "unitree_g1", "G1", "unitree_g1", "g1_29dof_rev_1_0");
+        AddFallbackRobotRoot(roster, selectedLabel, selectedRobotKey, "unitree_h1", "H1", "h1", "unitree_h1");
+        AddFallbackRobotRoot(roster, selectedLabel, selectedRobotKey, "x02lite", "X02Lite", "x02lite", "X02");
+        AddFallbackRobotRoot(roster, selectedLabel, selectedRobotKey, "openloong", "OpenLoong", "openloong");
+    }
+
+    private void AddFallbackRobotRoot(Dictionary<GameObject, bool> roster, string selectedLabel, string selectedRobotKey, string robotKey, params string[] sceneNames)
+    {
+        GameObject root = FindFallbackRobotRoot(sceneNames);
+        if (root == null)
+        {
+            return;
+        }
+
+        bool match = string.Equals(selectedRobotKey, robotKey, System.StringComparison.OrdinalIgnoreCase);
+        if (!match && !string.IsNullOrWhiteSpace(selectedLabel))
+        {
+            string labelKey = TryResolveRobotKeyQuiet(selectedLabel);
+            match = string.Equals(labelKey, robotKey, System.StringComparison.OrdinalIgnoreCase);
+        }
+
+        if (!roster.ContainsKey(root) || match)
+        {
+            roster[root] = match;
+        }
+    }
+
+    private static GameObject FindFallbackRobotRoot(params string[] sceneNames)
+    {
+        for (int pass = 0; pass < 2; pass++)
+        {
+            bool requireActive = pass == 0;
+            foreach (string name in sceneNames)
+            {
+                if (string.IsNullOrWhiteSpace(name))
+                {
+                    continue;
+                }
+
+                foreach (Transform transform in FindObjectsOfType<Transform>(true))
+                {
+                    if (transform == null ||
+                        !string.Equals(transform.name, name, System.StringComparison.OrdinalIgnoreCase) ||
+                        (requireActive && !transform.gameObject.activeInHierarchy))
+                    {
+                        continue;
+                    }
+
+                    if (transform.GetComponentInChildren<ArticulationBody>(true) != null ||
+                        transform.GetComponentInChildren<Renderer>(true) != null)
+                    {
+                        return transform.gameObject;
+                    }
+                }
+            }
+        }
+
+        return null;
     }
 
     private IEnumerator ApplyInitialRobotSelectionStateNextFrame()
@@ -1544,6 +2056,7 @@ public class StartInput : MonoBehaviour
         string selectedKey = TryResolveRobotKeyQuiet(selectedRaw);
         Debug.LogWarning("[StartInput] Start button clicked.");
         AppendDebugLogLine("[StartInput] Start button clicked.");
+        BeginPipelineStartupStatus($"Start clicked. robot='{selectedKey}', validating launch settings...");
         LogVerbose($"Start click: selectedRaw='{selectedRaw}', selectedKey='{selectedKey}', runBashOnClick={runBashOnClick}, monitorCsvOnClick={monitorCsvOnClick}");
 
         bool launchOk = true;
@@ -1569,6 +2082,9 @@ public class StartInput : MonoBehaviour
         else
         {
             SetRealtimeDropdownsInteractable(true);
+            SetPipelineStartupError(!launchOk
+                ? "Failed to launch WHAM/GMR process. Check run.ps1 path and pipeline logs."
+                : "Failed to start live CSV monitor.");
             if (launchOk && runBashOnClick && !monitorOk)
             {
                 StopBashProcessAsync(null);
@@ -1596,6 +2112,9 @@ public class StartInput : MonoBehaviour
 
     public void StopStartPipeline()
     {
+        PipelineStartupActive = false;
+        PipelineStatusText = "Retargeting stopped";
+        PipelineActivityText = "Stop requested.";
         StopCsvMonitor();
         EndActiveRealtimeCsv();
         SetRealtimeDropdownsInteractable(true);
@@ -1763,8 +2282,13 @@ public class StartInput : MonoBehaviour
         string resolvedVideoPath = ResolveVideoPath(resolvedWorkingDir);
         string commandArguments = BuildCommandArguments(executablePrefixArgs, resolvedScriptPath);
         ResetDebugLogFile();
+        bool streamWhamToUnity = enableTcpStreaming && recordWhamVideo;
+        bool streamGmrToUnity = enableTcpStreaming && recordGmrVideo;
+        bool effectiveTcpStreaming = streamWhamToUnity || streamGmrToUnity;
         bool effectiveRecordGmrVideo = recordGmrVideo && !(enableTcpStreaming && disablePreviewVideoWhenTcpStreaming);
         bool effectiveRecordWhamVideo = recordWhamVideo && !(enableTcpStreaming && disablePreviewVideoWhenTcpStreaming);
+        ClearDisabledStreamReceiverTargets(streamWhamToUnity, streamGmrToUnity);
+        ClearDisabledRecordingOutputs(resolvedOutputRootPath, effectiveRecordWhamVideo, effectiveRecordGmrVideo);
         string requestedGmrTorchDevice = string.IsNullOrWhiteSpace(gmrTorchDevice) ? "cpu" : gmrTorchDevice.Trim();
         string launchGmrTorchDevice = "cpu";
         if (!string.Equals(requestedGmrTorchDevice, "cpu", System.StringComparison.OrdinalIgnoreCase))
@@ -1778,9 +2302,24 @@ public class StartInput : MonoBehaviour
         LogVerbose(
             $"Resolved launch config: selectedRobot='{selectedRobot}', resolvedRobot='{resolvedRobot}', " +
             $"workingDir='{resolvedWorkingDir}', script='{resolvedScriptPath}', outputRoot='{resolvedOutputRootPath}', " +
-            $"csv='{resolvedCsvPath}', video='{resolvedVideoPath}', tcp={enableTcpStreaming}, track={track}, " +
+            $"csv='{resolvedCsvPath}', video='{resolvedVideoPath}', tcp={effectiveTcpStreaming} (raw={enableTcpStreaming}), " +
+            $"tcpWham={streamWhamToUnity}, tcpGmr={streamGmrToUnity}, track={track}, " +
             $"recordGmr={effectiveRecordGmrVideo} (raw={recordGmrVideo}), recordWham={effectiveRecordWhamVideo} (raw={recordWhamVideo}), " +
             $"gmrTorchDevice='{launchGmrTorchDevice}' (requested='{requestedGmrTorchDevice}')");
+
+        if (!effectiveRecordWhamVideo &&
+            commandArguments.IndexOf("--record_whamvideo", System.StringComparison.OrdinalIgnoreCase) >= 0)
+        {
+            SetPipelineStartupError("Record WHAM Video is disabled, but launch arguments still contain --record_whamvideo.");
+            return false;
+        }
+
+        if (!effectiveRecordGmrVideo &&
+            commandArguments.IndexOf("--record_gmrvideo", System.StringComparison.OrdinalIgnoreCase) >= 0)
+        {
+            SetPipelineStartupError("Record GMR Video is disabled, but launch arguments still contain --record_gmrvideo.");
+            return false;
+        }
 
         try
         {
@@ -1810,8 +2349,23 @@ public class StartInput : MonoBehaviour
 
             startInfo.EnvironmentVariables["OUTPUT_ROOT"] = resolvedOutputRootPath;
             startInfo.EnvironmentVariables["ROBOT"] = resolvedRobot;
+            // Disable run.ps1's legacy RECORD_VIDEO fallback. The split WHAM/GMR
+            // flags below are the only recording source of truth from the HUD.
+            startInfo.EnvironmentVariables["RECORD_VIDEO"] = "0";
             startInfo.EnvironmentVariables["RECORD_GMRVIDEO"] = effectiveRecordGmrVideo ? "1" : "0";
             startInfo.EnvironmentVariables["RECORD_WHAMVIDEO"] = effectiveRecordWhamVideo ? "1" : "0";
+            if (!effectiveRecordWhamVideo && startInfo.EnvironmentVariables["RECORD_WHAMVIDEO"] != "0")
+            {
+                SetPipelineStartupError("Invalid launch config: Record WHAM Video is disabled but RECORD_WHAMVIDEO would be enabled.");
+                return false;
+            }
+
+            if (!effectiveRecordGmrVideo && startInfo.EnvironmentVariables["RECORD_GMRVIDEO"] != "0")
+            {
+                SetPipelineStartupError("Invalid launch config: Record GMR Video is disabled but RECORD_GMRVIDEO would be enabled.");
+                return false;
+            }
+
             if (!string.IsNullOrWhiteSpace(resolvedVideoPath))
             {
                 startInfo.EnvironmentVariables["VIDEO"] = resolvedVideoPath;
@@ -1828,8 +2382,20 @@ public class StartInput : MonoBehaviour
             startInfo.EnvironmentVariables["GMR_CSV_FLUSH_INTERVAL"] = Mathf.Max(1, gmrCsvFlushInterval).ToString(CultureInfo.InvariantCulture);
             startInfo.EnvironmentVariables["WHAM_TAIL_FLUSH_INTERVAL"] = Mathf.Max(1, whamTailFlushInterval).ToString(CultureInfo.InvariantCulture);
             startInfo.EnvironmentVariables["PIPELINE_HEARTBEAT_FRAMES"] = Mathf.Max(1, pipelineHeartbeatFrames).ToString(CultureInfo.InvariantCulture);
+            startInfo.EnvironmentVariables["CAMERA_FOLLOW"] = (gmrCameraFollow || track) ? "1" : "0";
+            startInfo.EnvironmentVariables["CAMERA_LOOKAT_HEIGHT_OFFSET"] = gmrCameraLookatHeightOffset.ToString("F3", CultureInfo.InvariantCulture);
+            startInfo.EnvironmentVariables["CAMERA_ELEVATION"] = gmrCameraElevation.ToString("F3", CultureInfo.InvariantCulture);
+            startInfo.EnvironmentVariables["CAMERA_DISTANCE_SCALE"] = Mathf.Max(0.1f, gmrCameraDistanceScale).ToString("F3", CultureInfo.InvariantCulture);
+            startInfo.EnvironmentVariables["GMR_TCP_RENDER_WIDTH"] = Mathf.Max(320, gmrTcpRenderWidth).ToString(CultureInfo.InvariantCulture);
+            startInfo.EnvironmentVariables["GMR_TCP_RENDER_HEIGHT"] = Mathf.Max(240, gmrTcpRenderHeight).ToString(CultureInfo.InvariantCulture);
+            if (!string.IsNullOrWhiteSpace(gmrCameraAzimuth))
+            {
+                startInfo.EnvironmentVariables["CAMERA_AZIMUTH"] = gmrCameraAzimuth.Trim();
+            }
             startInfo.EnvironmentVariables["TRACK"] = track ? "1" : "0";
-            startInfo.EnvironmentVariables["TCP"] = enableTcpStreaming ? "1" : "0";
+            startInfo.EnvironmentVariables["TCP"] = effectiveTcpStreaming ? "1" : "0";
+            startInfo.EnvironmentVariables["TCP_STREAM_WHAM"] = streamWhamToUnity ? "1" : "0";
+            startInfo.EnvironmentVariables["TCP_STREAM_GMR"] = streamGmrToUnity ? "1" : "0";
             Process process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
             lock (processStateLock)
             {
@@ -1885,8 +2451,12 @@ public class StartInput : MonoBehaviour
                 ", VIDEO=" + (string.IsNullOrWhiteSpace(resolvedVideoPath) ? "<run.ps1 default>" : resolvedVideoPath) +
                 ", OUTPUT_ROOT=" + resolvedOutputRootPath +
                 ", CSV=" + resolvedCsvPath +
-                ", TCP=" + (enableTcpStreaming ? "1" : "0") +
+                ", TCP=" + (effectiveTcpStreaming ? "1" : "0") +
+                " (raw=" + (enableTcpStreaming ? "1" : "0") + ")" +
+                ", TCP_STREAM_WHAM=" + (streamWhamToUnity ? "1" : "0") +
+                ", TCP_STREAM_GMR=" + (streamGmrToUnity ? "1" : "0") +
                 ", TRACK=" + (track ? "1" : "0") +
+                ", RECORD_VIDEO=0" +
                 ", RECORD_WHAMVIDEO=" + (effectiveRecordWhamVideo ? "1" : "0") +
                 ", RECORD_GMRVIDEO=" + (effectiveRecordGmrVideo ? "1" : "0");
             Debug.Log(pipelineEnvLine);
@@ -1897,6 +2467,65 @@ public class StartInput : MonoBehaviour
         {
             Debug.LogError($"启动 Bash 命令失败: {e.Message}");
             return false;
+        }
+    }
+
+    private void ClearDisabledStreamReceiverTargets(bool streamWhamToUnity, bool streamGmrToUnity)
+    {
+        StreamReceiver receiver = FindObjectOfType<StreamReceiver>(true);
+        if (receiver == null)
+        {
+            return;
+        }
+
+        if (!streamWhamToUnity && !streamGmrToUnity)
+        {
+            receiver.ClearAllStreams();
+            return;
+        }
+
+        if (!streamWhamToUnity)
+        {
+            receiver.ClearStream(0);
+        }
+
+        if (!streamGmrToUnity)
+        {
+            receiver.ClearStream(1);
+        }
+    }
+
+    private void ClearDisabledRecordingOutputs(string outputRootPath, bool effectiveRecordWhamVideo, bool effectiveRecordGmrVideo)
+    {
+        if (string.IsNullOrWhiteSpace(outputRootPath))
+        {
+            return;
+        }
+
+        if (!effectiveRecordWhamVideo)
+        {
+            TryDeleteStaleOutputFile(Path.Combine(outputRootPath, "stream_demo", "output.mp4"));
+        }
+
+        if (!effectiveRecordGmrVideo)
+        {
+            TryDeleteStaleOutputFile(Path.Combine(outputRootPath, "video", "live_stream_robot.mp4"));
+        }
+    }
+
+    private void TryDeleteStaleOutputFile(string filePath)
+    {
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(filePath) && File.Exists(filePath))
+            {
+                File.Delete(filePath);
+                AppendDebugLogLine($"[StartInput] Deleted stale disabled recording output: {filePath}");
+            }
+        }
+        catch (System.Exception e)
+        {
+            Debug.LogWarning($"[StartInput] Could not delete stale recording output '{filePath}': {e.Message}");
         }
     }
 
@@ -2120,6 +2749,7 @@ public class StartInput : MonoBehaviour
         csvReadOffset = 0;
         csvPendingText = string.Empty;
         realtimeSourceRowsRead = 0;
+        ResetRealtimeCsvSafetyGate();
         pendingRealtimeRows.Clear();
         DrainRealtimeCsvQueues();
         if (writeDebugLogFile && string.IsNullOrWhiteSpace(resolvedDebugLogPath))
@@ -2647,7 +3277,14 @@ public class StartInput : MonoBehaviour
             return;
         }
 
-        realtimeSourceRowsRead += rows.Count;
+        int receivedRowCount = rows.Count;
+        rows = FilterSafeRealtimeCsvRows(rows);
+        if (rows.Count == 0)
+        {
+            return;
+        }
+
+        realtimeSourceRowsRead += receivedRowCount;
         float playbackFps = ClampRealtimeCsvFps(producerFps);
         float playbackBufferSeconds = ResolveRealtimePlaybackBufferSeconds(activeRealtimeMimicAgent.RobotKey, playbackFps);
         activeRealtimeCsvAgent.SetRealtimePlaybackRate(playbackFps, playbackBufferSeconds);
@@ -2689,15 +3326,186 @@ public class StartInput : MonoBehaviour
             }
 
             replayBootstrapped = true;
-            Debug.Log(
+            string playbackStartedMessage =
                 $"[StartInput] Realtime CSV playback started for '{activeRealtimeMimicAgent.RobotKey}' after {realtimeSourceRowsRead} source rows: {resolvedCsvPath}. " +
                 $"expectedColumns={activeRealtimeCsvAgent.ExpectedCsvColumns}, warmupRows={Mathf.Max(1, realtimeWarmupSourceRows)}, " +
                 $"producerFps={playbackFps:F2}, playbackBuffer={playbackBufferSeconds:F2}s, selectedRobot='{ResolveSelectedRobotName()}', bufferedBatches={realtimeCsvRowsQueue.Count}, " +
-                $"rootMapping=csv[0..2]->Unity(-y,z,x), quat=csv[3..6]->Unity(-y,z,x,-w)");
+                $"rootMapping=csv[0..2]->Unity(-y,z,x), quat=csv[3..6]->Unity(-y,z,x,-w)";
+            FinishPipelineStartup(playbackStartedMessage);
+            Debug.Log(playbackStartedMessage);
             return;
         }
 
         activeRealtimeCsvAgent.AppendRealtimeCsvRows(rows);
+    }
+
+    private List<float[]> FilterSafeRealtimeCsvRows(List<float[]> rows)
+    {
+        if (!enableRealtimeCsvSafetyGate || rows == null || rows.Count == 0)
+        {
+            return rows;
+        }
+
+        int expectedColumns = activeRealtimeCsvAgent != null ? activeRealtimeCsvAgent.ExpectedCsvColumns : 0;
+        var accepted = new List<float[]>(rows.Count);
+        for (int i = 0; i < rows.Count; i++)
+        {
+            float[] row = rows[i];
+            if (IsRealtimeCsvRowSafe(row, expectedColumns, out string reason))
+            {
+                accepted.Add(row);
+                lastAcceptedRealtimeRow = row;
+                consecutiveRejectedRealtimeRows = 0;
+                realtimeSafetyWarningLogged = false;
+                continue;
+            }
+
+            consecutiveRejectedRealtimeRows++;
+            string message =
+                $"[StartInput] Realtime CSV safety gate rejected row for '{activeRealtimeMimicAgent?.RobotKey ?? "<none>"}': {reason}. " +
+                $"consecutiveRejected={consecutiveRejectedRealtimeRows}/{Mathf.Max(1, realtimeMaxConsecutiveRejectedRows)}, csv='{resolvedCsvPath}'.";
+            if (!realtimeSafetyWarningLogged || consecutiveRejectedRealtimeRows >= Mathf.Max(1, realtimeMaxConsecutiveRejectedRows))
+            {
+                Debug.LogWarning(message);
+                AppendDebugLogLine(message);
+                realtimeSafetyWarningLogged = true;
+            }
+
+            if (consecutiveRejectedRealtimeRows >= Mathf.Max(1, realtimeMaxConsecutiveRejectedRows))
+            {
+                AbortUnsafeRealtimeCsv(message);
+                break;
+            }
+        }
+
+        return accepted;
+    }
+
+    private bool IsRealtimeCsvRowSafe(float[] row, int expectedColumns, out string reason)
+    {
+        reason = string.Empty;
+        if (row == null)
+        {
+            reason = "row is null";
+            return false;
+        }
+
+        if (expectedColumns > 0 && row.Length != expectedColumns)
+        {
+            reason = $"column count mismatch ({row.Length} != {expectedColumns})";
+            return false;
+        }
+
+        if (row.Length < 7)
+        {
+            reason = $"row has too few columns ({row.Length})";
+            return false;
+        }
+
+        for (int i = 0; i < row.Length; i++)
+        {
+            float value = row[i];
+            if (float.IsNaN(value) || float.IsInfinity(value))
+            {
+                reason = $"non-finite value at column {i}";
+                return false;
+            }
+        }
+
+        if (row.Length >= 7)
+        {
+            float maxAbsRoot = Mathf.Max(1f, realtimeMaxAbsRootPositionMeters);
+            for (int i = 0; i < 3; i++)
+            {
+                if (Mathf.Abs(row[i]) > maxAbsRoot)
+                {
+                    reason = $"root column {i} absolute value {row[i]:F3}m > {maxAbsRoot:F3}m";
+                    return false;
+                }
+            }
+
+            float quatMagnitude = Mathf.Sqrt(row[3] * row[3] + row[4] * row[4] + row[5] * row[5] + row[6] * row[6]);
+            if (quatMagnitude < 0.1f)
+            {
+                reason = $"invalid root quaternion magnitude {quatMagnitude:F4}";
+                return false;
+            }
+        }
+
+        float maxAbsJoint = Mathf.Max(1f, realtimeMaxAbsJointRadians);
+        for (int i = 7; i < row.Length; i++)
+        {
+            if (Mathf.Abs(row[i]) > maxAbsJoint)
+            {
+                reason = $"joint column {i} absolute value {row[i]:F3}rad > {maxAbsJoint:F3}rad";
+                return false;
+            }
+        }
+
+        if (lastAcceptedRealtimeRow == null || lastAcceptedRealtimeRow.Length != row.Length)
+        {
+            return true;
+        }
+
+        float rootJump = Vector3.Distance(
+            new Vector3(lastAcceptedRealtimeRow[0], lastAcceptedRealtimeRow[1], lastAcceptedRealtimeRow[2]),
+            new Vector3(row[0], row[1], row[2]));
+        if (rootJump > Mathf.Max(0.01f, realtimeMaxRootJumpMeters))
+        {
+            reason = $"root jump {rootJump:F3}m > {realtimeMaxRootJumpMeters:F3}m";
+            return false;
+        }
+
+        if (row.Length >= 7)
+        {
+            Quaternion previous = NormalizeCsvQuaternion(lastAcceptedRealtimeRow);
+            Quaternion current = NormalizeCsvQuaternion(row);
+            float angle = Quaternion.Angle(previous, current);
+            if (angle > Mathf.Max(1f, realtimeMaxRootRotationJumpDegrees))
+            {
+                reason = $"root rotation jump {angle:F1}deg > {realtimeMaxRootRotationJumpDegrees:F1}deg";
+                return false;
+            }
+        }
+
+        float jointLimit = Mathf.Max(0.01f, realtimeMaxJointJumpRadians);
+        for (int i = 7; i < row.Length; i++)
+        {
+            float delta = Mathf.Abs(row[i] - lastAcceptedRealtimeRow[i]);
+            if (delta > jointLimit)
+            {
+                reason = $"joint column {i} jump {delta:F3}rad > {jointLimit:F3}rad";
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static Quaternion NormalizeCsvQuaternion(float[] row)
+    {
+        var q = new Quaternion(row[3], row[4], row[5], row[6]);
+        float magnitude = Mathf.Sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+        if (magnitude < 0.0001f)
+        {
+            return Quaternion.identity;
+        }
+
+        float inv = 1f / magnitude;
+        return new Quaternion(q.x * inv, q.y * inv, q.z * inv, q.w * inv);
+    }
+
+    private void ResetRealtimeCsvSafetyGate()
+    {
+        lastAcceptedRealtimeRow = null;
+        consecutiveRejectedRealtimeRows = 0;
+        realtimeSafetyWarningLogged = false;
+    }
+
+    private void AbortUnsafeRealtimeCsv(string message)
+    {
+        SetPipelineStartupError(message);
+        StopCsvMonitor();
     }
 
     private void AbortRealtimeCsvBootstrap()
@@ -2722,6 +3530,7 @@ public class StartInput : MonoBehaviour
         csvReadOffset = 0;
         csvPendingText = string.Empty;
         realtimeSourceRowsRead = 0;
+        ResetRealtimeCsvSafetyGate();
         replayBootstrapped = false;
         firstNonEmptyCsvLogged = false;
         pendingRealtimeRows.Clear();
@@ -2742,6 +3551,7 @@ public class StartInput : MonoBehaviour
         csvPendingText = string.Empty;
         csvReadOffset = 0;
         realtimeSourceRowsRead = 0;
+        ResetRealtimeCsvSafetyGate();
         replayBootstrapped = false;
     }
 

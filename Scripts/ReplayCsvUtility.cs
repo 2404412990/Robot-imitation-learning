@@ -40,7 +40,42 @@ public static class ReplayCsvUtility
             {
                 row[j] = Mathf.Lerp(source[left][j], source[right][j], ratio);
             }
+            InterpolateRootQuaternion(source[left], source[right], ratio, row, dimension);
             result.Add(row);
+        }
+
+        return result;
+    }
+
+    public static List<float[]> CopyRows(IReadOnlyList<float[]> source, int expectedDimension)
+    {
+        var result = new List<float[]>();
+        if (source == null)
+        {
+            return result;
+        }
+
+        int dimension = expectedDimension > 0
+            ? expectedDimension
+            : (source.Count > 0 && source[0] != null ? source[0].Length : 0);
+        if (dimension <= 0)
+        {
+            return result;
+        }
+
+        for (int i = 0; i < source.Count; i++)
+        {
+            float[] row = source[i];
+            if (row == null || row.Length < dimension)
+            {
+                Debug.LogWarning($"[ReplayCsvUtility] Skip replay row with invalid column count: {row?.Length ?? 0}, expected {dimension}.");
+                continue;
+            }
+
+            float[] copy = new float[dimension];
+            System.Array.Copy(row, 0, copy, 0, dimension);
+            NormalizeRootQuaternion(copy, dimension);
+            result.Add(copy);
         }
 
         return result;
@@ -187,6 +222,7 @@ public static class ReplayCsvUtility
         {
             destination[i] = Mathf.Lerp(leftRow[i], rightRow[i], ratio);
         }
+        InterpolateRootQuaternion(leftRow, rightRow, ratio, destination, dimension);
 
         return true;
     }
@@ -240,7 +276,69 @@ public static class ReplayCsvUtility
         {
             row[j] = Mathf.Lerp(source[left][j], source[right][j], ratio);
         }
+        InterpolateRootQuaternion(source[left], source[right], ratio, row, dimension);
 
         return row;
+    }
+
+    private static void InterpolateRootQuaternion(float[] leftRow, float[] rightRow, float ratio, float[] destination, int dimension)
+    {
+        if (leftRow == null || rightRow == null || destination == null || dimension < 7)
+        {
+            NormalizeRootQuaternion(destination, dimension);
+            return;
+        }
+
+        float lx = leftRow[3];
+        float ly = leftRow[4];
+        float lz = leftRow[5];
+        float lw = leftRow[6];
+        float rx = rightRow[3];
+        float ry = rightRow[4];
+        float rz = rightRow[5];
+        float rw = rightRow[6];
+
+        float dot = lx * rx + ly * ry + lz * rz + lw * rw;
+        if (dot < 0f)
+        {
+            rx = -rx;
+            ry = -ry;
+            rz = -rz;
+            rw = -rw;
+        }
+
+        destination[3] = Mathf.Lerp(lx, rx, ratio);
+        destination[4] = Mathf.Lerp(ly, ry, ratio);
+        destination[5] = Mathf.Lerp(lz, rz, ratio);
+        destination[6] = Mathf.Lerp(lw, rw, ratio);
+        NormalizeRootQuaternion(destination, dimension);
+    }
+
+    private static void NormalizeRootQuaternion(float[] row, int dimension)
+    {
+        if (row == null || dimension < 7)
+        {
+            return;
+        }
+
+        float x = row[3];
+        float y = row[4];
+        float z = row[5];
+        float w = row[6];
+        float sqrMagnitude = x * x + y * y + z * z + w * w;
+        if (float.IsNaN(sqrMagnitude) || float.IsInfinity(sqrMagnitude) || sqrMagnitude < 1e-8f)
+        {
+            row[3] = 0f;
+            row[4] = 0f;
+            row[5] = 0f;
+            row[6] = 1f;
+            return;
+        }
+
+        float invMagnitude = 1f / Mathf.Sqrt(sqrMagnitude);
+        row[3] = x * invMagnitude;
+        row[4] = y * invMagnitude;
+        row[5] = z * invMagnitude;
+        row[6] = w * invMagnitude;
     }
 }
