@@ -279,8 +279,8 @@ class _HeadlessViewer:
     """
 
     def __init__(self, robot_type, camera_follow=True, motion_fps=30,
-                 camera_lookat_height_offset=0.75, camera_elevation=-5.0,
-                 camera_distance_scale=1.0, camera_azimuth=None,
+                 camera_lookat_height_offset=0.50, camera_elevation=-28.0,
+                 camera_distance_scale=1.70, camera_azimuth=None,
                  robot_path=None, **_kwargs):
         from general_motion_retargeting.params import ROBOT_XML_DICT, ROBOT_BASE_DICT, VIEWER_CAM_DISTANCE_DICT
 
@@ -294,7 +294,7 @@ class _HeadlessViewer:
         self.motion_fps = motion_fps
         self.camera_follow = camera_follow
         self.camera_lookat_height_offset = float(camera_lookat_height_offset)
-        self.camera_elevation = float(camera_elevation)
+        self.camera_elevation = -abs(float(camera_elevation))
         self.camera_distance_scale = float(camera_distance_scale)
         self.camera_azimuth = camera_azimuth
 
@@ -306,6 +306,32 @@ class _HeadlessViewer:
 
         self.viewer = type('_CamHolder', (), {'cam': self._cam})()
 
+    def _camera_lookat_from_robot_bounds(self):
+        positions = np.asarray(self.data.xpos[1:], dtype=np.float64)
+        if positions.size == 0:
+            return np.asarray(self.data.qpos[:3], dtype=np.float64).copy(), 0.5
+
+        finite_mask = np.isfinite(positions).all(axis=1)
+        positions = positions[finite_mask]
+        if positions.size == 0:
+            return np.asarray(self.data.qpos[:3], dtype=np.float64).copy(), 0.5
+
+        bounds_min = positions.min(axis=0)
+        bounds_max = positions.max(axis=0)
+        lookat = (bounds_min + bounds_max) * 0.5
+        radius = float(np.linalg.norm(bounds_max - bounds_min) * 0.5)
+        lookat[2] += self.camera_lookat_height_offset
+        return lookat, max(radius, 0.5)
+
+    def _update_follow_camera(self):
+        lookat, radius = self._camera_lookat_from_robot_bounds()
+        self._cam.lookat[:] = lookat
+        base_distance = self.viewer_cam_distance * max(0.1, self.camera_distance_scale)
+        self._cam.distance = max(base_distance, radius * 2.7)
+        self._cam.elevation = self.camera_elevation
+        if self.camera_azimuth is not None:
+            self._cam.azimuth = float(self.camera_azimuth)
+
     def step(self, root_pos, root_rot, dof_pos, human_motion_data=None,
              show_human_body_name=False, human_pos_offset=None, rate_limit=False,
              follow_camera=True, human_point_scale=0.1):
@@ -315,16 +341,7 @@ class _HeadlessViewer:
         mj.mj_forward(self.model, self.data)
 
         if follow_camera:
-            try:
-                lookat = self.data.xpos[self.model.body(self.robot_base).id].copy()
-            except Exception:
-                lookat = np.asarray(self.data.qpos[:3], dtype=np.float64).copy()
-            lookat[2] += self.camera_lookat_height_offset
-            self._cam.lookat[:] = lookat
-            self._cam.distance = self.viewer_cam_distance * max(0.1, self.camera_distance_scale)
-            self._cam.elevation = self.camera_elevation
-            if self.camera_azimuth is not None:
-                self._cam.azimuth = float(self.camera_azimuth)
+            self._update_follow_camera()
 
     def close(self):
         pass
@@ -375,6 +392,8 @@ def run_stream_mt(
     detect_interval = max(1, int(os.environ.get('WHAM_DETECT_INTERVAL', '2')))
     infer_interval = max(1, int(os.environ.get('WHAM_INFER_INTERVAL', '1')))
     stream_seq_len = max(4, int(os.environ.get('WHAM_STREAM_SEQ_LEN', str(STREAM_SEQ_LEN))))
+    tcp_stream_wham = env_flag('TCP_STREAM_WHAM', True)
+    tcp_stream_gmr = env_flag('TCP_STREAM_GMR', True)
 
     if is_cuda_device:
         torch.backends.cudnn.benchmark = True
@@ -404,6 +423,7 @@ def run_stream_mt(
     logger.info(
         f"[Input] source={'webcam:0' if is_webcam else video_path} capture_time={webcam_capture_time:.2f}s "
         f"record_whamvideo={int(record_whamvideo)} tcp_requested={int(bool(getattr(gmr_args, 'tcp', False)))} "
+        f"tcp_stream_wham={int(tcp_stream_wham)} tcp_stream_gmr={int(tcp_stream_gmr)} "
         f"heartbeat_frames={heartbeat_frames}"
     )
     if preview_window_enabled and os.name != 'nt' and not os.environ.get('DISPLAY'):
@@ -486,9 +506,10 @@ def run_stream_mt(
         if for_capture and not bool(getattr(gmr_args, "tcp", False)):
             return 480, 640, "screenshot capture"
 
-        base_h = max(120, int(os.environ.get("GMR_TCP_RENDER_HEIGHT", "240")))
+        base_h = max(120, int(os.environ.get("GMR_TCP_RENDER_HEIGHT", "720")))
+        requested_w = int(os.environ.get("GMR_TCP_RENDER_WIDTH", "0") or "0")
         aspect = max(0.1, min(10.0, width / max(float(height), 1.0)))
-        base_w = max(2, int(round(base_h * aspect)))
+        base_w = max(2, requested_w if requested_w > 0 else int(round(base_h * aspect)))
         return base_h, base_w, f"Unity streaming aspect={aspect:.3f}"
 
     def gmr_window_size():
@@ -1301,7 +1322,7 @@ def run_stream_mt(
         )
         
         # Create MuJoCo viewer when needed: recording, screenshot capture, or TCP streaming
-        _need_viewer = gmr_args.record_gmrvideo or capture_interval > 0 or gmr_args.tcp
+        _need_viewer = gmr_args.record_gmrvideo or capture_interval > 0 or (gmr_args.tcp and tcp_stream_gmr)
         _is_headless = not os.environ.get('DISPLAY')
         if _need_viewer:
             v_kws = dict(
@@ -1338,7 +1359,7 @@ def run_stream_mt(
                     logger.error(f"Failed to initialize headless GMR viewer: {e}")
                     gmr_state["viewer"] = None
 
-                if gmr_state["viewer"] is not None and (gmr_args.tcp or capture_interval > 0):
+                if gmr_state["viewer"] is not None and ((gmr_args.tcp and tcp_stream_gmr) or capture_interval > 0):
                     try:
                         v = gmr_state["viewer"]
                         h, w, render_reason = gmr_renderer_size(capture_interval > 0)
@@ -1356,7 +1377,7 @@ def run_stream_mt(
                     logger.info(f"Initialized GMR viewer for {gmr_args.robot}")
 
                     # Offscreen renderer for TCP streaming and screenshot capture
-                    if gmr_args.tcp or capture_interval > 0:
+                    if (gmr_args.tcp and tcp_stream_gmr) or capture_interval > 0:
                         v = gmr_state["viewer"]
                         h, w, render_reason = gmr_renderer_size(capture_interval > 0)
                         gmr_state["renderer"] = mj.Renderer(v.model, height=h, width=w)
@@ -1366,7 +1387,7 @@ def run_stream_mt(
                     gmr_state["viewer"] = None
 
     # TCP sender for streaming WHAM (streamId=0) and GMR (streamId=1) frames to Unity
-    if gmr_args.tcp:
+    if gmr_args.tcp and (tcp_stream_wham or tcp_stream_gmr):
         tcp_sender = TcpStreamSender()
         gmr_state["tcp_sender"] = tcp_sender
     else:
@@ -1579,7 +1600,9 @@ def run_stream_mt(
                         # Capture GMR offscreen frame for Unity (streamId=1)
                         gmr_renderer = gmr_state.get("renderer")
                         tcp = gmr_state.get("tcp_sender")
-                        if gmr_renderer is not None and tcp is not None:
+                        if tcp_stream_gmr and gmr_renderer is not None and tcp is not None:
+                            if not tcp.connected:
+                                tcp.connect()
                             gmr_renderer.update_scene(gmr_state["viewer"].data, camera=gmr_state["viewer"].viewer.cam)
                             gmr_rgb = gmr_renderer.render()
                             gmr_bgr = cv2.cvtColor(gmr_rgb, cv2.COLOR_RGB2BGR)
@@ -1668,9 +1691,9 @@ def run_stream_mt(
 
         # Send WHAM frame to Unity via TCP (streamId=0)
         tcp = gmr_state.get("tcp_sender")
-        if tcp is not None and not tcp.connected:
+        if tcp_stream_wham and tcp is not None and not tcp.connected:
             tcp.connect()
-        if tcp is not None and frame is not None:
+        if tcp_stream_wham and tcp is not None and frame is not None:
             if tcp.send_frame(0, frame) and not gmr_state.get("_tcp_wham_logged", False):
                 logger.info("[TCP] Sent first WHAM frame to Unity streamId=0")
                 gmr_state["_tcp_wham_logged"] = True
@@ -1870,9 +1893,9 @@ if __name__ == '__main__':
     parser.add_argument("--no-tcp", dest="tcp", action="store_false")
     parser.add_argument("--no_tcp", dest="tcp", action="store_false")
     parser.set_defaults(tcp=False)
-    parser.add_argument("--camera_lookat_height_offset", type=float, default=0.25)
-    parser.add_argument("--camera_elevation", type=float, default=12.0)
-    parser.add_argument("--camera_distance_scale", type=float, default=4.0)
+    parser.add_argument("--camera_lookat_height_offset", type=float, default=0.50)
+    parser.add_argument("--camera_elevation", type=float, default=-28.0)
+    parser.add_argument("--camera_distance_scale", type=float, default=1.70)
     parser.add_argument("--camera_azimuth", type=float, default=None)
     parser.add_argument("--smooth_alpha", type=float, default=0.35)
     parser.add_argument("--height_adjust", action="store_true")

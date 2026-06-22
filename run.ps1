@@ -213,11 +213,11 @@ $E2E_WARMUP_ONCE      = _env E2E_WARMUP_ONCE      "1"
 $E2E_WARMUP_CACHE_ROOT= _env E2E_WARMUP_CACHE_ROOT "$PWD\.cache\wham-gmr"
 
 # GMR viewer camera controls.
-$CAMERA_FOLLOW               = _env CAMERA_FOLLOW               "0"
+$CAMERA_FOLLOW               = _env CAMERA_FOLLOW               "1"
 $TRACK                       = _env TRACK                       "0"
-$CAMERA_LOOKAT_HEIGHT_OFFSET = _env CAMERA_LOOKAT_HEIGHT_OFFSET "0.45"
-$CAMERA_ELEVATION            = _env CAMERA_ELEVATION            "12.0"
-$CAMERA_DISTANCE_SCALE       = _env CAMERA_DISTANCE_SCALE       "1.3"
+$CAMERA_LOOKAT_HEIGHT_OFFSET = _env CAMERA_LOOKAT_HEIGHT_OFFSET "0.50"
+$CAMERA_ELEVATION            = _env CAMERA_ELEVATION            "-28.0"
+$CAMERA_DISTANCE_SCALE       = _env CAMERA_DISTANCE_SCALE       "1.70"
 $CAMERA_AZIMUTH              = _env CAMERA_AZIMUTH              ""
 $TCP                         = _env TCP                         "0"
 

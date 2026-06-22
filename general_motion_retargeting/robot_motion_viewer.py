@@ -61,9 +61,9 @@ class RobotMotionViewer:
         window_height=None,
         keyboard_callback=None,
         robot_path=None,
-        camera_lookat_height_offset=0.75,
-        camera_elevation=-5.0,
-        camera_distance_scale=1.0,
+        camera_lookat_height_offset=0.50,
+        camera_elevation=-28.0,
+        camera_distance_scale=1.70,
         camera_azimuth=None,
     ):
 
@@ -79,7 +79,7 @@ class RobotMotionViewer:
         self.rate_limiter = RateLimiter(frequency=self.motion_fps, warn=False)
         self.camera_follow = camera_follow
         self.camera_lookat_height_offset = float(camera_lookat_height_offset)
-        self.camera_elevation = float(camera_elevation)
+        self.camera_elevation = -abs(float(camera_elevation))
         self.camera_distance_scale = float(camera_distance_scale)
         self.camera_azimuth = camera_azimuth
         self.record_video = record_video
@@ -240,13 +240,10 @@ class RobotMotionViewer:
             mj.mj_forward(self.model, self.data)
 
             if follow_camera:
-                try:
-                    lookat = self.data.xpos[self.model.body(self.robot_base).id].copy()
-                except Exception:
-                    lookat = np.asarray(self.data.qpos[:3], dtype=np.float64).copy()
-                lookat[2] += self.camera_lookat_height_offset
+                lookat, radius = self._camera_lookat_from_robot_bounds()
                 self.viewer.cam.lookat[:] = lookat
-                self.viewer.cam.distance = self.viewer_cam_distance * max(0.1, self.camera_distance_scale)
+                base_distance = self.viewer_cam_distance * max(0.1, self.camera_distance_scale)
+                self.viewer.cam.distance = max(base_distance, radius * 2.7)
                 self.viewer.cam.elevation = self.camera_elevation
                 if self.camera_azimuth is not None:
                     self.viewer.cam.azimuth = float(self.camera_azimuth)
@@ -274,6 +271,23 @@ class RobotMotionViewer:
             self.renderer.update_scene(self.data, camera=self.viewer.cam)
             img = self.renderer.render()
             self.mp4_writer.append_data(img)
+
+    def _camera_lookat_from_robot_bounds(self):
+        positions = np.asarray(self.data.xpos[1:], dtype=np.float64)
+        if positions.size == 0:
+            return np.asarray(self.data.qpos[:3], dtype=np.float64).copy(), 0.5
+
+        finite_mask = np.isfinite(positions).all(axis=1)
+        positions = positions[finite_mask]
+        if positions.size == 0:
+            return np.asarray(self.data.qpos[:3], dtype=np.float64).copy(), 0.5
+
+        bounds_min = positions.min(axis=0)
+        bounds_max = positions.max(axis=0)
+        lookat = (bounds_min + bounds_max) * 0.5
+        radius = float(np.linalg.norm(bounds_max - bounds_min) * 0.5)
+        lookat[2] += self.camera_lookat_height_offset
+        return lookat, max(radius, 0.5)
     
     def close(self):
         self.viewer.close()
