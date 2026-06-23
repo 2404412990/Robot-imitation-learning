@@ -1,3 +1,18 @@
+# 2026.6.19
+
+增加一个新分支，将漫游改成固定摄像机下的ui界面
+
+<img width="1754" height="933" alt="2150505fcbc017574c42170e6bcf2130 (1)" src="https://github.com/user-attachments/assets/9db2d970-2859-4708-9bbb-2c8cc75e9bda" />
+
+
+# 2026.6.5
+
+1. 对于dataset下的所有离线csv，将它们重新放在dataset下面以机器人名字为名字的文件夹下管理，每次切换机器人的时候，csv下拉列表只会显示该机器人适配的csv文件
+
+2. 解决unity实时重定向中机器人一直卡顿的问题：实际上是两者帧率不匹配：通常是unity下的机器人读取实时csv文件新行的速度快于wham_gmr产生新行的速度，从而导致untiy下的机器人需要经常去等数据，看起来有卡顿地效果，解决办法就是让快的去主动适应慢的，对齐两端的帧率
+
+3. 增加对openloong和x02lite的支持，修复部分关节错位的问题，经测试g1, h1, openloong, x02lite（关节映射仍有一些问题）可以正常在unity内实时重定向
+
 # 2026.5.8
 
 适配windows系统，最主要是dpvo（slam估计）和pytorch3d（wham窗口渲染时的那个小人）的编译，然后也改了下windows下的格物平台，现在windows的格物平台和ubuntu 格物平台的功能差不多，我在windows下加个两个Raw image组件，可以抓取wham和gmr两个窗口并输出到unity世界内
