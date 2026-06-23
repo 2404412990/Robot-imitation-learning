@@ -23,24 +23,24 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
              "in StartInput (e.g. unitree_g1, unitree_g1_with_hands).")]
     [SerializeField] private string robotKey = "unitree_g1";
 
-    // 鈹€鈹€ Why no CSV鈫扷nity permutation table here 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    // Why no CSV-to-Unity permutation table here.
     // The current G1 prefab's ArticulationBody depth-first traversal yields
-    // joints in the same order that WHAM + GMR writes to the CSV 鈥?URDF order:
+    // joints in the same order that WHAM + GMR writes to the CSV: URDF order:
     //   0..5   left  leg: hip_pitch, hip_roll, hip_yaw, knee, ankle_pitch, ankle_roll
     //   6..11  right leg: same suborder
     //   12..14 waist:  yaw, roll, pitch
     //   15..21 left  arm: shoulder_pitch/roll/yaw, elbow, wrist_roll/pitch/yaw
     //   22..28 right arm: same suborder
     //
-    // So a 1:1 identity mapping (`currentDof[i] 鈫?jh[i]`) is correct. An
+    // So a 1:1 identity mapping (`currentDof[i] -> jh[i]`) is correct. An
     // earlier prefab needed a non-trivial permutation; copying that table onto
     // this prefab is what was causing the "twitching" (every joint received a
     // random other joint's angle). The field is deliberately omitted so Unity
     // can't deserialize a stale wrong permutation from the scene.
 
     [Tooltip("If ON, print every Unity revolute joint's GameObject name on Initialize() so " +
-             "the user can verify the G1 prefab still yields URDF order (left_hip_pitch 鈫?" +
-             "right_hip_pitch 鈫?waist 鈫?left_arm 鈫?right_arm). If the order ever changes " +
+             "the user can verify the G1 prefab still yields URDF order (left_hip_pitch -> " +
+             "right_hip_pitch -> waist -> left_arm -> right_arm). If the order ever changes " +
              "(swapped left/right traversal, wrist after shoulder, etc.), retargeting will " +
              "look wrong even though no other code changed.")]
     [SerializeField] private bool logJointMappingOnStart = true;
@@ -104,7 +104,7 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
         typeof(ArticulationBody).GetProperty("jointName", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
 
     /// <summary>
-    /// Dump the Unity-joint-index 鈫?joint-name correspondence to the Console.
+    /// Dump the Unity-joint-index -> joint-name correspondence to the Console.
     /// Compare against expected URDF order to verify identity mapping is still
     /// correct for the current G1 prefab.
     /// </summary>
@@ -115,7 +115,7 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
         for (int i = 0; i < 29 && i < jh.Length; i++)
         {
             string jointName = (jh[i] != null) ? jh[i].name : "<null>";
-            sb.AppendLine($"  Unity jh[{i,2}] = '{jointName}'   鈫? CSV[{i}]");
+            sb.AppendLine($"  Unity jh[{i,2}] = '{jointName}'   -> CSV[{i}]");
         }
         sb.AppendLine("Expected URDF order (29 DOF G1):");
         sb.AppendLine("  0..5  left  leg: hip_pitch, hip_roll, hip_yaw, knee, ankle_pitch, ankle_roll");
@@ -293,7 +293,7 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
     Transform body;
 
     // Snapshot of the articulation's rest pose, captured once in Initialize().
-    // Stored as plain arrays so their size is immutable 鈥?no risk of them growing
+    // Stored as plain arrays so their size is immutable; no risk of them growing
     // to 35 entries if GetJointPositions is called again later on a dirty state.
     private float[] restPositions;
     private float[] restVelocities;
@@ -322,7 +322,7 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
     private bool _isClone = false;
     private bool isRobotSelectedInScene = true;
 
-    // 鈹€鈹€ IMimicAgent surface 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    // IMimicAgent surface
     public string RobotKey => string.IsNullOrWhiteSpace(robotKey) ? "unitree_g1" : robotKey.Trim();
     public GameObject AgentGameObject => gameObject;
     public bool UseExternalReplayData
@@ -413,7 +413,7 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
     /// <summary>
     /// Imperative reset of the agent's PD targets and replay bookkeeping.
     ///
-    /// IMPORTANT 鈥?what this DOES NOT do, and why:
+    /// IMPORTANT: what this DOES NOT do, and why:
     /// We deliberately do NOT call <c>TeleportRoot</c>, <c>SetJointPositions</c>,
     /// or <c>SetJointVelocities</c> here. Those operations write the engine's
     /// articulation cache, and they are UNSAFE in the frame immediately after
@@ -430,14 +430,14 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
     ///     configuration property (not a per-step physics state), so writes
     ///     persist across active/inactive cycles and don't depend on the
     ///     articulation rebuild. This is the actual fix for "stale PD target
-    ///     dragging joints toward the last replay pose" 鈥?that was the only
+    ///     dragging joints toward the last replay pose"; that was the only
     ///     thing ResetToInitialState ever needed to address.
     ///   - Clear the C# bookkeeping arrays (u/uff/utotal/currentFrame/tt).
     ///
     /// The actual pose restoration (root TeleportRoot + SetJointPositions of
     /// restPositions + per-frame uff write) happens in <c>OnEpisodeBegin</c>,
     /// which is queued by <c>RequestEndEpisode</c> in StartInput and fires
-    /// on the NEXT FixedUpdate 鈥?at which point the articulation has been
+    /// on the NEXT FixedUpdate, at which point the articulation has been
     /// fully rebuilt and the cache writes are safe.
     /// </summary>
     public void ResetToInitialState()
@@ -464,7 +464,7 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
     }
 
     // Registration with the scene-wide registry happens at the end of the
-    // ML-Agents Initialize() override below 鈥?NOT in OnEnable / OnDisable.
+    // ML-Agents Initialize() override below, NOT in OnEnable / OnDisable.
     // Reason: ML-Agents Agent uses its own non-virtual OnEnable() to drive
     // LazyInitialize(); shadowing it here would prevent Initialize() from
     // ever running. The registry detects stale entries via AgentGameObject
@@ -508,16 +508,16 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
         body = arts[0].GetComponent<Transform>();
         art0 = body.GetComponent<ArticulationBody>();
 
-        // 鈹€鈹€ CRITICAL: capture pos0/rot0/restPositions only ONCE, ever. 鈹€鈹€鈹€鈹€鈹€
+        // CRITICAL: capture pos0/rot0/restPositions only once.
         // ML-Agents' Agent.OnEnable re-fires LazyInitialize each time the
         // GameObject is SetActive(true). The user's stack trace confirms
-        // Initialize being invoked from ApplyRobotVisibility 鈫?SetActive(true)
+        // Initialize being invoked from ApplyRobotVisibility -> SetActive(true)
         // during a dropdown switch. On THAT call:
         //   - arts[0].immovable is still true (set at the end of the previous
         //     OnEpisodeBegin), so the articulation cache size is 29.
         //   - The articulation hasn't been rebuilt yet from the SetActive flip.
         //   - GetJointPositions returns whatever junk was in the cache when
-        //     the body was deactivated 鈥?i.e. the last replay frame's joint
+        //     the body was deactivated, i.e. the last replay frame's joint
         //     angles, not the bind pose.
         // If we let those values overwrite restPositions every cycle, the
         // next OnEpisodeBegin's SafeSetJointPositions(restPositions) writes
@@ -547,7 +547,7 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
 
         TryLoadCurrentMotionData(keepProgress: false);
 
-        // Print Unity joint name 鈫?CSV index correspondence so the user can
+        // Print Unity joint name -> CSV index correspondence so the user can
         // verify the G1 prefab traversal still matches URDF order.
         if (logJointMappingOnStart) DumpJointMapping();
 
@@ -752,7 +752,7 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
         return Path.GetFullPath(Path.Combine(projectRoot, normalized));
     }
 
-    // 鈹€鈹€ safe articulation helpers 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    // Safe articulation helpers
 
     // Per-instance scratch list for the cache-size probe. Avoids allocating a
     // fresh List every OnEpisodeBegin / FixedUpdate while keeping each clone's
@@ -764,7 +764,7 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
     /// <c>SetJointVelocities</c> expects right now. The naive approach of
     /// summing <c>ab.dofCount</c> across <c>arts</c> is unreliable because
     /// <c>dofCount</c> can be temporarily out of sync with the engine right
-    /// after the root's <c>immovable</c> flag changes 鈥?that mismatch was the
+    /// after the root's <c>immovable</c> flag changes. That mismatch was the
     /// root cause of the "Articulation cache size (35) does not match supplied
     /// list size (29)" error.
     ///
@@ -788,9 +788,9 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
     /// Why this is non-trivial: restPositions is captured at Initialize when
     /// immovable=false (cache = 6 root DOFs + 29 joint DOFs = 35). After the
     /// first OnEpisodeBegin sets immovable=true the cache shrinks to 29
-    /// (joints only 鈥?root slots are removed). A naive "trim to first N"
+    /// (joints only; root slots are removed). A naive "trim to first N"
     /// approach would keep restPositions[0..28] = "6 root values + 23 joint
-    /// values" and write those into the 29 joint cache slots 鈥?every joint
+    /// values" and write those into the 29 joint cache slots; every joint
     /// receives the wrong value (left_hip_pitch gets a root quaternion
     /// component, etc.). On repeated robot switches the corruption compounds
     /// until arms end up twisted into the body.
@@ -863,14 +863,14 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
 
         UnityEngine.Debug.LogWarning(
             $"[G1mimicAgent] Unexpected cache mismatch: source={source.Count}, cache={cacheSize}. " +
-            "Falling back to trim/pad 鈥?joint values may be misaligned.");
+            "Falling back to trim/pad; joint values may be misaligned.");
         var result = new List<float>(cacheSize);
         for (int i = 0; i < cacheSize; i++)
             result.Add(i < source.Count ? source[i] : 0f);
         return result;
     }
 
-    // 鈹€鈹€ episode lifecycle 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    // Episode lifecycle
 
     public override void OnEpisodeBegin()
     {
@@ -879,13 +879,13 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
             return;
         }
 
-        // 鈹€鈹€ CRITICAL: restore immovable=false BEFORE any articulation-cache
+        // CRITICAL: restore immovable=false before any articulation-cache
         // writes. The previous OnEpisodeBegin (last line below) sets
         // arts[0].immovable = true so the root stays put during replay. That
         // shrinks the articulation cache from 35 slots (6 root + 29 joints)
         // down to 29 (joints only). On the NEXT OnEpisodeBegin call,
         // restPositions still has 35 entries (captured at Initialize when
-        // immovable=false), but the current cache is 29 鈥?EnsureListSize then
+        // immovable=false), but the current cache is 29. EnsureListSize then
         // trims restPositions to its FIRST 29 entries, which are the 6 root
         // values followed by only the first 23 joint values. Those get
         // written into the 29 joint slots, so every joint receives the
@@ -996,7 +996,7 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
         Array.Copy(currentData, 3, currentRot, 0, 4);
         Array.Copy(currentData, 7, currentDof, 0, 29);
 
-        // 1:1 identity mapping 鈥?currentDof[i] drives jh[i]. The current G1
+        // 1:1 identity mapping: currentDof[i] drives jh[i]. The current G1
         // prefab's joint hierarchy already matches URDF order; no permutation.
         for (int i = 0; i < 29; i++)
         {
@@ -1068,7 +1068,7 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
     public override void CollectObservations(VectorSensor sensor)
     {
         // Guard against the half-torn-down articulation state. CollectObservations
-        // is called from ML-Agents' Agent.OnDisable() 鈫?NotifyAgentDone() path
+        // is called from ML-Agents' Agent.OnDisable() -> NotifyAgentDone() path
         // when the GameObject is SetActive(false), and at that point each
         // ArticulationBody's `jointPosition` / `jointVelocity` ReducedSpace can
         // have a dofCount of 0 (joints aren't simulated while inactive). The
@@ -1168,7 +1168,7 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
             Array.Copy(currentData, 0, currentPos, 0, 3);
             Array.Copy(currentData, 3, currentRot, 0, 4);
             Array.Copy(currentData, 7, currentDof, 0, 29);
-            // 1:1 identity mapping 鈥?radians 鈫?degrees, no joint permutation.
+            // 1:1 identity mapping: radians -> degrees, no joint permutation.
             for (int i = 0; i < 29; i++) uff[i] = currentDof[i] * 180f / 3.14f;
 
             newPosition = new Vector3(-currentPos[1], currentPos[2], currentPos[0]);

@@ -3791,7 +3791,7 @@ public class StartInput : MonoBehaviour
         }
         catch (System.Exception e)
         {
-            Debug.LogError($"瑙ｆ瀽 OUTPUT_ROOT 澶辫触: {outputRoot} ({e.Message})");
+            Debug.LogError($"Failed to resolve OUTPUT_ROOT: {outputRoot} ({e.Message})");
             return string.Empty;
         }
 

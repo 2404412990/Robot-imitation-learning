@@ -16,6 +16,13 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
     private const int DofCount = 18;
     private const int CsvColumnCount = 7 + DofCount;
 
+    private enum ReplayDataMode
+    {
+        DatasetReplay,
+        ExternalCsvReplay,
+        LiveRealtimeCsv
+    }
+
     public bool train = false;
     public bool replay = false;
 
@@ -188,7 +195,7 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
     private float realtimePlaybackBufferSeconds = 0.2f;
     private bool hasValidJointMap = true;
     private bool holdSelectionNeutralPose;
-    private bool isLiveRealtimeCsv;
+    private ReplayDataMode replayDataMode = ReplayDataMode.DatasetReplay;
     private bool hasLoggedDirectJointStateError;
     private bool hasLoggedEmptyReplayData;
     private float[] neutralPoseFrame;
@@ -245,7 +252,11 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
             useExternalReplayData = value;
             if (!value)
             {
-                isLiveRealtimeCsv = false;
+                replayDataMode = ReplayDataMode.DatasetReplay;
+            }
+            else if (replayDataMode != ReplayDataMode.LiveRealtimeCsv)
+            {
+                replayDataMode = ReplayDataMode.ExternalCsvReplay;
             }
         }
     }
@@ -262,6 +273,7 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
         EndEpisode();
     }
     public int ExpectedCsvColumns => CsvColumnCount;
+    private bool IsLiveRealtimeCsv => useExternalReplayData && replayDataMode == ReplayDataMode.LiveRealtimeCsv;
 
     public void SetRobotSelectedInScene(bool isSelected)
     {
@@ -272,7 +284,7 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
             {
                 UseExternalReplayData = false;
                 ReplayMode = false;
-                isLiveRealtimeCsv = false;
+                replayDataMode = ReplayDataMode.DatasetReplay;
                 holdSelectionNeutralPose = true;
                 ClearReplayBuffers();
                 ApplyGroundedNeutralPose();
@@ -287,7 +299,7 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
         holdSelectionNeutralPose = false;
         UseExternalReplayData = false;
         ReplayMode = false;
-        isLiveRealtimeCsv = false;
+        replayDataMode = ReplayDataMode.DatasetReplay;
         ClearReplayBuffers();
         if (art0 != null)
         {
@@ -316,7 +328,7 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
         currentFrame = 0;
         realtimeFrameCursor = 0f;
         tt = 0;
-        isLiveRealtimeCsv = true;
+        replayDataMode = ReplayDataMode.LiveRealtimeCsv;
         return true;
     }
 
@@ -345,12 +357,12 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
         }
 
         UseExternalReplayData = false;
-        isLiveRealtimeCsv = false;
+        replayDataMode = ReplayDataMode.DatasetReplay;
     }
 
     public void ResetToInitialState()
     {
-        isLiveRealtimeCsv = false;
+        replayDataMode = ReplayDataMode.DatasetReplay;
         RestoreInitialRootPose();
 
         if (restPositions != null)
@@ -370,7 +382,7 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
             utotal[i] = 0f;
         }
         currentFrame = useExternalReplayData ? 0 : frame0;
-        if (useExternalReplayData && isLiveRealtimeCsv)
+        if (IsLiveRealtimeCsv)
         {
             realtimeFrameCursor = 0f;
         }
@@ -635,7 +647,7 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
         }
 
         holdSelectionNeutralPose = false;
-        isLiveRealtimeCsv = false;
+        replayDataMode = ReplayDataMode.ExternalCsvReplay;
         ReplayMode = true;
         UnityEngine.Debug.Log($"[X02Lite] Loaded replay CSV '{filePath}' rows={data.Count}.");
         return ApplyReplayData(data, keepProgress);
@@ -663,7 +675,7 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
             return false;
         }
 
-        isLiveRealtimeCsv = false;
+        replayDataMode = ReplayDataMode.DatasetReplay;
         return ApplyReplayData(data, keepProgress);
     }
 
@@ -699,7 +711,6 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
         if (data == null || data.Count == 0) return false;
 
         int oldFrame = currentFrame;
-        isLiveRealtimeCsv = false;
         refData = data;
 
         if (refData.Count <= 1)
@@ -882,7 +893,7 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
         Array.Copy(currentData, 3, currentRot, 0, 4);
         Array.Copy(currentData, 7, currentDof, 0, DofCount);
 
-        ApplyCurrentDofToJoints(directWrite: replay && (!isLiveRealtimeCsv || writeLiveJointPositionsDirectly));
+        ApplyCurrentDofToJoints(directWrite: replay && (!IsLiveRealtimeCsv || writeLiveJointPositionsDirectly));
 
         Vector3 newPosition = BuildUnityRootPosition(currentPos);
         Quaternion newRotation = new Quaternion(
@@ -994,7 +1005,7 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
         bool hasMotionData = itpData != null && itpData.Count > 0;
         if (hasMotionData)
         {
-            if (useExternalReplayData && isLiveRealtimeCsv)
+            if (IsLiveRealtimeCsv)
             {
                 realtimeFrameCursor = Mathf.Clamp(realtimeFrameCursor, 0f, itpData.Count - 1);
                 if (ReplayCsvUtility.SampleRowsAtFrame(itpData, realtimeFrameCursor, ExpectedCsvColumns, realtimeSampledData))
@@ -1016,7 +1027,7 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
             Array.Copy(currentData, 0, currentPos, 0, 3);
             Array.Copy(currentData, 3, currentRot, 0, 4);
             Array.Copy(currentData, 7, currentDof, 0, DofCount);
-            ApplyCurrentDofToJoints(directWrite: replay && (!isLiveRealtimeCsv || writeLiveJointPositionsDirectly));
+            ApplyCurrentDofToJoints(directWrite: replay && (!IsLiveRealtimeCsv || writeLiveJointPositionsDirectly));
 
             newPosition = BuildUnityRootPosition(currentPos);
             newRotation = new Quaternion(
@@ -1081,7 +1092,7 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
 
         if (itpData != null && currentFrame < itpData.Count - 1)
         {
-            if (useExternalReplayData && isLiveRealtimeCsv)
+            if (IsLiveRealtimeCsv)
             {
                 realtimeFrameCursor = ReplayCsvUtility.AdvanceRealtimeCursor(
                     realtimeFrameCursor,
