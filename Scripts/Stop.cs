@@ -46,7 +46,7 @@ public class Stop : MonoBehaviour
 
         if (startInput != null)
         {
-            startInput.StopStartPipeline();
+            startInput.StopStartPipeline(true);
             Debug.Log("[Stop] StartInput pipeline stopped.");
         }
         else

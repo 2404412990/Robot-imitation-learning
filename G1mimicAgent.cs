@@ -704,7 +704,8 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
         realtimeFrameCursor = 0f;
         DisableReplayMirrorColliders();
         bool isRuntimeLiveCsv = IsRuntimeLiveCsvPath(filePath);
-        return ApplyReplayData(data, keepProgress, resample30FpsToFixed50Hz: !isRuntimeLiveCsv, startAtFrameZero: true);
+        float sourceFps = ReplayCsvUtility.ResolveReplaySourceFps(filePath);
+        return ApplyReplayData(data, keepProgress, resampleToFixed50Hz: !isRuntimeLiveCsv, startAtFrameZero: true, sourceFps: sourceFps);
     }
 
     private static bool IsRuntimeLiveCsvPath(string filePath)
@@ -744,22 +745,24 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
         }
 
         replayDataMode = ReplayDataMode.DatasetReplay;
-        return ApplyReplayData(data, keepProgress, resample30FpsToFixed50Hz: true, startAtFrameZero: false);
+        float sourceFps = ReplayCsvUtility.ResolveReplaySourceFps(selectedCsv);
+        return ApplyReplayData(data, keepProgress, resampleToFixed50Hz: true, startAtFrameZero: false, sourceFps: sourceFps);
     }
 
     private bool ApplyReplayData(
         List<float[]> data,
         bool keepProgress,
-        bool resample30FpsToFixed50Hz,
-        bool startAtFrameZero)
+        bool resampleToFixed50Hz,
+        bool startAtFrameZero,
+        float sourceFps)
     {
         if (data == null || data.Count == 0) return false;
 
         int oldFrame = currentFrame;
         refData = data;
 
-        itpData = resample30FpsToFixed50Hz
-            ? ReplayCsvUtility.Resample30FpsToFixed50Hz(refData)
+        itpData = resampleToFixed50Hz
+            ? ReplayCsvUtility.ResampleSourceFpsToFixedHz(refData, sourceFps)
             : ReplayCsvUtility.CopyRows(refData, ExpectedCsvColumns);
 
         if (itpData.Count == 0) return false;

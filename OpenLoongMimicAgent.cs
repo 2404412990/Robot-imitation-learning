@@ -629,7 +629,8 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, I
         replayDataMode = ReplayDataMode.ExternalCsvReplay;
         useExternalReplayData = true;
         realtimeFrameCursor = 0f;
-        return ApplyReplayData(data, keepProgress);
+        float sourceFps = ReplayCsvUtility.ResolveReplaySourceFps(filePath);
+        return ApplyReplayData(data, keepProgress, sourceFps);
     }
 
     public void ResetToInitialState()
@@ -675,16 +676,17 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, I
         if (csvFiles.Count == 0) return false;
 
         string selectedCsv = csvFiles[Mathf.Clamp(MotionId, 0, csvFiles.Count - 1)];
-        return ApplyReplayData(LoadDataFromFile(selectedCsv), keepProgress);
+        float sourceFps = ReplayCsvUtility.ResolveReplaySourceFps(selectedCsv);
+        return ApplyReplayData(LoadDataFromFile(selectedCsv), keepProgress, sourceFps);
     }
 
-    private bool ApplyReplayData(List<float[]> data, bool keepProgress)
+    private bool ApplyReplayData(List<float[]> data, bool keepProgress, float sourceFps)
     {
         if (data == null || data.Count == 0) return false;
 
         int oldFrame = currentFrame;
         refData = data;
-        itpData = ReplayCsvUtility.Resample30FpsToFixed50Hz(refData);
+        itpData = ReplayCsvUtility.ResampleSourceFpsToFixedHz(refData, sourceFps);
         if (itpData.Count == 0) return false;
 
         currentFrame = keepProgress

@@ -516,7 +516,8 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
             mergedRows.Add(row);
         }
 
-        List<float[]> resampledRows = ReplayCsvUtility.Resample30FpsToFixed50Hz(mergedRows);
+        float sourceFps = ReplayCsvUtility.ResolveReplaySourceFps(filePath);
+        List<float[]> resampledRows = ReplayCsvUtility.ResampleSourceFpsToFixedHz(mergedRows, sourceFps);
         allPosData = new List<float[]>(resampledRows.Count);
         allRotData = new List<float[]>(resampledRows.Count);
         allDofData = new List<float[]>(resampledRows.Count);

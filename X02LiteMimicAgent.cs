@@ -696,7 +696,8 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
         replayDataMode = ReplayDataMode.ExternalCsvReplay;
         ReplayMode = true;
         UnityEngine.Debug.Log($"[X02Lite] Loaded replay CSV '{filePath}' rows={data.Count}.");
-        return ApplyReplayData(data, keepProgress);
+        float sourceFps = ReplayCsvUtility.ResolveReplaySourceFps(filePath);
+        return ApplyReplayData(data, keepProgress, sourceFps);
     }
 
     private bool TryLoadCurrentMotionData(bool keepProgress)
@@ -722,7 +723,8 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
         }
 
         replayDataMode = ReplayDataMode.DatasetReplay;
-        return ApplyReplayData(data, keepProgress);
+        float sourceFps = ReplayCsvUtility.ResolveReplaySourceFps(selectedCsv);
+        return ApplyReplayData(data, keepProgress, sourceFps);
     }
 
     private string PickDefaultReplayCsv(List<string> csvFileNames, int fallbackIndex)
@@ -752,7 +754,7 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
         return csvFileNames[index];
     }
 
-    private bool ApplyReplayData(List<float[]> data, bool keepProgress)
+    private bool ApplyReplayData(List<float[]> data, bool keepProgress, float sourceFps)
     {
         if (data == null || data.Count == 0) return false;
 
@@ -765,15 +767,7 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
         }
         else
         {
-            float[] refT = new float[refData.Count];
-            for (int i = 0; i < refT.Length; i++) refT[i] = i / 30f;
-
-            int newFrameCount = Mathf.Max(1, (int)(refData.Count * 50f / 30f) - 1);
-            float[] newT = new float[newFrameCount];
-            for (int i = 0; i < newT.Length; i++) newT[i] = i / 50f;
-
-            List<float[]> interpolated = Interpolate(refT, refData, newT);
-            itpData = interpolated ?? new List<float[]>(refData);
+            itpData = ReplayCsvUtility.ResampleSourceFpsToFixedHz(refData, sourceFps);
         }
 
         if (itpData.Count == 0) return false;

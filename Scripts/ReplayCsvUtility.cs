@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Globalization;
 using UnityEngine;
 
 public static class ReplayCsvUtility
@@ -7,8 +8,30 @@ public static class ReplayCsvUtility
     public const float UnityFixedFps = 50f;
     public const float MinRealtimeFps = 1f;
     public const float MaxRealtimeFps = 120f;
+    public const string ReplayMetadataExtension = ".replay.json";
+
+    [System.Serializable]
+    private sealed class ReplayCsvMetadata
+    {
+        public float sourceFps = SourceFps;
+        public float originalSourceFps = SourceFps;
+        public bool realtimeCameraSource;
+        public string robotKey;
+        public int sourceRows;
+        public int archivedRows;
+    }
 
     public static List<float[]> Resample30FpsToFixed50Hz(List<float[]> source)
+    {
+        return ResampleSourceFpsToFixedHz(source, SourceFps);
+    }
+
+    public static List<float[]> ResampleSourceFpsToFixedHz(List<float[]> source, float sourceFps)
+    {
+        return ResampleSourceFpsToTargetFps(source, sourceFps, UnityFixedFps);
+    }
+
+    public static List<float[]> ResampleSourceFpsToTargetFps(List<float[]> source, float sourceFps, float targetFps)
     {
         if (source == null || source.Count <= 1)
         {
@@ -25,12 +48,14 @@ public static class ReplayCsvUtility
             }
         }
 
-        int newFrameCount = Mathf.Max(1, (int)(source.Count * UnityFixedFps / SourceFps) - 1);
+        float safeSourceFps = ClampRealtimeFps(sourceFps);
+        float safeTargetFps = ClampRealtimeFps(targetFps);
+        int newFrameCount = Mathf.Max(1, (int)(source.Count * safeTargetFps / safeSourceFps) - 1);
         var result = new List<float[]>(newFrameCount);
 
         for (int i = 0; i < newFrameCount; i++)
         {
-            float sourceFrame = i * SourceFps / UnityFixedFps;
+            float sourceFrame = i * safeSourceFps / safeTargetFps;
             int left = Mathf.Clamp(Mathf.FloorToInt(sourceFrame), 0, source.Count - 1);
             int right = Mathf.Clamp(left + 1, 0, source.Count - 1);
             float ratio = Mathf.Clamp01(sourceFrame - left);
@@ -45,6 +70,92 @@ public static class ReplayCsvUtility
         }
 
         return result;
+    }
+
+    public static float ResolveReplaySourceFps(string csvPath, float defaultSourceFps = SourceFps)
+    {
+        return TryReadReplaySourceFps(csvPath, out float sourceFps)
+            ? sourceFps
+            : ClampRealtimeFps(defaultSourceFps);
+    }
+
+    public static bool TryReadReplaySourceFps(string csvPath, out float sourceFps)
+    {
+        sourceFps = SourceFps;
+        if (string.IsNullOrWhiteSpace(csvPath))
+        {
+            return false;
+        }
+
+        string metadataPath = csvPath + ReplayMetadataExtension;
+        if (!System.IO.File.Exists(metadataPath))
+        {
+            return false;
+        }
+
+        try
+        {
+            string json = System.IO.File.ReadAllText(metadataPath);
+            ReplayCsvMetadata metadata = JsonUtility.FromJson<ReplayCsvMetadata>(json);
+            if (metadata == null)
+            {
+                return false;
+            }
+
+            sourceFps = ClampRealtimeFps(metadata.sourceFps);
+            return true;
+        }
+        catch (System.Exception e)
+        {
+            Debug.LogWarning($"[ReplayCsvUtility] Failed to read replay metadata '{metadataPath}': {e.Message}");
+            return false;
+        }
+    }
+
+    public static void WriteReplayMetadata(
+        string csvPath,
+        string robotKey,
+        float sourceFps,
+        float originalSourceFps,
+        bool realtimeCameraSource,
+        int sourceRows,
+        int archivedRows)
+    {
+        if (string.IsNullOrWhiteSpace(csvPath))
+        {
+            return;
+        }
+
+        var metadata = new ReplayCsvMetadata
+        {
+            sourceFps = ClampRealtimeFps(sourceFps),
+            originalSourceFps = ClampRealtimeFps(originalSourceFps),
+            realtimeCameraSource = realtimeCameraSource,
+            robotKey = robotKey ?? string.Empty,
+            sourceRows = Mathf.Max(0, sourceRows),
+            archivedRows = Mathf.Max(0, archivedRows),
+        };
+
+        string json =
+            "{\n" +
+            $"  \"sourceFps\": {metadata.sourceFps.ToString("G9", CultureInfo.InvariantCulture)},\n" +
+            $"  \"originalSourceFps\": {metadata.originalSourceFps.ToString("G9", CultureInfo.InvariantCulture)},\n" +
+            $"  \"realtimeCameraSource\": {(metadata.realtimeCameraSource ? "true" : "false")},\n" +
+            $"  \"robotKey\": \"{EscapeJsonString(metadata.robotKey)}\",\n" +
+            $"  \"sourceRows\": {metadata.sourceRows},\n" +
+            $"  \"archivedRows\": {metadata.archivedRows}\n" +
+            "}\n";
+        System.IO.File.WriteAllText(csvPath + ReplayMetadataExtension, json);
+    }
+
+    private static string EscapeJsonString(string value)
+    {
+        if (string.IsNullOrEmpty(value))
+        {
+            return string.Empty;
+        }
+
+        return value.Replace("\\", "\\\\").Replace("\"", "\\\"");
     }
 
     public static List<float[]> CopyRows(IReadOnlyList<float[]> source, int expectedDimension)
@@ -256,12 +367,17 @@ public static class ReplayCsvUtility
 
     public static int GetResampledFrameCount30To50(int sourceFrameCount)
     {
+        return GetResampledFrameCount(sourceFrameCount, SourceFps, UnityFixedFps);
+    }
+
+    public static int GetResampledFrameCount(int sourceFrameCount, float sourceFps, float targetFps)
+    {
         if (sourceFrameCount <= 1)
         {
             return Mathf.Max(0, sourceFrameCount);
         }
 
-        return Mathf.Max(1, (int)(sourceFrameCount * UnityFixedFps / SourceFps) - 1);
+        return Mathf.Max(1, (int)(sourceFrameCount * ClampRealtimeFps(targetFps) / ClampRealtimeFps(sourceFps)) - 1);
     }
 
     private static float[] SampleSourceAtFixedFrame(List<float[]> source, int fixedFrameIndex, int dimension)
