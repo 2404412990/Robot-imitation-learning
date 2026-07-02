@@ -25,6 +25,7 @@ ROBOT_XML_DICT = {
     "fourier_gr3": ASSET_ROOT / "fourier_gr3v2_1_1" / "mjcf" / "gr3v2_1_1_dummy_hand.xml",
     "x02lite": ASSET_ROOT / "x02lite" / "scene.xml",
     "openloong": ASSET_ROOT / "openloong" / "scene_white.xml",
+    "lite_11_v1": ASSET_ROOT / "Lite_11_v1" / "xml" / "scene_plane.xml",
 }
 
 IK_CONFIG_DICT = {
@@ -49,6 +50,7 @@ IK_CONFIG_DICT = {
         "fourier_gr3": IK_CONFIG_ROOT / "smplx_to_gr3.json",
         "x02lite": IK_CONFIG_ROOT / "smplx_to_x02lite.json",
         "openloong": IK_CONFIG_ROOT / "smplx_to_openloong.json",
+        "lite_11_v1": IK_CONFIG_ROOT / "smplx_to_lite_11_v1.json",
     },
     "bvh_lafan1":{
         "unitree_g1": IK_CONFIG_ROOT / "bvh_lafan1_to_g1.json",
@@ -104,6 +106,7 @@ ROBOT_BASE_DICT = {
     "fourier_gr3": "base_link",
     "x02lite": "pelvis",
     "openloong": "base_link",
+    "lite_11_v1": "base_link",
 }
 
 VIEWER_CAM_DISTANCE_DICT = {
@@ -127,4 +130,5 @@ VIEWER_CAM_DISTANCE_DICT = {
     "fourier_gr3": 2.0,
     "x02lite": 3.0,
     "openloong": 3.5,
+    "lite_11_v1": 2.6,
 }

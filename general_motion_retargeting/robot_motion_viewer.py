@@ -85,6 +85,8 @@ class RobotMotionViewer:
         self.record_video = record_video
         self.window_width = window_width
         self.window_height = window_height
+        self.mp4_writer = None
+        self.renderer = None
 
         # --- Fix HiDPI + fullscreen issues on Linux ---
         # On Wayland / X11, tell GLFW to respect the requested window size
@@ -139,7 +141,14 @@ class RobotMotionViewer:
             print(f"Recording video to {self.video_path}")
             
             # Initialize renderer for video recording
-            self.renderer = mj.Renderer(self.model, height=video_height, width=video_width)
+            try:
+                self.renderer = mj.Renderer(self.model, height=video_height, width=video_width)
+            except Exception:
+                if self.mp4_writer is not None:
+                    self.mp4_writer.close()
+                    self.mp4_writer = None
+                self.viewer.close()
+                raise
         
     @staticmethod
     def _set_glfw_window_size(viewer_handle, width, height):
@@ -292,6 +301,6 @@ class RobotMotionViewer:
     def close(self):
         self.viewer.close()
         time.sleep(0.5)
-        if self.record_video:
+        if self.record_video and self.mp4_writer is not None:
             self.mp4_writer.close()
             print(f"Video saved to {self.video_path}")

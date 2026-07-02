@@ -238,6 +238,7 @@ if __name__ == "__main__":
             "pnd_adam_lite",
             "x02lite",
             "openloong",
+            "lite_11_v1",
             "tienkung",
             "fourier_gr3",
         ],
