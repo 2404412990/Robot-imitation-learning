@@ -26,6 +26,7 @@ GMR_PYTHON=${GMR_PYTHON:-$(which python)}
 VIDEO=${VIDEO:-examples/IMG_9732.mov}
 TIME=${TIME:-0}
 ROBOT=${ROBOT:-unitree_g1}
+ROBOTS=${ROBOTS:-${ROBOT}}
 ROBOT_PATH=${ROBOT_PATH:-}
 
 # ROBOT_PATH supports both robot key (same choices as --robot) and custom XML path.
@@ -51,12 +52,14 @@ if [[ -n "${OUTPUT_ROOT}" ]]; then
 	OUTPUT_DIR=${OUTPUT_DIR:-${OUTPUT_ROOT}/stream_demo}
 	STREAM_NPZ_DIR=${STREAM_NPZ_DIR:-${OUTPUT_DIR}/npz_stream}
 	PKL_PATH=${PKL_PATH:-${OUTPUT_ROOT}/pkl/my_motion.pkl}
+	CSV_ROOT=${CSV_ROOT:-${OUTPUT_ROOT}/csv}
 	CSV_PATH=${CSV_PATH:-${OUTPUT_ROOT}/csv/live_motion.csv}
 	GMR_VIDEO_PATH=${GMR_VIDEO_PATH:-${OUTPUT_ROOT}/video/live_stream_robot.mp4}
 else
 	OUTPUT_DIR=${OUTPUT_DIR:-output/stream_demo}
 	STREAM_NPZ_DIR=${STREAM_NPZ_DIR:-${OUTPUT_DIR}/npz_stream}
 	PKL_PATH=${PKL_PATH:-pkl_outputs/my_motion.pkl}
+	CSV_ROOT=${CSV_ROOT:-pkl_outputs/csv}
 	CSV_PATH=${CSV_PATH:-pkl_outputs/csv/live_motion.csv}
 	GMR_VIDEO_PATH=${GMR_VIDEO_PATH:-videos/live_stream_robot.mp4}
 fi
@@ -98,8 +101,7 @@ CAMERA_ELEVATION=${CAMERA_ELEVATION:--28.0}
 CAMERA_DISTANCE_SCALE=${CAMERA_DISTANCE_SCALE:-1.70}
 CAMERA_AZIMUTH=${CAMERA_AZIMUTH:-}
 
-mkdir -p "${OUTPUT_DIR}" "$(dirname "${PKL_PATH}")" "$(dirname "${CSV_PATH}")" "$(dirname "${GMR_VIDEO_PATH}")"
-mkdir -p "${OUTPUT_DIR}" "$(dirname "${PKL_PATH}")" "$(dirname "${CSV_PATH}")" "$(dirname "${GMR_VIDEO_PATH}")"
+mkdir -p "${OUTPUT_DIR}" "$(dirname "${PKL_PATH}")" "${CSV_ROOT}" "$(dirname "${CSV_PATH}")" "$(dirname "${GMR_VIDEO_PATH}")"
 
 GMR_READY_FLAG=${GMR_READY_FLAG:-${STREAM_NPZ_DIR}/gmr_ready.flag}
 STREAM_TAIL_PATH=${STREAM_TAIL_PATH:-${STREAM_NPZ_DIR}/stream_tail.pkl}
@@ -114,6 +116,7 @@ echo "[E2E] Camera params: follow=${CAMERA_FOLLOW} lookat_h=${CAMERA_LOOKAT_HEIG
 echo "[E2E] WHAM perf params: amp=${WHAM_USE_AMP} detect_interval=${WHAM_DETECT_INTERVAL} infer_interval=${WHAM_INFER_INTERVAL} seq_len=${WHAM_STREAM_SEQ_LEN} input_scale=${WHAM_INPUT_SCALE}"
 echo "[E2E] WHAM stream mode=tail (fixed)"
 echo "[E2E] GMR torch_device=${GMR_TORCH_DEVICE}  max_iter=${GMR_MAX_ITER}"
+echo "[E2E] Source params: VIDEO=${VIDEO} TIME=${TIME} ROBOT=${ROBOT} ROBOTS=${ROBOTS} CSV_PATH=${CSV_PATH} CSV_ROOT=${CSV_ROOT}"
 echo "[E2E] GMR viewer mode: async thread + low-latency fixed profile (ready_timeout=${GMR_VIEWER_READY_TIMEOUT_SEC}s, join_timeout=${GMR_VIEWER_THREAD_JOIN_TIMEOUT_SEC}s)"
 echo "[E2E] Warmup: enabled=${E2E_WARMUP} once=${E2E_WARMUP_ONCE} force=${E2E_WARMUP_FORCE}"
 if [[ "${RECORD_GMRVIDEO}" == "1" && "${USE_XVFB_GMR}" == "1" ]]; then
@@ -194,9 +197,11 @@ INTEGRATED_CMD=(
 	--time "${TIME}"
 	--output_dir "${OUTPUT_DIR}"
 	--robot "${ROBOT}"
+	--robots "${ROBOTS}"
 	--coord_fix yup_to_zup
 	--save_path "${PKL_PATH}"
 	--csv_path "${CSV_PATH}"
+	--csv_root "${CSV_ROOT}"
 	--smooth_alpha "${SMOOTH_ALPHA}"
 	--viewer_warmup_frames "${VIEWER_WARMUP_FRAMES}"
 	--camera_lookat_height_offset "${CAMERA_LOOKAT_HEIGHT_OFFSET}"

@@ -992,7 +992,10 @@ if __name__ == '__main__':
     cfg = get_cfg_defaults()
     cfg.merge_from_file('configs/yamls/demo.yaml')
     
-    record_whamvideo = bool(args.record_whamvideo or args.record_video)
+    # Keep --record_video accepted for old scripts, but make explicit WHAM/GMR
+    # recording flags authoritative so HUD-disabled recording cannot be revived
+    # by a legacy default.
+    record_whamvideo = bool(args.record_whamvideo)
 
     run_stream_mt(
         cfg,

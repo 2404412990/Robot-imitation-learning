@@ -149,6 +149,7 @@ $GMR_PYTHON   = _env GMR_PYTHON   $WHAM_PYTHON
 $VIDEO        = _env VIDEO        "examples/IMG_9732.mov"
 $TIME         = _env TIME         "0"
 $ROBOT        = _env ROBOT        "unitree_g1"
+$ROBOTS       = _env ROBOTS       $ROBOT
 $ROBOT_PATH   = _env ROBOT_PATH   ""
 
 # ROBOT_PATH supports both robot key and custom XML path.
@@ -162,7 +163,7 @@ if ($ROBOT_PATH) {
 }
 
 # Backward compatibility.
-$LEGACY_RECORD_VIDEO  = _env RECORD_VIDEO   "1"
+$LEGACY_RECORD_VIDEO  = _env RECORD_VIDEO   "0"
 $RECORD_WHAMVIDEO     = _env RECORD_WHAMVIDEO $LEGACY_RECORD_VIDEO
 $RECORD_GMRVIDEO      = _env RECORD_GMRVIDEO  $LEGACY_RECORD_VIDEO
 $USE_XVFB_GMR         = _env USE_XVFB_GMR     "0"
@@ -172,12 +173,14 @@ if ($OUTPUT_ROOT) {
     $OUTPUT_DIR      = _env OUTPUT_DIR     "$OUTPUT_ROOT/stream_demo"
     $STREAM_NPZ_DIR  = _env STREAM_NPZ_DIR "$OUTPUT_DIR/npz_stream"
     $PKL_PATH        = _env PKL_PATH       "$OUTPUT_ROOT/pkl/my_motion.pkl"
+    $CSV_ROOT        = _env CSV_ROOT       "$OUTPUT_ROOT/csv"
     $CSV_PATH        = _env CSV_PATH       "$OUTPUT_ROOT/csv/live_motion.csv"
     $GMR_VIDEO_PATH  = _env GMR_VIDEO_PATH "$OUTPUT_ROOT/video/live_stream_robot.mp4"
 } else {
     $OUTPUT_DIR      = _env OUTPUT_DIR     "output/stream_demo"
     $STREAM_NPZ_DIR  = _env STREAM_NPZ_DIR "$OUTPUT_DIR/npz_stream"
     $PKL_PATH        = _env PKL_PATH       "pkl_outputs/my_motion.pkl"
+    $CSV_ROOT        = _env CSV_ROOT       "pkl_outputs/csv"
     $CSV_PATH        = _env CSV_PATH       "pkl_outputs/csv/live_motion.csv"
     $GMR_VIDEO_PATH  = _env GMR_VIDEO_PATH "videos/live_stream_robot.mp4"
 }
@@ -236,6 +239,7 @@ if ($E2E_VALIDATE_ENV_ONLY -eq "1") {
 foreach ($d in @(
     $OUTPUT_DIR,
     (Split-Path -Parent $PKL_PATH),
+    $CSV_ROOT,
     (Split-Path -Parent $CSV_PATH),
     (Split-Path -Parent $GMR_VIDEO_PATH)
 )) {
@@ -259,7 +263,7 @@ Write-Host "[E2E] Camera params: follow=$CAMERA_FOLLOW track=$TRACK lookat_h=$CA
 Write-Host "[E2E] WHAM perf params: amp=$WHAM_USE_AMP detect_interval=$WHAM_DETECT_INTERVAL infer_interval=$WHAM_INFER_INTERVAL seq_len=$WHAM_STREAM_SEQ_LEN input_scale=$WHAM_INPUT_SCALE"
 Write-Host "[E2E] WHAM stream mode=tail (fixed)"
 Write-Host "[E2E] GMR torch_device=$GMR_TORCH_DEVICE"
-Write-Host "[E2E] Source params: VIDEO=$VIDEO TIME=$TIME ROBOT=$ROBOT OUTPUT_ROOT=$(if ($OUTPUT_ROOT) { $OUTPUT_ROOT } else { '<default>' }) CSV_PATH=$CSV_PATH TCP=$TCP"
+Write-Host "[E2E] Source params: VIDEO=$VIDEO TIME=$TIME ROBOT=$ROBOT ROBOTS=$ROBOTS OUTPUT_ROOT=$(if ($OUTPUT_ROOT) { $OUTPUT_ROOT } else { '<default>' }) CSV_PATH=$CSV_PATH CSV_ROOT=$CSV_ROOT TCP=$TCP"
 Write-Host "[E2E] GMR viewer mode: async thread + low-latency fixed profile (ready_timeout=$GMR_VIEWER_READY_TIMEOUT_SEC s, join_timeout=$GMR_VIEWER_THREAD_JOIN_TIMEOUT_SEC s)"
 Write-Host "[E2E] Warmup: enabled=$E2E_WARMUP once=$E2E_WARMUP_ONCE force=$E2E_WARMUP_FORCE"
 
@@ -351,9 +355,11 @@ $INTEGRATED_CMD = @(
     "--time", $TIME,
     "--output_dir", $OUTPUT_DIR,
     "--robot", $ROBOT,
+    "--robots", $ROBOTS,
     "--coord_fix", "yup_to_zup",
     "--save_path", $PKL_PATH,
     "--csv_path", $CSV_PATH,
+    "--csv_root", $CSV_ROOT,
     "--smooth_alpha", $SMOOTH_ALPHA,
     "--viewer_warmup_frames", $VIEWER_WARMUP_FRAMES,
     "--camera_lookat_height_offset", $CAMERA_LOOKAT_HEIGHT_OFFSET,

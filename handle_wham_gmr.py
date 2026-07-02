@@ -4,6 +4,7 @@ import time
 import os
 import cv2
 import csv
+import json
 import smplx
 from scipy.spatial.transform import Rotation as R
 from smplx.joint_names import JOINT_NAMES
@@ -77,6 +78,77 @@ def _build_unity_csv_row(qpos, robot: str, csv_path: str, frame_id: int):
             "Check ROBOT env/--robot and the loaded MuJoCo XML before feeding Unity."
         )
     return row
+
+
+def _write_unity_qpos_metadata(state):
+    """Write a sidecar describing the exact MuJoCo qpos contract Unity consumes.
+
+    This intentionally does not change live_motion.csv. Unity can use the JSON
+    to validate joint names/order, qpos0/home offsets, limits, and root quat
+    convention instead of guessing from scene traversal order.
+    """
+    if state is None or state.get("metadata_written"):
+        return
+
+    csv_path = state.get("csv_path")
+    retarget = state.get("retarget")
+    if not csv_path or retarget is None or getattr(retarget, "model", None) is None:
+        return
+
+    model = retarget.model
+    joints = []
+    for joint_id in range(int(model.njnt)):
+        qpos_adr = int(model.jnt_qposadr[joint_id])
+        if qpos_adr < 7:
+            continue
+
+        joint_name = mj.mj_id2name(model, mj.mjtObj.mjOBJ_JOINT, joint_id) or f"qpos_{qpos_adr}"
+        limited = bool(model.jnt_limited[joint_id]) if hasattr(model, "jnt_limited") else False
+        joint_range = None
+        if limited:
+            joint_range = [
+                float(model.jnt_range[joint_id][0]),
+                float(model.jnt_range[joint_id][1]),
+            ]
+
+        joints.append({
+            "csvIndex": qpos_adr - 7,
+            "jointName": joint_name,
+            "qposAdr": qpos_adr,
+            "qpos0": float(model.qpos0[qpos_adr]),
+            "limited": limited,
+            "range": joint_range,
+        })
+
+    joints.sort(key=lambda item: item["csvIndex"])
+    metadata = {
+        "robot": state.get("robot"),
+        "csvColumns": int(model.nq),
+        "qposLength": int(model.nq),
+        "root": {
+            "position": "qpos[0:3]",
+            "quatSourceOrder": "wxyz",
+            "csvQuatOrder": "xyzw",
+            "unityMapping": "pos=(-y,z,x), quat=(-y,z,x,-w)",
+            "qpos0": [float(v) for v in np.asarray(model.qpos0[:7]).tolist()],
+        },
+        "joints": joints,
+    }
+
+    metadata_dir = os.path.dirname(csv_path) or "."
+    metadata_path = os.path.join(metadata_dir, "retarget_metadata.json")
+    os.makedirs(metadata_dir, exist_ok=True)
+    tmp_path = metadata_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
+    os.replace(tmp_path, metadata_path)
+
+    state["metadata_path"] = metadata_path
+    state["metadata_written"] = True
+    logger.info(
+        f"[GMR] wrote Unity qpos metadata: robot={state.get('robot')} "
+        f"csv_cols={metadata['csvColumns']} joints={len(joints)} path={metadata_path}"
+    )
 
 
 def _x02lite_fk_ankles(qpos, postprocessor, state):
@@ -420,11 +492,16 @@ def run_stream_mt(
         "stream_mode=tail"
     )
     heartbeat_frames = max(1, int(os.environ.get('PIPELINE_HEARTBEAT_FRAMES', '30')))
+    low_memory_mode = env_flag("WHAM_LOW_MEMORY_MODE", False)
+    pipeline_queue_size = max(2, int(os.environ.get("WHAM_PIPELINE_QUEUE_SIZE", "10")))
+    gmr_preview_fps = max(0.5, float(os.environ.get("GMR_PREVIEW_FPS", "3.0")))
+    gmr_preview_interval = 1.0 / gmr_preview_fps
     logger.info(
         f"[Input] source={'webcam:0' if is_webcam else video_path} capture_time={webcam_capture_time:.2f}s "
         f"record_whamvideo={int(record_whamvideo)} tcp_requested={int(bool(getattr(gmr_args, 'tcp', False)))} "
         f"tcp_stream_wham={int(tcp_stream_wham)} tcp_stream_gmr={int(tcp_stream_gmr)} "
-        f"heartbeat_frames={heartbeat_frames}"
+        f"heartbeat_frames={heartbeat_frames} gmr_preview_fps={gmr_preview_fps:.2f} "
+        f"low_memory={int(low_memory_mode)} queue_size={pipeline_queue_size}"
     )
     if preview_window_enabled and os.name != 'nt' and not os.environ.get('DISPLAY'):
         logger.warning("RECORD_WHAMVIDEO=1 but DISPLAY is not set; preview window disabled.")
@@ -469,6 +546,10 @@ def run_stream_mt(
     else:
         cap = cv2.VideoCapture(video_path)
     assert cap.isOpened(), f'Faild to load video file {video_path}'
+    try:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    except Exception:
+        pass
 
     if rotate_deg is None and (not is_webcam) and hasattr(cv2, 'CAP_PROP_ORIENTATION_AUTO'):
         orientation_meta = None
@@ -550,11 +631,11 @@ def run_stream_mt(
 
 
     # Queues for pipeline
-    read_Q = Queue(maxsize=10)
-    det_Q = Queue(maxsize=10)
-    ext_Q = Queue(maxsize=10)
-    wham_Q = Queue(maxsize=10)
-    render_Q = Queue(maxsize=max(8, int(os.environ.get('WHAM_RENDER_QUEUE_SIZE', '120'))))
+    read_Q = Queue(maxsize=pipeline_queue_size)
+    det_Q = Queue(maxsize=pipeline_queue_size)
+    ext_Q = Queue(maxsize=pipeline_queue_size)
+    wham_Q = Queue(maxsize=pipeline_queue_size)
+    render_Q = Queue(maxsize=max(2, int(os.environ.get('WHAM_RENDER_QUEUE_SIZE', '16'))))
     render_thread = None
     render_drop_count = 0
 
@@ -563,6 +644,19 @@ def run_stream_mt(
             return q.qsize()
         except Exception:
             return -1
+
+    thread_failure_lock = threading.Lock()
+    thread_failure = {"message": None}
+
+    def guarded_thread(name, target):
+        try:
+            target()
+        except Exception as exc:
+            with thread_failure_lock:
+                if thread_failure["message"] is None:
+                    thread_failure["message"] = f"{name} thread failed: {exc}"
+            logger.exception(f"[FATAL] {name} thread failed")
+            request_stop()
 
     def extract_latest_vertices(pred):
         verts = pred['verts_cam']
@@ -1165,17 +1259,21 @@ def run_stream_mt(
                 if frame_id == 0 or frame_id % heartbeat_frames == 0:
                     logger.warning(f"[WHAM] frame={frame_id} skipped because no tracked person; wham_Q={safe_qsize(wham_Q)}")
 
-    t1 = threading.Thread(target=reader_thread, daemon=True)
-    t2 = threading.Thread(target=detector_thread, daemon=True)
-    t3 = threading.Thread(target=extractor_thread, daemon=True)
-    t4 = threading.Thread(target=wham_thread, daemon=True)
+    t1 = threading.Thread(target=lambda: guarded_thread("reader", reader_thread), daemon=True, name="reader")
+    t2 = threading.Thread(target=lambda: guarded_thread("detector", detector_thread), daemon=True, name="detector")
+    t3 = threading.Thread(target=lambda: guarded_thread("extractor", extractor_thread), daemon=True, name="extractor")
+    t4 = threading.Thread(target=lambda: guarded_thread("wham", wham_thread), daemon=True, name="wham")
     terminal_listener = None
 
     if is_webcam:
         if webcam_capture_time > 0:
             logger.info(f"Webcam auto-stop enabled: {webcam_capture_time:.2f}s")
         else:
-            terminal_listener = threading.Thread(target=terminal_key_listener, daemon=True)
+            terminal_listener = threading.Thread(
+                target=lambda: guarded_thread("terminal-listener", terminal_key_listener),
+                daemon=True,
+                name="terminal-listener",
+            )
     
     t1.start()
     t2.start()
@@ -1184,7 +1282,11 @@ def run_stream_mt(
     if terminal_listener is not None:
         terminal_listener.start()
     if record_whamvideo:
-        render_thread = threading.Thread(target=render_thread_worker, daemon=True, name='wham-render')
+        render_thread = threading.Thread(
+            target=lambda: guarded_thread("wham-render", render_thread_worker),
+            daemon=True,
+            name='wham-render',
+        )
         render_thread.start()
     
 
@@ -1193,11 +1295,62 @@ def run_stream_mt(
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
 
-    # GMR State Setup
-    gmr_state = {
-        "retarget": None,
-        "postprocessor": None,
-        "viewer": None,
+    # GMR State Setup.  Multi-robot mode shares the WHAM/human-motion
+    # adaptation path, then runs one GMR state per selected robot.
+    def _parse_robot_keys():
+        raw = getattr(gmr_args, "robots", None) if gmr_args is not None else None
+        if not raw:
+            raw = getattr(gmr_args, "robot", "unitree_g1") if gmr_args is not None else "unitree_g1"
+        keys = []
+        seen = set()
+        for part in str(raw).split(","):
+            key = part.strip()
+            if not key:
+                continue
+            low = key.lower()
+            if low not in seen:
+                keys.append(key)
+                seen.add(low)
+        return keys or [getattr(gmr_args, "robot", "unitree_g1")]
+
+    robot_keys = _parse_robot_keys()
+
+    def _new_gmr_state(robot_key, index):
+        return {
+            "robot": robot_key,
+            "index": index,
+            "lock": threading.Lock(),
+            "worker_queue": None,
+            "worker_thread": None,
+            "worker_last_frame": -1,
+            "worker_last_error": None,
+            "worker_dropped": 0,
+            "latest_qp": None,
+            "latest_frame_id": -1,
+            "latest_row": None,
+            "last_ik_ms": 0.0,
+            "last_post_ms": 0.0,
+            "last_csv_ms": 0.0,
+            "retarget": None,
+            "postprocessor": None,
+            "viewer": None,
+            "renderer": None,
+            "tcp_sender": None,
+            "csv_file": None,
+            "csv_writer": None,
+            "csv_path": None,
+            "metadata_path": None,
+            "metadata_written": False,
+            "csv_row_count": 0,
+            "qpos_history": [],
+            "prev_qpos_quat": None,
+            "ik_residuals_acc": [],
+            "ik_pos_error_acc": [],
+        }
+
+    gmr_states = {robot: _new_gmr_state(robot, i) for i, robot in enumerate(robot_keys)}
+    gmr_state = gmr_states[robot_keys[0]]
+    gmr_state.update({
         "tail_body_model": None,
         "tail_joint_names": None,
         "tail_parents": None,
@@ -1209,19 +1362,30 @@ def run_stream_mt(
         # Root orientation tracking for continuity across WHAM windows.
         # WHAM root orientation also resets per window; clamp large jumps.
         "prev_pelvis_quat": None,        # xyzw quaternion
-    }
-    qpos_history = []
-    csv_file = None
-    csv_writer = None
-    csv_row_count = 0
+    })
+    csv_flush_rows = max(1, int(os.environ.get("CSV_FLUSH_ROWS", "5")))
+    csv_flush_interval = max(0.01, float(os.environ.get("CSV_FLUSH_INTERVAL_MS", "100")) / 1000.0)
     
     if gmr_args is not None:
-        csv_dir = os.path.dirname(gmr_args.csv_path)
-        if csv_dir:
-            os.makedirs(csv_dir, exist_ok=True)
-        csv_file = open(gmr_args.csv_path, "w", newline="")
-        csv_writer = csv.writer(csv_file)
-        logger.info(f"[GMR] CSV output opened: {gmr_args.csv_path}")
+        csv_root = getattr(gmr_args, "csv_root", None)
+        for state in gmr_states.values():
+            robot_key = state["robot"]
+            if csv_root:
+                csv_path = os.path.join(csv_root, robot_key, "live_motion.csv")
+            elif len(gmr_states) == 1:
+                csv_path = gmr_args.csv_path
+            else:
+                base_dir = os.path.dirname(gmr_args.csv_path) or "pkl_outputs/csv"
+                csv_path = os.path.join(base_dir, robot_key, "live_motion.csv")
+
+            csv_dir = os.path.dirname(csv_path)
+            if csv_dir:
+                os.makedirs(csv_dir, exist_ok=True)
+            state["csv_path"] = csv_path
+            state["csv_file"] = open(csv_path, "w", newline="")
+            state["csv_writer"] = csv.writer(state["csv_file"])
+            state["last_csv_flush_time"] = time.time()
+            logger.info(f"[GMR] CSV output opened: robot={robot_key} path={csv_path}")
         
     def tail_params_to_smplx_frame(params):
         _dev = torch.device(gmr_args.torch_device) if gmr_args and gmr_args.torch_device != "cpu" else torch.device("cpu")
@@ -1320,6 +1484,7 @@ def run_stream_mt(
             root_origin_offset=gmr_args.root_origin_offset,
             torch_device=gmr_args.torch_device,
         )
+        _write_unity_qpos_metadata(gmr_state)
         
         # Create MuJoCo viewer when needed: recording, screenshot capture, or TCP streaming
         _need_viewer = gmr_args.record_gmrvideo or capture_interval > 0 or (gmr_args.tcp and tcp_stream_gmr)
@@ -1386,12 +1551,113 @@ def run_stream_mt(
                     logger.error(f"Failed to initialize GMR viewer: {e}")
                     gmr_state["viewer"] = None
 
+    def init_gmr_state(state, betas, create_viewer=None):
+        _need_viewer = (
+            bool(create_viewer) if create_viewer is not None
+            else (gmr_args.record_gmrvideo or capture_interval > 0 or (gmr_args.tcp and tcp_stream_gmr))
+        )
+        if state["retarget"] is not None:
+            if not _need_viewer or state.get("viewer") is not None:
+                return
+        else:
+            robot_key = state["robot"]
+            hh = None
+            if betas is not None and betas.size > 0:
+                hh = 1.66 + 0.1 * float(betas[0])
+
+            r_kwargs = dict(actual_human_height=hh, src_human="smplx", tgt_robot=robot_key)
+            if gmr_args.robot_path is not None and len(gmr_states) == 1:
+                r_kwargs["robot_path"] = gmr_args.robot_path
+
+            state["retarget"] = GMR(**r_kwargs)
+            expected_cols = _expected_csv_columns_for_robot(robot_key)
+            model_nq = int(state["retarget"].model.nq)
+            logger.info(
+                f"[GMR] initialized robot={robot_key} model_nq={model_nq} "
+                f"model_nv={int(state['retarget'].model.nv)} model_nu={int(state['retarget'].model.nu)} "
+                f"expected_csv_cols={expected_cols if expected_cols is not None else '<unchecked>'} "
+                f"xml={state['retarget'].xml_file}"
+            )
+            if expected_cols is not None and model_nq != expected_cols:
+                raise RuntimeError(
+                    f"[GMR] Robot model qpos length mismatch: robot={robot_key} "
+                    f"model_nq={model_nq} expected_csv_cols={expected_cols} xml={state['retarget'].xml_file}"
+                )
+
+            default_gmr_max_iter = "20" if (robot_key or "").strip().lower() == "openloong" else "10"
+            _gmr_max_iter = int(os.environ.get("GMR_MAX_ITER", default_gmr_max_iter))
+            state["retarget"].max_iter = _gmr_max_iter
+            logger.info(f"[GMR] robot={robot_key} max_iter={_gmr_max_iter}")
+
+            state["postprocessor"] = OnlineQposPostprocessor(
+                state["retarget"].xml_file,
+                root_body_name=state["retarget"].robot_root_name,
+                smooth_alpha=max(0.0, min(1.0, gmr_args.smooth_alpha)),
+                height_adjust=gmr_args.height_adjust,
+                root_origin_offset=gmr_args.root_origin_offset,
+                torch_device=gmr_args.torch_device,
+            )
+            _write_unity_qpos_metadata(state)
+
+        if not _need_viewer:
+            return
+
+        robot_key = state["robot"]
+
+        gmr_window_w, gmr_window_h = gmr_window_size()
+        v_kws = dict(
+            robot_type=robot_key,
+            motion_fps=30.0,
+            transparent_robot=0,
+            record_video=gmr_args.record_gmrvideo and state["index"] == 0,
+            video_path=gmr_args.video_path,
+            video_width=gmr_window_w,
+            video_height=gmr_window_h,
+            window_width=gmr_window_w,
+            window_height=gmr_window_h,
+            camera_follow=getattr(gmr_args, "camera_follow", False) or getattr(gmr_args, "track", False),
+        )
+        if hasattr(gmr_args, "camera_lookat_height_offset"):
+            v_kws["camera_lookat_height_offset"] = gmr_args.camera_lookat_height_offset
+        if hasattr(gmr_args, "camera_elevation"):
+            v_kws["camera_elevation"] = gmr_args.camera_elevation
+        if hasattr(gmr_args, "camera_distance_scale"):
+            v_kws["camera_distance_scale"] = gmr_args.camera_distance_scale
+        if getattr(gmr_args, "camera_azimuth", None) is not None:
+            v_kws["camera_azimuth"] = gmr_args.camera_azimuth
+        if getattr(gmr_args, "robot_path", None) is not None and len(gmr_states) == 1:
+            v_kws["robot_path"] = gmr_args.robot_path
+
+        _is_headless = not os.environ.get("DISPLAY")
+        try:
+            if _is_headless and not (gmr_args.record_gmrvideo and state["index"] == 0):
+                state["viewer"] = _HeadlessViewer(**v_kws)
+                logger.info(f"Initialized headless GMR viewer for {robot_key}")
+            else:
+                state["viewer"] = RobotMotionViewer(**v_kws)
+                logger.info(f"Initialized GMR viewer for {robot_key}")
+        except Exception as e:
+            logger.error(f"Failed to initialize GMR viewer for {robot_key}: {e}")
+            state["viewer"] = None
+
+        if state["viewer"] is not None and ((gmr_args.tcp and tcp_stream_gmr) or capture_interval > 0):
+            try:
+                v = state["viewer"]
+                h, w, render_reason = gmr_renderer_size(capture_interval > 0)
+                state["renderer"] = mj.Renderer(v.model, height=h, width=w)
+                logger.info(f"Initialized GMR offscreen renderer ({w}x{h}) for {render_reason}, robot={robot_key}")
+            except Exception as e:
+                logger.error(f"Failed to create offscreen renderer for {robot_key}: {e}")
+                state["renderer"] = None
+
     # TCP sender for streaming WHAM (streamId=0) and GMR (streamId=1) frames to Unity
     if gmr_args.tcp and (tcp_stream_wham or tcp_stream_gmr):
         tcp_sender = TcpStreamSender()
-        gmr_state["tcp_sender"] = tcp_sender
+        for state in gmr_states.values():
+            state["tcp_sender"] = tcp_sender
     else:
-        gmr_state["tcp_sender"] = None
+        for state in gmr_states.values():
+            state["tcp_sender"] = None
         logger.info("TCP streaming disabled (use --tcp to enable)")
 
     frame_times = deque(maxlen=30)
@@ -1406,6 +1672,157 @@ def run_stream_mt(
     _t_gmr_post = deque(maxlen=30)   # post-processing (ms)
     _t_wham_q   = deque(maxlen=30)   # wham_Q.get wait time (ms)
     _t_adapt    = deque(maxlen=30)   # adaptation layer (ms)
+    last_gmr_preview_render_time = 0.0
+    gmr_worker_queue_size = max(1, int(os.environ.get("GMR_WORKER_QUEUE_SIZE", "1")))
+
+    def _clone_smplx_frame(src):
+        return {
+            key: (
+                np.asarray(value[0]).copy(),
+                np.asarray(value[1]).copy(),
+            )
+            for key, value in src.items()
+        }
+
+    def _enqueue_latest_gmr_task(state, frame_id, sf, betas):
+        q = state.get("worker_queue")
+        if q is None:
+            return
+
+        task = (int(frame_id), _clone_smplx_frame(sf), None if betas is None else np.asarray(betas).copy())
+        try:
+            q.put_nowait(task)
+            return
+        except Full:
+            pass
+
+        try:
+            q.get_nowait()
+            with state["lock"]:
+                state["worker_dropped"] += 1
+        except Empty:
+            pass
+
+        try:
+            q.put_nowait(task)
+        except Full:
+            with state["lock"]:
+                state["worker_dropped"] += 1
+
+    def _process_gmr_worker_frame(state, frame_id, sf, betas):
+        robot_key = state["robot"]
+        init_gmr_state(state, betas, create_viewer=False)
+
+        _t0_ik = time.perf_counter()
+        qp, ik_residuals = state["retarget"].retarget(sf)
+        ik_ms = (time.perf_counter() - _t0_ik) * 1000
+
+        _t0_post = time.perf_counter()
+        qp = state["postprocessor"].process(qp)
+        post_ms = (time.perf_counter() - _t0_post) * 1000
+
+        if not os.environ.get("BENCH_DISABLE_QUAT_CLAMP", "0") == "1" and state.get("prev_qpos_quat") is not None:
+            prev_q = state["prev_qpos_quat"]
+            curr_q = np.asarray(qp[3:7], dtype=np.float64)
+            if float(np.dot(curr_q, prev_q)) < 0.0:
+                curr_q = -curr_q
+            prev_xyzw = prev_q[[1, 2, 3, 0]]
+            curr_xyzw = curr_q[[1, 2, 3, 0]]
+            r_curr = R.from_quat(curr_xyzw)
+            r_prev = R.from_quat(prev_xyzw)
+            r_diff = r_curr * r_prev.inv()
+            angle = float(np.linalg.norm(r_diff.as_rotvec()))
+            max_angle = np.deg2rad(20.0)
+            if angle > max_angle:
+                blend = float(max_angle / angle)
+                curr_q = prev_q + blend * (curr_q - prev_q)
+                curr_q /= np.linalg.norm(curr_q)
+                qp[3:7] = curr_q.astype(qp.dtype)
+        state["prev_qpos_quat"] = np.asarray(qp[3:7], dtype=np.float64).copy()
+
+        state["ik_residuals_acc"].append(ik_residuals)
+        try:
+            pos_err_mm = state["retarget"].decomposed_position_error_mm()
+            state["ik_pos_error_acc"].append(pos_err_mm)
+        except Exception:
+            pass
+
+        if str(robot_key).strip().lower() == "x02lite" and (state["csv_row_count"] == 0 or frame_id % heartbeat_frames == 0):
+            _log_x02lite_qpos_health(qp, state.get("postprocessor"), frame_id, state)
+
+        _t0_csv = time.perf_counter()
+        row = _build_unity_csv_row(qp, robot_key, state["csv_path"], frame_id)
+        writer = state.get("csv_writer")
+        csv_fh = state.get("csv_file")
+        if writer is not None:
+            writer.writerow(row.tolist())
+            state["csv_row_count"] += 1
+            now_for_flush = time.time()
+            if csv_fh is not None and (
+                state["csv_row_count"] % csv_flush_rows == 0 or
+                now_for_flush - state.get("last_csv_flush_time", 0.0) >= csv_flush_interval
+            ):
+                csv_fh.flush()
+                state["last_csv_flush_time"] = now_for_flush
+        csv_ms = (time.perf_counter() - _t0_csv) * 1000
+
+        state["qpos_history"].append(qp.copy())
+        with state["lock"]:
+            state["latest_qp"] = qp.copy()
+            state["latest_row"] = row.copy()
+            state["latest_frame_id"] = int(frame_id)
+            state["worker_last_frame"] = int(frame_id)
+            state["worker_last_error"] = None
+            state["last_ik_ms"] = ik_ms
+            state["last_post_ms"] = post_ms
+            state["last_csv_ms"] = csv_ms
+
+        _t_gmr_ik.append(ik_ms)
+        _t_gmr_post.append(post_ms)
+
+        if state["csv_row_count"] == 1 or frame_id % heartbeat_frames == 0:
+            logger.info(
+                f"[GMR] wrote CSV row={state['csv_row_count']} frame={frame_id} robot={robot_key} "
+                f"qpos_len={len(qp)} csv_cols={len(row)} csv={state['csv_path']} "
+                f"ik_ms={ik_ms:.1f} post_ms={post_ms:.1f} csv_ms={csv_ms:.1f}"
+            )
+
+    def _gmr_worker_loop(state):
+        robot_key = state["robot"]
+        logger.info(f"[GMR] worker started robot={robot_key}")
+        while not stop_event.is_set():
+            try:
+                task = state["worker_queue"].get(timeout=0.1)
+            except Empty:
+                continue
+            if task is None:
+                break
+            frame_id, sf, betas = task
+            try:
+                _process_gmr_worker_frame(state, frame_id, sf, betas)
+            except KeyboardInterrupt:
+                terminal_stop_event.set()
+                stop_event.set()
+                break
+            except Exception as e:
+                with state["lock"]:
+                    state["worker_last_error"] = str(e)
+                logger.error(f"[GMR] worker error robot={robot_key} frame={frame_id}: {e}")
+                if state.get("retarget") is None:
+                    stop_event.set()
+                    break
+        logger.info(f"[GMR] worker stopped robot={robot_key}")
+
+    for state in gmr_states.values():
+        state["worker_queue"] = Queue(maxsize=gmr_worker_queue_size)
+        worker = threading.Thread(
+            target=_gmr_worker_loop,
+            args=(state,),
+            daemon=True,
+            name=f"gmr-worker-{state['robot']}",
+        )
+        state["worker_thread"] = worker
+        worker.start()
 
     # Register SIGINT handler so Ctrl+C sets stop flags gracefully instead of
     # interrupting PyTorch / MuJoCo native code mid-operation (which causes segfaults).
@@ -1522,95 +1939,77 @@ def run_stream_mt(
 
                 _t_adapt.append((time.perf_counter() - _t0_adapt) * 1000)
 
-                init_gmr(bt)
+                for state in gmr_states.values():
+                    _enqueue_latest_gmr_task(state, frame_id, sf, bt)
 
-                try:
-                    _t0_ik = time.perf_counter()
-                    qp, ik_residuals = gmr_state["retarget"].retarget(sf)
-                    _t_gmr_ik.append((time.perf_counter() - _t0_ik) * 1000)
-                    _t0_post = time.perf_counter()
-                    qp = gmr_state["postprocessor"].process(qp)
-                    _t_gmr_post.append((time.perf_counter() - _t0_post) * 1000)
-                    # Accumulate IK residuals for per-frame averaging
-                    if "ik_residuals_acc" not in gmr_state:
-                        gmr_state["ik_residuals_acc"] = []
-                        gmr_state["ik_pos_error_acc"] = []
-                    gmr_state["ik_residuals_acc"].append(ik_residuals)
+                now_for_preview = time.time()
+                render_gmr_preview_this_frame = (
+                    tcp_stream_gmr and
+                    (now_for_preview - last_gmr_preview_render_time) >= gmr_preview_interval
+                )
+                rendered_gmr_preview = False
+                gmr_preview_frames = []
+                if render_gmr_preview_this_frame or capture_interval > 0 or gmr_args.record_gmrvideo:
+                    for robot_key, state in gmr_states.items():
+                        try:
+                            init_gmr_state(state, bt, create_viewer=True)
+                            with state["lock"]:
+                                qp = None if state.get("latest_qp") is None else state["latest_qp"].copy()
+                            if qp is None:
+                                continue
+
+                            need_viewer_step = (
+                                state["viewer"] is not None and
+                                state.get("csv_row_count", 0) > max(0, int(gmr_args.viewer_warmup_frames)) and
+                                (gmr_args.record_gmrvideo or capture_interval > 0 or render_gmr_preview_this_frame)
+                            )
+                            if not need_viewer_step:
+                                continue
+
+                            display_qp = qp.copy()
+                            if len(gmr_states) > 1:
+                                display_qp[0] += (state["index"] - (len(gmr_states) - 1) * 0.5) * 1.6
+                            state["viewer"].step(
+                                root_pos=display_qp[:3],
+                                root_rot=display_qp[3:7],
+                                dof_pos=display_qp[7:],
+                                human_motion_data=None,
+                                human_pos_offset=np.array([0.0, 0.0, 0.0]),
+                                show_human_body_name=False,
+                                rate_limit=False,
+                                follow_camera=(gmr_args.camera_follow or gmr_args.track),
+                            )
+
+                            gmr_renderer = state.get("renderer")
+                            if tcp_stream_gmr and render_gmr_preview_this_frame and gmr_renderer is not None:
+                                gmr_renderer.update_scene(state["viewer"].data, camera=state["viewer"].viewer.cam)
+                                gmr_rgb = gmr_renderer.render()
+                                gmr_preview_frames.append(cv2.cvtColor(gmr_rgb, cv2.COLOR_RGB2BGR))
+                                rendered_gmr_preview = True
+                        except Exception as e:
+                            logger.error(f"GMR viewer error ({robot_key}): {e}")
+
+                tcp = gmr_state.get("tcp_sender")
+                if tcp_stream_gmr and gmr_preview_frames and tcp is not None:
+                    if not tcp.connected:
+                        tcp.connect()
                     try:
-                        pos_err_mm = gmr_state["retarget"].decomposed_position_error_mm()
-                        gmr_state["ik_pos_error_acc"].append(pos_err_mm)
-                    except Exception:
-                        pass
-                except KeyboardInterrupt:
-                    logger.info("KeyboardInterrupt during GMR processing, shutting down.")
-                    terminal_stop_event.set()
-                    stop_event.set()
-                    break
-
-                # Clamp root quaternion change per frame to suppress yaw
-                # jitter from WHAM window resets.  The postprocessor already
-                # smooths, but large jumps can still slip through.
-                # NOTE: MuJoCo qpos uses wxyz (scalar-first); scipy uses xyzw.
-                if not _bench_no_quat and gmr_state.get("prev_qpos_quat") is not None:
-                    prev_q = gmr_state["prev_qpos_quat"]       # wxyz
-                    curr_q = np.asarray(qp[3:7], dtype=np.float64)  # wxyz
-                    if float(np.dot(curr_q, prev_q)) < 0.0:
-                        curr_q = -curr_q
-                    prev_xyzw = prev_q[[1, 2, 3, 0]]
-                    curr_xyzw = curr_q[[1, 2, 3, 0]]
-                    r_curr = R.from_quat(curr_xyzw)
-                    r_prev = R.from_quat(prev_xyzw)
-                    r_diff = r_curr * r_prev.inv()
-                    angle = float(np.linalg.norm(r_diff.as_rotvec()))
-                    max_angle = np.deg2rad(20.0)
-                    if angle > max_angle:
-                        blend = float(max_angle / angle)
-                        curr_q = prev_q + blend * (curr_q - prev_q)
-                        curr_q /= np.linalg.norm(curr_q)
-                        qp[3:7] = curr_q.astype(qp.dtype)
-                gmr_state["prev_qpos_quat"] = np.asarray(qp[3:7], dtype=np.float64).copy()  # wxyz
-                qpos_history.append(qp.copy())
-
-                if str(gmr_args.robot).strip().lower() == "x02lite" and (csv_row_count == 0 or frame_id % heartbeat_frames == 0):
-                    _log_x02lite_qpos_health(qp, gmr_state.get("postprocessor"), frame_id, gmr_state)
-                
-                row = _build_unity_csv_row(qp, gmr_args.robot, gmr_args.csv_path, frame_id)
-                csv_writer.writerow(row.tolist())
-                csv_file.flush()
-                csv_row_count += 1
-                if csv_row_count == 1 or frame_id % heartbeat_frames == 0:
-                    logger.info(
-                        f"[GMR] wrote CSV row={csv_row_count} frame={frame_id} robot={gmr_args.robot} "
-                        f"qpos_len={len(qp)} csv_cols={len(row)} csv={gmr_args.csv_path}"
-                    )
-                
-                if gmr_state["viewer"] is not None and (len(qpos_history) - 1) >= max(0, int(gmr_args.viewer_warmup_frames)):
-                    try:
-                        gmr_state["viewer"].step(
-                            root_pos=qp[:3],
-                            root_rot=qp[3:7],
-                            dof_pos=qp[7:],
-                            human_motion_data=None,
-                            human_pos_offset=np.array([0.0, 0.0, 0.0]),
-                            show_human_body_name=False,
-                            rate_limit=False,
-                            follow_camera=(gmr_args.camera_follow or gmr_args.track),
-                        )
-
-                        # Capture GMR offscreen frame for Unity (streamId=1)
-                        gmr_renderer = gmr_state.get("renderer")
-                        tcp = gmr_state.get("tcp_sender")
-                        if tcp_stream_gmr and gmr_renderer is not None and tcp is not None:
-                            if not tcp.connected:
-                                tcp.connect()
-                            gmr_renderer.update_scene(gmr_state["viewer"].data, camera=gmr_state["viewer"].viewer.cam)
-                            gmr_rgb = gmr_renderer.render()
-                            gmr_bgr = cv2.cvtColor(gmr_rgb, cv2.COLOR_RGB2BGR)
-                            if tcp.send_frame(1, gmr_bgr) and not gmr_state.get("_tcp_gmr_logged", False):
-                                logger.info("[TCP] Sent first GMR frame to Unity streamId=1")
-                                gmr_state["_tcp_gmr_logged"] = True
+                        min_h = min(img.shape[0] for img in gmr_preview_frames)
+                        fitted = []
+                        for img in gmr_preview_frames:
+                            if img.shape[0] != min_h:
+                                w = max(1, int(img.shape[1] * (min_h / float(img.shape[0]))))
+                                img = cv2.resize(img, (w, min_h), interpolation=cv2.INTER_AREA)
+                            fitted.append(img)
+                        gmr_bgr = np.concatenate(fitted, axis=1) if len(fitted) > 1 else fitted[0]
+                        if tcp.send_frame(1, gmr_bgr) and not gmr_state.get("_tcp_gmr_logged", False):
+                            logger.info(f"[TCP] Sent first GMR frame to Unity streamId=1 robots={','.join(robot_keys)}")
+                            gmr_state["_tcp_gmr_logged"] = True
                     except Exception as e:
-                        logger.error(f"GMR viewer error: {e}")
+                        logger.error(f"GMR preview compose/send error: {e}")
+
+                if rendered_gmr_preview:
+                    last_gmr_preview_render_time = time.time()
         else:
             if frame_id == 0 or frame_id % heartbeat_frames == 0:
                 logger.warning(
@@ -1626,6 +2025,33 @@ def run_stream_mt(
         
         # Calculate latency
         latency = curr_time - start_time
+
+        if frame_id == 0 or frame_id % heartbeat_frames == 0:
+            robot_rows_parts = []
+            for key, state in gmr_states.items():
+                q = state.get("worker_queue")
+                with state["lock"]:
+                    err = state.get("worker_last_error")
+                    dropped = state.get("worker_dropped", 0)
+                    latest_frame = state.get("latest_frame_id", -1)
+                    ik_ms = state.get("last_ik_ms", 0.0)
+                    csv_ms = state.get("last_csv_ms", 0.0)
+                err_tag = "" if not err else f":err={str(err)[:48]}"
+                robot_rows_parts.append(
+                    f"{key}:csv={state.get('csv_row_count', 0)} latest={latest_frame} "
+                    f"q={safe_qsize(q)} drop={dropped} ik={ik_ms:.1f} csv_ms={csv_ms:.1f}{err_tag}"
+                )
+            robot_rows = " | ".join(robot_rows_parts)
+            mean_ik = float(np.mean(_t_gmr_ik)) if len(_t_gmr_ik) else 0.0
+            mean_post = float(np.mean(_t_gmr_post)) if len(_t_gmr_post) else 0.0
+            mean_adapt = float(np.mean(_t_adapt)) if len(_t_adapt) else 0.0
+            mean_wham_wait = float(np.mean(_t_wham_q)) if len(_t_wham_q) else 0.0
+            logger.info(
+                f"[Heartbeat] frame={frame_id} wham_fps={avg_fps:.2f} latency={latency:.2f}s "
+                f"queues read={safe_qsize(read_Q)} det={safe_qsize(det_Q)} ext={safe_qsize(ext_Q)} wham={safe_qsize(wham_Q)} "
+                f"adapt_ms={mean_adapt:.1f} ik_ms={mean_ik:.1f} post_ms={mean_post:.1f} wham_wait_ms={mean_wham_wait:.1f} "
+                f"gmr_preview_fps={gmr_preview_fps:.2f} {robot_rows}"
+            )
         
         if record_whamvideo:
             if success and verts_cam is not None:
@@ -1722,15 +2148,49 @@ def run_stream_mt(
                 f"[Q-wait:{_q_ms:.1f}ms  Adapt:{_ad_ms:.1f}ms  IK:{_ik_ms:.1f}ms  Post:{_po_ms:.1f}ms]"
             )
             
-    if gmr_args is not None and csv_file is not None:
-        csv_file.close()
+    if gmr_args is not None:
+        stop_event.set()
+        for state in gmr_states.values():
+            q = state.get("worker_queue")
+            if q is None:
+                continue
+            try:
+                q.put_nowait(None)
+            except Full:
+                try:
+                    q.get_nowait()
+                except Empty:
+                    pass
+                try:
+                    q.put_nowait(None)
+                except Full:
+                    pass
+
+        worker_join_timeout = max(0.5, float(os.environ.get("GMR_WORKER_JOIN_TIMEOUT", "3.0")))
+        for state in gmr_states.values():
+            worker = state.get("worker_thread")
+            if worker is not None:
+                worker.join(timeout=worker_join_timeout)
+                if worker.is_alive():
+                    logger.warning(f"[GMR] worker did not exit in time robot={state['robot']}")
+
+        for state in gmr_states.values():
+            csv_fh = state.get("csv_file")
+            if csv_fh is not None:
+                try:
+                    csv_fh.flush()
+                    csv_fh.close()
+                except Exception:
+                    pass
+
         from scripts.smplx_to_robot_stream import write_motion_pkl
-        if len(qpos_history) > 0:
+        primary_history = gmr_state.get("qpos_history", [])
+        if len(primary_history) > 0:
             logger.info(f"Saving motion PKL to {gmr_args.save_path}")
             try:
                 write_motion_pkl(
                     gmr_args.save_path,
-                    qpos_history,
+                    primary_history,
                     fps=30.0,
                     xml_file=gmr_state["retarget"].xml_file,
                     root_body_name=gmr_state["retarget"].robot_root_name,
@@ -1751,11 +2211,12 @@ def run_stream_mt(
             elif _dirs["mujoco"] == 0:
                 logger.warning(f"[Capture] No MuJoCo frames captured — render failures={gmr_state.get('_render_failures', 0)}")
             cap_orig.release()
-        if gmr_state["viewer"] is not None:
-            try:
-                gmr_state["viewer"].close()
-            except:
-                pass
+        for state in gmr_states.values():
+            if state.get("viewer") is not None:
+                try:
+                    state["viewer"].close()
+                except Exception:
+                    pass
         if gmr_state.get("tcp_sender") is not None:
             try:
                 gmr_state["tcp_sender"].close()
@@ -1784,6 +2245,13 @@ def run_stream_mt(
             logger.warning("render thread did not exit in time; continue shutdown.")
         if render_drop_count > 0:
             logger.info(f"Render queue dropped {render_drop_count} frame(s) to keep low latency.")
+
+    with thread_failure_lock:
+        fatal_thread_message = thread_failure.get("message")
+    if fatal_thread_message:
+        if torch.cuda.is_available():
+            logger.info(f"[VRAM] peak_allocated_mb={torch.cuda.max_memory_allocated()/1024/1024:.0f}")
+        raise RuntimeError(fatal_thread_message)
 
     if len(frame_param_map) == 0 or max_frame_id < 0:
         logger.warning("No valid WHAM predictions were collected. Skip GMR SMPL-X npz save.")
@@ -1875,11 +2343,15 @@ if __name__ == '__main__':
     
     # GMR Args
     parser.add_argument("--robot", default="unitree_g1")
+    parser.add_argument("--robots", default=None,
+                        help="Comma-separated robot keys for multi-robot GMR. Defaults to --robot.")
     parser.add_argument("--robot_path", type=str, default=None)
     parser.add_argument("--torch_device", default="cpu")
     parser.add_argument("--coord_fix", default="yup_to_zup")
     parser.add_argument("--save_path", type=str, default="pkl_outputs/live_motion.pkl")
     parser.add_argument("--csv_path", type=str, default="pkl_outputs/csv/live_motion.csv")
+    parser.add_argument("--csv_root", type=str, default=None,
+                        help="Root directory for multi-robot CSV output: <csv_root>/<robot>/live_motion.csv.")
     parser.add_argument("--record_gmrvideo", action="store_true")
     parser.add_argument("--video_path", type=str, default="videos/live_stream_robot.mp4", help="GMR video path")
     parser.add_argument("--viewer_warmup_frames", type=int, default=12)
@@ -1920,7 +2392,10 @@ if __name__ == '__main__':
     cfg = get_cfg_defaults()
     cfg.merge_from_file('configs/yamls/demo.yaml')
     
-    record_whamvideo = bool(args.record_whamvideo or args.record_video)
+    # `--record_video` is a legacy alias that made disabled HUD recording
+    # unexpectedly write WHAM videos through old run.ps1 defaults. Keep the
+    # parser for compatibility, but make explicit WHAM/GMR flags authoritative.
+    record_whamvideo = bool(args.record_whamvideo)
 
 
 
