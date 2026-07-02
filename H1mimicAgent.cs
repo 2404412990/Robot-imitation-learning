@@ -78,12 +78,12 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
     private static readonly UnityRetargetCalibrationEntry[] H1UnityCalibration =
     {
         new UnityRetargetCalibrationEntry(0,  "left_hip_yaw",          1f, 0f),
-        new UnityRetargetCalibrationEntry(1,  "left_hip_roll",         1f, 0f),
+        new UnityRetargetCalibrationEntry(1,  "left_hip_roll",         1f, -0.04f),
         new UnityRetargetCalibrationEntry(2,  "left_hip_pitch",        1f, 0f),
         new UnityRetargetCalibrationEntry(3,  "left_knee",             1f, 0f),
         new UnityRetargetCalibrationEntry(4,  "left_ankle",            1f, 0f),
         new UnityRetargetCalibrationEntry(5,  "right_hip_yaw",         1f, 0f),
-        new UnityRetargetCalibrationEntry(6,  "right_hip_roll",        1f, 0f),
+        new UnityRetargetCalibrationEntry(6,  "right_hip_roll",        1f, 0.04f),
         new UnityRetargetCalibrationEntry(7,  "right_hip_pitch",       1f, 0f),
         new UnityRetargetCalibrationEntry(8,  "right_knee",            1f, 0f),
         new UnityRetargetCalibrationEntry(9,  "right_ankle",           1f, 0f),
@@ -921,13 +921,26 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
 
     private Quaternion MapH1RootRotation(float[] currentRot)
     {
-        return KeepRootYawOnly(UnityQposMapper.MapRootRotationFromCsvXyzw(currentRot));
+        return KeepLimitedRootTilt(UnityQposMapper.MapRootRotationFromCsvXyzw(currentRot));
     }
 
     private static Quaternion KeepRootYawOnly(Quaternion rotation)
     {
         Vector3 euler = rotation.eulerAngles;
         return Quaternion.Euler(0f, euler.y, 0f);
+    }
+
+    private static Quaternion KeepLimitedRootTilt(Quaternion rotation)
+    {
+        Vector3 euler = rotation.eulerAngles;
+        float pitch = Mathf.Clamp(ToSignedDegrees(euler.x) * 0.25f, -6f, 6f);
+        float roll = Mathf.Clamp(ToSignedDegrees(euler.z) * 0.25f, -6f, 6f);
+        return Quaternion.Euler(pitch, euler.y, roll);
+    }
+
+    private static float ToSignedDegrees(float degrees)
+    {
+        return Mathf.DeltaAngle(0f, degrees);
     }
 
     private static Quaternion NormalizeQuaternion(Quaternion rotation)
