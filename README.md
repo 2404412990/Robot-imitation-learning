@@ -4,8 +4,6 @@
 
 `checkpoints`,`dataset`和`assets/body_models`可在[链接](https://pan.baidu.com/s/1fVf2eA1OzdRv70M4gm2wSA?pwd=8pnu) 下载
 
-https://borealisdata.ca/dataset.xhtml?persistentId=doi:10.5683/SP2/JRHDRN
-
 ## 运行
 
 示例命令：
