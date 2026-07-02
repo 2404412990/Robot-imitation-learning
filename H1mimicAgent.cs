@@ -155,6 +155,7 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
     private bool _isClone = false;
     private bool isRobotSelectedInScene = true;
     private bool holdSelectionNeutralPose;
+    private bool neutralPoseRestorePending = true;
     private Vector3 replayRootOffset = Vector3.zero;
     private int mirrorDiagnosticFrame;
     private int retargetCalibrationLogCounter;
@@ -162,6 +163,12 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
     private bool ShouldHoldNeutralPose()
     {
         return !replay && !useExternalReplayData && (holdSelectionNeutralPose || !train);
+    }
+
+    private void QueueNeutralPoseRestore()
+    {
+        holdSelectionNeutralPose = true;
+        neutralPoseRestorePending = true;
     }
 
     private void FreezeRoot()
@@ -176,6 +183,38 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
         art0.immovable = true;
     }
 
+    private void ApplyNeutralPoseNow()
+    {
+        if (art0 == null)
+        {
+            return;
+        }
+
+        art0.immovable = false;
+        art0.TeleportRoot(pos0, rot0);
+        art0.velocity = Vector3.zero;
+        art0.angularVelocity = Vector3.zero;
+        SafeSetJointPositions(P0);
+        SafeSetJointVelocities(W0);
+
+        for (int i = 0; i < 19; i++)
+        {
+            u[i] = 0f;
+            uff[i] = 0f;
+            utotal[i] = 0f;
+            if (jh[i] != null)
+            {
+                SetJointTargetDeg(jh[i], 0f);
+            }
+        }
+
+        currentFrame = 0;
+        tt = 0;
+        isEndEpisode = false;
+        art0.immovable = true;
+        neutralPoseRestorePending = false;
+    }
+
     // ── IMimicAgent surface ───────────────────────────────────────────────────
     public string RobotKey => string.IsNullOrWhiteSpace(robotKey) ? "unitree_h1" : robotKey.Trim();
     public GameObject AgentGameObject => this == null ? null : gameObject;
@@ -188,10 +227,15 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
             if (value)
             {
                 holdSelectionNeutralPose = false;
+                neutralPoseRestorePending = false;
             }
             if (!value)
             {
                 hasExternalReplayCsv = false;
+                if (!replay)
+                {
+                    QueueNeutralPoseRestore();
+                }
             }
         }
     }
@@ -204,6 +248,11 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
             if (value)
             {
                 holdSelectionNeutralPose = false;
+                neutralPoseRestorePending = false;
+            }
+            else if (!useExternalReplayData)
+            {
+                QueueNeutralPoseRestore();
             }
         }
     }
@@ -223,7 +272,7 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
         {
             if (!replay && !useExternalReplayData)
             {
-                holdSelectionNeutralPose = true;
+                QueueNeutralPoseRestore();
                 ResetToInitialState();
                 if (art0 != null)
                 {
@@ -236,10 +285,12 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
         }
 
         holdSelectionNeutralPose = false;
+        neutralPoseRestorePending = false;
         UseExternalReplayData = false;
         ReplayMode = false;
         hasExternalReplayCsv = false;
         realtimeRawRows.Clear();
+        neutralPoseRestorePending = true;
         if (art0 != null)
         {
             art0.velocity = Vector3.zero;
@@ -267,6 +318,7 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
         tt = 0;
         isEndEpisode = false;
         holdSelectionNeutralPose = false;
+        neutralPoseRestorePending = false;
         return true;
     }
 
@@ -302,7 +354,7 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
         realtimeFrameCursor = 0f;
         currentFrame = 0;
         isEndEpisode = false;
-        holdSelectionNeutralPose = true;
+        QueueNeutralPoseRestore();
     }
 
     /// <summary>
@@ -921,7 +973,7 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
         if (ShouldHoldNeutralPose())
         {
             ResetToInitialState();
-            FreezeRoot();
+            ApplyNeutralPoseNow();
             return;
         }
 
@@ -1137,6 +1189,11 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
 
         if (ShouldHoldNeutralPose())
         {
+            if (neutralPoseRestorePending)
+            {
+                ApplyNeutralPoseNow();
+            }
+
             FreezeRoot();
             return;
         }

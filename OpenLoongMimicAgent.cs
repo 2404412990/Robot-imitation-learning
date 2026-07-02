@@ -204,6 +204,8 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, I
     private Quaternion newRotation;
     private int appliedRowDebugCount;
     private bool isRobotSelectedInScene = true;
+    private bool holdNeutralPose = true;
+    // private bool neutralPoseRestorePending = true;
     private bool hasLoggedDirectJointStateError;
     private Vector3 replayRootOffset = Vector3.zero;
     private int retargetCalibrationLogCounter;
@@ -219,18 +221,80 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, I
             if (!value)
             {
                 replayDataMode = ReplayDataMode.DatasetReplay;
+                if (!replay)
+                {
+                    QueueNeutralPoseRestore();
+                }
             }
             else if (replayDataMode != ReplayDataMode.LiveRealtimeCsv)
             {
+                holdNeutralPose = false;
+                // neutralPoseRestorePending = false;
                 replayDataMode = ReplayDataMode.ExternalCsvReplay;
             }
         }
     }
-    public bool ReplayMode { get => replay; set => replay = value; }
+    public bool ReplayMode
+    {
+        get => replay;
+        set
+        {
+            replay = value;
+            if (value)
+            {
+                holdNeutralPose = false;
+                // neutralPoseRestorePending = false;
+            }
+            else if (!useExternalReplayData)
+            {
+                QueueNeutralPoseRestore();
+            }
+        }
+    }
     public int MotionId { get; set; }
     public void RequestEndEpisode() => EndEpisode();
     public int ExpectedCsvColumns => ExpectedCols;
     private bool IsLiveRealtimeCsv => useExternalReplayData && replayDataMode == ReplayDataMode.LiveRealtimeCsv;
+
+    private bool ShouldHoldNeutralPose()
+    {
+        return !replay && !useExternalReplayData && holdNeutralPose;
+    }
+
+    private void QueueNeutralPoseRestore()
+    {
+        holdNeutralPose = true;
+        // neutralPoseRestorePending = true;
+    }
+
+    private void ApplyNeutralPoseNow()
+    {
+        if (rootArticulation == null)
+        {
+            return;
+        }
+
+        rootArticulation.immovable = false;
+        rootArticulation.TeleportRoot(pos0, rot0);
+        rootArticulation.velocity = Vector3.zero;
+        rootArticulation.angularVelocity = Vector3.zero;
+        SafeSetJointPositions(new List<float>(restPositions));
+        SafeSetJointVelocities(new List<float>(restVelocities));
+
+        for (int i = 0; i < DofCols; i++)
+        {
+            u[i] = 0f;
+            uff[i] = 0f;
+            utotal[i] = 0f;
+            SetJointTargetDeg(jh[i], 0f);
+        }
+
+        currentFrame = frame0;
+        realtimeFrameCursor = 0f;
+        tt = 0;
+        rootArticulation.immovable = true;
+        // neutralPoseRestorePending = false;
+    }
 
     public void SetReplayRootOffset(Vector3 offset)
     {
@@ -381,6 +445,12 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, I
     {
         if (rootArticulation == null) return;
 
+        if (ShouldHoldNeutralPose())
+        {
+            ApplyNeutralPoseNow();
+            return;
+        }
+
         if (replay || useExternalReplayData)
         {
             rootArticulation.immovable = true;
@@ -467,6 +537,12 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, I
     {
         if (!isRobotSelectedInScene)
         {
+            return;
+        }
+
+        if (ShouldHoldNeutralPose())
+        {
+            ApplyNeutralPoseNow();
             return;
         }
 
@@ -580,6 +656,11 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, I
 
         currentFrame = frame0;
         tt = 0;
+
+        // Clear stale replay data so FixedUpdate does not play old CSV frames
+        // after the agent has been reset to neutral pose.
+        itpData = new List<float[]>();
+        refData = new List<float[]>();
     }
 
     private bool TryLoadCurrentMotionData(bool keepProgress)

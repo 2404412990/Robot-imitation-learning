@@ -1,4 +1,3 @@
-using System;
 using UnityEngine;
 using UnityEngine.UI;
 using Gewu.Imitation;
@@ -6,22 +5,19 @@ using Gewu.Imitation;
 public class Stop : MonoBehaviour
 {
     [Header("References")]
-    [Tooltip("The StartInput component that owns the bash process and CSV monitor. " +
+    [Tooltip("The StartInput component that owns the shell process and CSV monitor. " +
              "Auto-resolved via FindObjectOfType if left empty.")]
     [SerializeField] private StartInput startInput;
 
     [Tooltip("Optional explicit IMimicAgent to reset after the pipeline is killed. " +
              "When left empty, every registered robot is reset so whichever one was " +
-             "consuming the live stream falls back to its own dataset replay.")]
+             "consuming the live stream falls back to its idle gate.")]
     [SerializeField] private MonoBehaviour targetAgentBehaviour;
 
-    // ── internal state ────────────────────────────────────────────────────────
     private Button stopButton;
     private bool addedRuntimeListener;
 
-    // ── Unity lifecycle ───────────────────────────────────────────────────────
-
-    void Awake()
+    private void Awake()
     {
         stopButton = GetComponent<Button>();
         if (stopButton != null && !HasPersistentStopHandler(stopButton))
@@ -31,7 +27,7 @@ public class Stop : MonoBehaviour
         }
     }
 
-    void OnDestroy()
+    private void OnDestroy()
     {
         if (stopButton != null && addedRuntimeListener)
         {
@@ -39,34 +35,25 @@ public class Stop : MonoBehaviour
         }
     }
 
-    // ── public API ────────────────────────────────────────────────────────────
-
     public void OnStopButtonClicked()
     {
         ExecuteStop();
     }
 
-    // ── core stop logic ───────────────────────────────────────────────────────
-
     private void ExecuteStop()
     {
         EnsureReferences();
 
-        // 1. Kill bash process and CSV monitor.
         if (startInput != null)
         {
             startInput.StopStartPipeline();
-            Debug.Log("[Stop] Bash 进程和 CSV 监听已终止。");
+            Debug.Log("[Stop] StartInput pipeline stopped.");
         }
         else
         {
-            Debug.LogWarning("[Stop] 未找到 StartInput，无法终止 Bash 进程。");
+            Debug.LogWarning("[Stop] StartInput was not found; no external pipeline was stopped.");
         }
 
-        // 2. Reset agent(s) to local replay mode.
-        //    Clear the live-CSV flag so OnEpisodeBegin reloads motion data from
-        //    the dataset directory (the dropdown CSV files). Set replay=true
-        //    so the agent uses kinematic teleporting instead of PD-force tracking.
         int resetCount = 0;
         if (targetAgentBehaviour is IMimicAgent pinned && pinned.AgentGameObject != null)
         {
@@ -75,11 +62,13 @@ public class Stop : MonoBehaviour
         }
         else if (MimicAgentRegistry.Instance != null)
         {
-            // Reset every registered robot — the live stream targets exactly
-            // one of them, but we don't know which one without re-reading the
-            // dropdown, and resetting an already-idle robot is a no-op.
             foreach (IMimicAgent agent in MimicAgentRegistry.Instance.All)
             {
+                if (agent == null || agent.AgentGameObject == null)
+                {
+                    continue;
+                }
+
                 ResetAgent(agent);
                 resetCount++;
             }
@@ -87,31 +76,24 @@ public class Stop : MonoBehaviour
 
         if (resetCount > 0)
         {
-            Debug.Log($"[Stop] {resetCount} 个 Agent 已切换到 replay 模式（EndEpisode 已调用）。");
+            Debug.Log($"[Stop] Reset {resetCount} agent(s) to idle/neutral mode.");
         }
         else
         {
-            Debug.LogWarning("[Stop] 未找到任何已注册的 IMimicAgent，无法重置 Agent。");
+            Debug.LogWarning("[Stop] No registered IMimicAgent was found to reset.");
         }
-
-        Debug.Log("[Stop] 停止完成。");
     }
 
-    private void ResetAgent(IMimicAgent agent)
+    private static void ResetAgent(IMimicAgent agent)
     {
         agent.UseExternalReplayData = false;
-        if (string.Equals(agent.RobotKey, "x02lite", System.StringComparison.OrdinalIgnoreCase))
+        agent.ReplayMode = false;
+        agent.ResetToInitialState();
+        if (agent.AgentGameObject.activeInHierarchy)
         {
-            agent.ReplayMode = false;
-            agent.ResetToInitialState();
-            return;
+            agent.RequestEndEpisode();
         }
-
-        agent.ReplayMode = true;
-        agent.RequestEndEpisode();
     }
-
-    // ── helpers ───────────────────────────────────────────────────────────────
 
     private void EnsureReferences()
     {
@@ -120,17 +102,13 @@ public class Stop : MonoBehaviour
             startInput = FindObjectOfType<StartInput>();
             if (startInput == null)
             {
-                Debug.LogWarning("[Stop] 场景中未找到 StartInput 组件。" +
-                                 "\n请在 Inspector 中手动赋值 startInput 字段。");
+                Debug.LogWarning("[Stop] Could not find a StartInput component in the scene.");
             }
         }
 
-        // targetAgentBehaviour is optional. If left empty we fall back to
-        // resetting every registered IMimicAgent in ExecuteStop().
         if (targetAgentBehaviour != null && !(targetAgentBehaviour is IMimicAgent))
         {
-            Debug.LogWarning("[Stop] targetAgentBehaviour 不是 IMimicAgent 实现，已忽略。" +
-                             "\n请确认拖入的是 G1mimicAgent / H1mimicAgent 之类的脚本组件。");
+            Debug.LogWarning("[Stop] targetAgentBehaviour does not implement IMimicAgent and was ignored.");
             targetAgentBehaviour = null;
         }
     }

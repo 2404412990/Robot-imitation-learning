@@ -1380,7 +1380,12 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
         }
 
         Physics.gravity = Vector3.zero;
-        arts[0].immovable = true;
+
+        // Teleport the root back to the scene-initial pose so the robot does
+        // not stay at the last live/replay frame position (which can leave it
+        // sunk into the ground or rotated away from the spawn orientation).
+        arts[0].immovable = false;
+        arts[0].TeleportRoot(pos0, rot0);
         arts[0].velocity = Vector3.zero;
         arts[0].angularVelocity = Vector3.zero;
 
@@ -1402,6 +1407,8 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
 
         ZeroArticulationJointVelocities();
         ZeroArticulationBodyVelocities();
+
+        arts[0].immovable = true;
 
         if (directWriteCount == 0 && !hasLoggedDirectJointStateError)
         {

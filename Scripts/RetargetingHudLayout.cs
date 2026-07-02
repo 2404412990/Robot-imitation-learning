@@ -650,8 +650,7 @@ public sealed class RetargetingHudLayout : MonoBehaviour
 
         RectTransform viewport = CreatePanel("ParamsViewport", panel, new Color(0f, 0f, 0f, 0.08f));
         Stretch(viewport, 28f, 26f, 28f, 118f);
-        var mask = viewport.gameObject.AddComponent<Mask>();
-        mask.showMaskGraphic = false;
+        viewport.gameObject.AddComponent<RectMask2D>();
         var scroll = viewport.gameObject.AddComponent<ScrollRect>();
         scroll.horizontal = false;
         scroll.vertical = true;
@@ -865,15 +864,18 @@ public sealed class RetargetingHudLayout : MonoBehaviour
         input.text = ReadRuntimeParameterString(field);
         input.customCaretColor = true;
         input.caretColor = Color.white;
-        input.caretWidth = 3;
+        input.caretWidth = 4;
+        input.caretBlinkRate = 0.8f;
         input.selectionColor = new Color(0.35f, 0.72f, 1.0f, 0.45f);
+        input.resetOnDeActivation = false;
+        input.restoreOriginalTextOnEscape = false;
 
         RectTransform viewport = CreateRect("TextViewport", root);
         Stretch(viewport, 12f, 4f, 12f, 4f);
         viewport.gameObject.AddComponent<RectMask2D>();
 
-        TMP_Text text = CreateInputText("Text", viewport, input.text, new Color(0.94f, 0.98f, 1f, 1f));
-        TMP_Text placeholder = CreateInputText("Placeholder", viewport, "Value", new Color(0.74f, 0.82f, 0.90f, 0.55f));
+        TMP_Text text = CreateInputText("Text", viewport, input.text, new Color(0.94f, 0.98f, 1f, 1f), raycast: true);
+        TMP_Text placeholder = CreateInputText("Placeholder", viewport, "Value", new Color(0.74f, 0.82f, 0.90f, 0.55f), raycast: false);
         placeholder.enabled = string.IsNullOrEmpty(input.text);
 
         input.textViewport = viewport;
@@ -886,6 +888,8 @@ public sealed class RetargetingHudLayout : MonoBehaviour
             {
                 inputImage.color = focusColor;
             }
+
+            input.ActivateInputField();
         });
         input.onDeselect.AddListener(value =>
         {
@@ -906,6 +910,7 @@ public sealed class RetargetingHudLayout : MonoBehaviour
             TrySetFieldValue(field, value, live: true);
         });
         input.onEndEdit.AddListener(value => TrySetFieldValue(field, value, live: false));
+        input.ForceLabelUpdate();
         return input;
     }
 
@@ -943,7 +948,7 @@ public sealed class RetargetingHudLayout : MonoBehaviour
             : string.Empty;
     }
 
-    private TMP_Text CreateInputText(string name, RectTransform parent, string textValue, Color color)
+    private TMP_Text CreateInputText(string name, RectTransform parent, string textValue, Color color, bool raycast = false)
     {
         RectTransform rect = CreateRect(name, parent);
         Stretch(rect);
@@ -954,7 +959,7 @@ public sealed class RetargetingHudLayout : MonoBehaviour
         text.alignment = TextAlignmentOptions.MidlineLeft;
         text.color = color;
         text.enableWordWrapping = false;
-        text.raycastTarget = false;
+        text.raycastTarget = raycast;
         ownedGraphics.Add(text);
         return text;
     }
@@ -1248,7 +1253,7 @@ public sealed class RetargetingHudLayout : MonoBehaviour
             ParamControl control = paramControls[i];
             if (control.Input != null)
             {
-                control.Input.interactable = !locked;
+                control.Input.interactable = true;
             }
 
             if (control.Toggle != null)
