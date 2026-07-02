@@ -98,4 +98,15 @@ namespace Gewu.Imitation
     {
         void SetRobotSelectedInScene(bool isSelected);
     }
+
+    /// <summary>
+    /// Optional display-only offset used when multiple robots replay the same
+    /// retargeted motion side by side. Implementations must add this offset
+    /// only to the final Unity root position; joint qpos values and CSV data
+    /// remain unchanged.
+    /// </summary>
+    public interface IReplayRootOffsetMimicAgent
+    {
+        void SetReplayRootOffset(Vector3 offset);
+    }
 }

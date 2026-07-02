@@ -11,7 +11,7 @@ using System;
 using System.Globalization;
 using Gewu.Imitation;
 
-public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelectableMimicAgent
+public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelectableMimicAgent, IReplayRootOffsetMimicAgent
 {
     private const int DofCount = 18;
     private const int CsvColumnCount = 7 + DofCount;
@@ -112,14 +112,44 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
         45f, 45f, 115f, 5f, 60f,
     };
 
-    // CSV order stays MuJoCo/X02LiteV21. Unity's imported left elbow reduced-space
-    // axis bends opposite to MuJoCo, so it uses a negative drive range below.
+    // CSV order stays MuJoCo/X02LiteV21. This table only converts MuJoCo qpos
+    // axis direction into Unity ArticulationBody reduced-axis direction.
     private static readonly float[] DefaultUnityJointSigns =
     {
         1f, 1f, 1f, -1f,
-        1f, 1f, 1f, 1f,
+        -1f, 1f, -1f, 1f,
         1f, 1f, 1f, 1f, 1f,
         1f, 1f, 1f, 1f, 1f,
+    };
+
+    private static readonly float[] DefaultUnityJointOffsetsRad =
+    {
+        0f, 0f, 0f, 0f,
+        0f, 0f, 0f, 0f,
+        0f, -0.06f, 0f, 0f, 0f,
+        0f, 0.06f, 0f, 0f, 0f,
+    };
+
+    private static readonly UnityRetargetCalibrationEntry[] DefaultUnityCalibration =
+    {
+        new UnityRetargetCalibrationEntry(0,  "L_shoulder_pitch",  1f, 0f),
+        new UnityRetargetCalibrationEntry(1,  "L_shoulder_roll",   1f, 0f),
+        new UnityRetargetCalibrationEntry(2,  "L_shoulder_yaw",    1f, 0f),
+        new UnityRetargetCalibrationEntry(3,  "L_elbow",          -1f, 0f),
+        new UnityRetargetCalibrationEntry(4,  "R_shoulder_pitch", -1f, 0f),
+        new UnityRetargetCalibrationEntry(5,  "R_shoulder_roll",   1f, 0f),
+        new UnityRetargetCalibrationEntry(6,  "R_shoulder_yaw",   -1f, 0f),
+        new UnityRetargetCalibrationEntry(7,  "R_elbow",           1f, 0f),
+        new UnityRetargetCalibrationEntry(8,  "L_hip_yaw",         1f, 0f),
+        new UnityRetargetCalibrationEntry(9,  "L_hip_roll",        1f, -0.06f),
+        new UnityRetargetCalibrationEntry(10, "L_hip_pitch",       1f, 0f),
+        new UnityRetargetCalibrationEntry(11, "L_knee_pitch",      1f, 0f),
+        new UnityRetargetCalibrationEntry(12, "L_ankle_pitch",     1f, 0f),
+        new UnityRetargetCalibrationEntry(13, "R_hip_yaw",         1f, 0f),
+        new UnityRetargetCalibrationEntry(14, "R_hip_roll",        1f, 0.06f),
+        new UnityRetargetCalibrationEntry(15, "R_hip_pitch",       1f, 0f),
+        new UnityRetargetCalibrationEntry(16, "R_knee_pitch",      1f, 0f),
+        new UnityRetargetCalibrationEntry(17, "R_ankle_pitch",     1f, 0f),
     };
 
     // X02LiteV21 CSV/MuJoCo order:
@@ -142,6 +172,9 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
     [SerializeField] private bool showGroundedNeutralPoseWhenSelected = true;
     [SerializeField] private bool applyUnityJointSignCorrection = true;
     [SerializeField] private bool logUnityJointSignsOnStart = true;
+    [SerializeField] private bool logRetargetCalibrationDiagnostics;
+    [SerializeField] private int retargetCalibrationLogInterval = 120;
+    private int retargetCalibrationLogCounter;
 
     private void DumpJointMapping()
     {
@@ -155,6 +188,7 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
         sb.AppendLine("Expected X02LiteV21 order (18 DOF):");
         sb.AppendLine("  0..3 left arm, 4..7 right arm, 8..12 left leg, 13..17 right leg");
         sb.AppendLine("Missing joints are skipped; they are never mapped by traversal fallback.");
+        sb.AppendLine($"Live mirror direct joint write is forced in replay/live; legacy inspector flag writeLiveJointPositionsDirectly={writeLiveJointPositionsDirectly}.");
         if (logUnityJointSignsOnStart)
         {
             sb.AppendLine("Unity joint signs:");
@@ -164,7 +198,8 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
                 string limits = jh[i] != null
                     ? $"limits=[{drive.lowerLimit:F1},{drive.upperLimit:F1}]"
                     : "limits=<missing>";
-                sb.AppendLine($"  CSV[{i,2}] {CsvJointDisplayNames[i],-18} sign={GetUnityJointSign(i),4:F1} {limits}");
+                UnityRetargetCalibrationEntry calibration = GetUnityCalibration(i);
+                sb.AppendLine($"  CSV[{i,2}] {CsvJointDisplayNames[i],-18} sign={calibration.sign,4:F1} offset={calibration.offsetRad,6:F3} {limits}");
             }
         }
         UnityEngine.Debug.Log(sb.ToString());
@@ -197,6 +232,7 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
     private bool holdSelectionNeutralPose;
     private ReplayDataMode replayDataMode = ReplayDataMode.DatasetReplay;
     private bool hasLoggedDirectJointStateError;
+    private bool hasLoggedDriveClampWarning;
     private bool hasLoggedEmptyReplayData;
     private float[] neutralPoseFrame;
 
@@ -240,10 +276,11 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
 
     private bool _isClone = false;
     private bool isRobotSelectedInScene = true;
+    private Vector3 replayRootOffset = Vector3.zero;
 
     // IMimicAgent surface
     public string RobotKey => string.IsNullOrWhiteSpace(robotKey) ? "x02lite" : robotKey.Trim();
-    public GameObject AgentGameObject => gameObject;
+    public GameObject AgentGameObject => this == null ? null : gameObject;
     public bool UseExternalReplayData
     {
         get => useExternalReplayData;
@@ -266,7 +303,7 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
     {
         if (ReplayMode || UseExternalReplayData)
         {
-            TryApplyReplayStartFrame(logIfEmpty: true);
+            TryApplyReplayStartFrame(logIfEmpty: ShouldLogEmptyReplayDataWarning());
             return;
         }
 
@@ -274,6 +311,11 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
     }
     public int ExpectedCsvColumns => CsvColumnCount;
     private bool IsLiveRealtimeCsv => useExternalReplayData && replayDataMode == ReplayDataMode.LiveRealtimeCsv;
+
+    public void SetReplayRootOffset(Vector3 offset)
+    {
+        replayRootOffset = offset;
+    }
 
     public void SetRobotSelectedInScene(bool isSelected)
     {
@@ -457,7 +499,11 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
             UnityEngine.Debug.LogError("[X02Lite] Incomplete joint map. Replay/live retargeting will stay disabled until every expected arm/leg joint is authored as a RevoluteJoint.");
         }
 
-        MimicAgentRegistry.Instance.Register(this);
+        MimicAgentRegistry registry = MimicAgentRegistry.Instance;
+        if (registry != null)
+        {
+            registry.Register(this);
+        }
     }
 
     private ArticulationBody ResolveRootArticulation()
@@ -833,13 +879,23 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
             return;
         }
 
-        if (holdSelectionNeutralPose && !ReplayMode && !useExternalReplayData)
+        if (!ReplayMode && !useExternalReplayData)
         {
-            ApplyGroundedNeutralPose();
+            if (holdSelectionNeutralPose || showGroundedNeutralPoseWhenSelected)
+            {
+                ApplyGroundedNeutralPose();
+            }
             return;
         }
 
-        TryApplyReplayStartFrame(logIfEmpty: true);
+        TryApplyReplayStartFrame(logIfEmpty: ShouldLogEmptyReplayDataWarning());
+    }
+
+    private bool ShouldLogEmptyReplayDataWarning()
+    {
+        // Live CSV warmup commonly resets the Agent before rows arrive. That is a
+        // normal waiting state, not a user-visible replay error.
+        return replay && !useExternalReplayData && replayDataMode == ReplayDataMode.DatasetReplay;
     }
 
     private bool TryApplyReplayStartFrame(bool logIfEmpty)
@@ -877,9 +933,9 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
         List<float[]> episodeData = useExternalReplayData ? itpData : refData;
         if (episodeData == null || episodeData.Count == 0)
         {
-            if (logIfEmpty && !hasLoggedEmptyReplayData)
+            if (logIfEmpty && ShouldLogEmptyReplayDataWarning() && !hasLoggedEmptyReplayData)
             {
-                UnityEngine.Debug.LogWarning("[X02Lite] replay data is empty, skip replay start.");
+                UnityEngine.Debug.Log("[X02Lite] replay data is empty, skip replay start.");
                 hasLoggedEmptyReplayData = true;
             }
             return false;
@@ -893,15 +949,10 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
         Array.Copy(currentData, 3, currentRot, 0, 4);
         Array.Copy(currentData, 7, currentDof, 0, DofCount);
 
-        ApplyCurrentDofToJoints(directWrite: replay && (!IsLiveRealtimeCsv || writeLiveJointPositionsDirectly));
+        ApplyCurrentDofToJoints(directWrite: ReplayMode || useExternalReplayData);
 
         Vector3 newPosition = BuildUnityRootPosition(currentPos);
-        Quaternion newRotation = new Quaternion(
-            -currentRot[1],
-             currentRot[2],
-             currentRot[0],
-            -currentRot[3]
-        );
+        Quaternion newRotation = UnityQposMapper.MapRootRotationFromCsvXyzw(currentRot);
         art0.TeleportRoot(newPosition, newRotation);
         art0.velocity        = Vector3.zero;
         art0.angularVelocity = Vector3.zero;
@@ -972,6 +1023,11 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
             return;
         }
 
+        if (ReplayMode || useExternalReplayData)
+        {
+            return;
+        }
+
         var continuousActions = actionBuffers.ContinuousActions;
         var kk = 0.9f;
         float kb = 50;
@@ -1027,20 +1083,19 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
             Array.Copy(currentData, 0, currentPos, 0, 3);
             Array.Copy(currentData, 3, currentRot, 0, 4);
             Array.Copy(currentData, 7, currentDof, 0, DofCount);
-            ApplyCurrentDofToJoints(directWrite: replay && (!IsLiveRealtimeCsv || writeLiveJointPositionsDirectly));
+            bool mirrorMode = ReplayMode || useExternalReplayData;
+            ApplyCurrentDofToJoints(directWrite: mirrorMode);
 
             newPosition = BuildUnityRootPosition(currentPos);
-            newRotation = new Quaternion(
-                -currentRot[1],
-                 currentRot[2],
-                 currentRot[0],
-                -currentRot[3]
-            );
-            if (replay)
+            newRotation = UnityQposMapper.MapRootRotationFromCsvXyzw(currentRot);
+            if (mirrorMode)
             {
                 Physics.gravity = Vector3.zero;
                 art0.immovable = true;
                 art0.TeleportRoot(newPosition, newRotation);
+                art0.velocity = Vector3.zero;
+                art0.angularVelocity = Vector3.zero;
+                ZeroAllArticulationVelocities();
             }
             else
             {
@@ -1065,6 +1120,12 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
         }
 
         tt++;
+        if (ReplayMode || useExternalReplayData)
+        {
+            AdvancePlaybackFrame();
+            return;
+        }
+
         if (train && hasMotionData && tt > 3 && !replay)
         {
             art0.immovable = false;
@@ -1090,6 +1151,11 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
             AddReward(1f + (rot_reward + pos_reward) * 1f + dof_reward);
         }
 
+        AdvancePlaybackFrame();
+    }
+
+    private void AdvancePlaybackFrame()
+    {
         if (itpData != null && currentFrame < itpData.Count - 1)
         {
             if (IsLiveRealtimeCsv)
@@ -1109,11 +1175,11 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
         }
     }
 
-    void SetJointTargetDeg(ArticulationBody joint, float x)
+    void SetJointTargetDeg(ArticulationBody joint, float x, bool clampToDriveLimits = true)
     {
         if (joint == null) return;
         var drive = joint.xDrive;
-        if (clampTargetsToDriveLimits)
+        if (clampToDriveLimits && clampTargetsToDriveLimits)
         {
             x = Mathf.Clamp(x, drive.lowerLimit, drive.upperLimit);
         }
@@ -1130,42 +1196,120 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
         for (int i = 0; i < DofCount; i++)
         {
             float targetRad = ToUnityJointRadians(i, currentDof[i]);
+            if (!directWrite)
+            {
+                LogDriveClampIfNeeded(i, jh[i], targetRad);
+            }
             float targetDeg = targetRad * Mathf.Rad2Deg;
             uff[i] = targetDeg;
-            SetJointTargetDeg(jh[i], targetDeg);
+            SetJointTargetDeg(jh[i], targetDeg, clampToDriveLimits: !directWrite);
 
             if (directWrite && writeReplayJointPositionsDirectly)
             {
-                if (SetJointPositionRad(jh[i], targetRad))
+                if (SetJointPositionRad(jh[i], targetRad, clampToDriveLimits: false))
                 {
                     directWriteCount++;
                 }
             }
         }
 
-        if (directWrite && writeReplayJointPositionsDirectly && directWriteCount == 0 && !hasLoggedDirectJointStateError)
+        if (directWrite && writeReplayJointPositionsDirectly && directWriteCount != DofCount && !hasLoggedDirectJointStateError)
         {
-            UnityEngine.Debug.LogError("[X02Lite] Direct replay could not write any joint positions; all mapped joints reported empty reduced-space state.");
+            UnityEngine.Debug.LogError(
+                $"[X02Lite] Direct qpos mirror wrote {directWriteCount}/{DofCount} joints. " +
+                "Check explicit CSV joint map and ArticulationBody reduced-space state; partial writes make limbs look frozen.");
             hasLoggedDirectJointStateError = true;
         }
     }
 
     private float ToUnityJointRadians(int csvIndex, float csvRadians)
     {
-        return csvRadians * GetUnityJointSign(csvIndex);
+        UnityRetargetCalibrationEntry calibration = GetUnityCalibration(csvIndex);
+        float targetRad = applyUnityJointSignCorrection
+            ? calibration.Apply(csvRadians)
+            : csvRadians + calibration.offsetRad;
+        LogRetargetCalibrationIfNeeded(csvIndex, csvRadians, calibration, targetRad);
+        return targetRad;
     }
 
-    private float GetUnityJointSign(int csvIndex)
+    private UnityRetargetCalibrationEntry GetUnityCalibration(int csvIndex)
     {
-        if (!applyUnityJointSignCorrection || csvIndex < 0 || csvIndex >= DefaultUnityJointSigns.Length)
+        string jointName = csvIndex >= 0 && csvIndex < CsvJointDisplayNames.Length
+            ? CsvJointDisplayNames[csvIndex]
+            : string.Empty;
+        float defaultSign = csvIndex >= 0 && csvIndex < DefaultUnityJointSigns.Length
+            ? DefaultUnityJointSigns[csvIndex]
+            : 1f;
+        float defaultOffset = csvIndex >= 0 && csvIndex < DefaultUnityJointOffsetsRad.Length
+            ? DefaultUnityJointOffsetsRad[csvIndex]
+            : 0f;
+        return UnityRetargetCalibration.Resolve(csvIndex, jointName, DefaultUnityCalibration, defaultSign, defaultOffset, clampTargetsToDriveLimits);
+    }
+
+    private void LogRetargetCalibrationIfNeeded(int csvIndex, float csvRad, UnityRetargetCalibrationEntry calibration, float targetRad)
+    {
+        if (!logRetargetCalibrationDiagnostics)
         {
-            return 1f;
+            return;
         }
 
-        return DefaultUnityJointSigns[csvIndex] < 0f ? -1f : 1f;
+        int interval = Mathf.Max(1, retargetCalibrationLogInterval);
+        retargetCalibrationLogCounter++;
+        if (retargetCalibrationLogCounter % interval != 0)
+        {
+            return;
+        }
+
+        ArticulationBody joint = csvIndex >= 0 && csvIndex < jh.Length ? jh[csvIndex] : null;
+        float actualRad = 0f;
+        if (joint != null && joint.jointPosition.dofCount > 0)
+        {
+            actualRad = joint.jointPosition[0];
+        }
+
+        UnityEngine.Debug.Log(
+            $"[X02LiteCalib] frame={currentFrame} csvIndex={csvIndex} joint={calibration.jointName} " +
+            $"csvRad={csvRad:F4} sign={calibration.sign:F1} offsetRad={calibration.offsetRad:F4} " +
+            $"targetRad={targetRad:F4} actualRad={actualRad:F4} errorRad={(actualRad - targetRad):F4}");
     }
 
-    private bool SetJointPositionRad(ArticulationBody joint, float radians)
+    private void ZeroAllArticulationVelocities()
+    {
+        if (arts == null)
+        {
+            return;
+        }
+
+        for (int i = 0; i < arts.Length; i++)
+        {
+            ArticulationBody art = arts[i];
+            if (art == null)
+            {
+                continue;
+            }
+
+            art.velocity = Vector3.zero;
+            art.angularVelocity = Vector3.zero;
+            try
+            {
+                ArticulationReducedSpace jointVelocity = art.jointVelocity;
+                if (jointVelocity.dofCount > 0)
+                {
+                    for (int dof = 0; dof < jointVelocity.dofCount; dof++)
+                    {
+                        jointVelocity[dof] = 0f;
+                    }
+                    art.jointVelocity = jointVelocity;
+                }
+            }
+            catch (System.Exception)
+            {
+                // Reduced-space caches can be empty while Unity rebuilds articulation state.
+            }
+        }
+    }
+
+    private bool SetJointPositionRad(ArticulationBody joint, float radians, bool clampToDriveLimits = true)
     {
         if (joint == null || joint.jointType != ArticulationJointType.RevoluteJoint)
         {
@@ -1180,7 +1324,7 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
                 return false;
             }
 
-            jointPosition[0] = ClampJointRadiansToDrive(joint, radians);
+            jointPosition[0] = clampToDriveLimits ? ClampJointRadiansToDrive(joint, radians) : radians;
             joint.jointPosition = jointPosition;
 
             if (zeroReplayJointVelocitiesOnDirectWrite)
@@ -1218,6 +1362,35 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
         return degrees * Mathf.Deg2Rad;
     }
 
+    private void LogDriveClampIfNeeded(int csvIndex, ArticulationBody joint, float targetRad)
+    {
+        if (hasLoggedDriveClampWarning || joint == null || !clampTargetsToDriveLimits)
+        {
+            return;
+        }
+
+        ArticulationDrive drive = joint.xDrive;
+        if (drive.lowerLimit >= drive.upperLimit)
+        {
+            return;
+        }
+
+        float targetDeg = targetRad * Mathf.Rad2Deg;
+        if (targetDeg >= drive.lowerLimit - 0.5f && targetDeg <= drive.upperLimit + 0.5f)
+        {
+            return;
+        }
+
+        string jointName = csvIndex >= 0 && csvIndex < CsvJointDisplayNames.Length
+            ? CsvJointDisplayNames[csvIndex]
+            : joint.name;
+        UnityEngine.Debug.LogWarning(
+            $"[X02LiteCalib] target for CSV[{csvIndex}] {jointName} is outside Unity drive limits: " +
+            $"target={targetDeg:F1}deg limits=[{drive.lowerLimit:F1},{drive.upperLimit:F1}]. " +
+            "If this joint looks frozen, adjust only this joint's sign/offset calibration.");
+        hasLoggedDriveClampWarning = true;
+    }
+
     private Vector3 BuildUnityRootPosition(float[] rootPos)
     {
         float y = rootPos[2];
@@ -1229,7 +1402,7 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
         Vector3 position = new Vector3(-rootPos[1], y, rootPos[0]);
         position.x += pos0.x;
         position.z += pos0.z;
-        return position;
+        return position + replayRootOffset;
     }
 
     private void NormalizeInitialRootPose()

@@ -34,7 +34,9 @@ public class StreamReceiver : MonoBehaviour
     [Header("Aspect")]
     [SerializeField] private bool preserveIncomingAspect = true;
     [SerializeField] private bool resizeRawImageRect = true;
-    [SerializeField] private float maxTextureApplyFps = 30f;
+    [SerializeField] private float maxTextureApplyFps = 12f;
+    [SerializeField] private int maxTextureDecodesPerFrame = 1;
+    [SerializeField] private bool decodeOnlyWhenTargetVisible = true;
 
     [Header("调试")]
     [SerializeField] private bool logFrameReceive;
@@ -59,6 +61,8 @@ public class StreamReceiver : MonoBehaviour
     private long _gmrReceivedFrames;
     private long _whamShownFrames;
     private long _gmrShownFrames;
+    private long _whamDroppedFrames;
+    private long _gmrDroppedFrames;
     private long _lastWhamReceivedSample;
     private long _lastGmrReceivedSample;
     private long _lastWhamShownSample;
@@ -68,8 +72,11 @@ public class StreamReceiver : MonoBehaviour
     private float _gmrReceiveFps;
     private float _whamShownFps;
     private float _gmrShownFps;
+    private float _lastWhamDecodeMs;
+    private float _lastGmrDecodeMs;
     private float _lastWhamFrameTime = -1f;
     private float _lastGmrFrameTime = -1f;
+    private bool _preferWhamNext = true;
     private readonly Dictionary<RawImage, Vector2> _initialImageSizes = new Dictionary<RawImage, Vector2>();
     private readonly ConcurrentQueue<QueuedStreamLog> _logQueue = new ConcurrentQueue<QueuedStreamLog>();
 
@@ -209,9 +216,16 @@ public class StreamReceiver : MonoBehaviour
         }
         string client = hasClient ? "client: connected" : "client: waiting";
         string last = lastTime >= 0f ? $"{Time.unscaledTime - lastTime:F1}s ago" : "never";
+        long dropped;
+        float decodeMs;
+        lock (_lock)
+        {
+            dropped = streamId == 0 ? _whamDroppedFrames : _gmrDroppedFrames;
+            decodeMs = streamId == 0 ? _lastWhamDecodeMs : _lastGmrDecodeMs;
+        }
         string tex = texture != null ? $"{texture.width}x{texture.height}" : "none";
         string rect = target != null ? $"{Mathf.RoundToInt(target.rectTransform.rect.width)}x{Mathf.RoundToInt(target.rectTransform.rect.height)}" : "missing";
-        return $"{label} | {bindAddress}:{port} | {(IsListening ? "listening" : "closed")} | {client} | rx(TCP) {received} @ {receiveFps:F1} fps | shown(UI) {shown} @ {shownFps:F1} fps | last {last} | tex {tex} | target {rect}";
+        return $"{label} | {bindAddress}:{port} | {(IsListening ? "listening" : "closed")} | {client} | rx(TCP) {received} @ {receiveFps:F1} fps | shown(UI) {shown} @ {shownFps:F1} fps | drop {dropped} | decode {decodeMs:F1}ms | last {last} | tex {tex} | target {rect}";
     }
 
     // ── Unity 生命周期 ────────────────────────────────────────────────────
@@ -237,22 +251,39 @@ public class StreamReceiver : MonoBehaviour
         byte[] gmrToApply = null;
         float now = Time.unscaledTime;
         float interval = maxTextureApplyFps > 0.0f ? 1.0f / maxTextureApplyFps : 0.0f;
+        int budget = Mathf.Max(1, maxTextureDecodesPerFrame);
+        bool whamVisible = IsTargetVisibleForDecode(whamRawImage);
+        bool gmrVisible = IsTargetVisibleForDecode(gmrRawImage);
 
         lock (_lock)
         {
-            if (_whamDirty && _pendingWham != null && now >= _nextWhamApplyTime)
+            bool whamReady = _whamDirty && _pendingWham != null && whamVisible && now >= _nextWhamApplyTime;
+            bool gmrReady = _gmrDirty && _pendingGmr != null && gmrVisible && now >= _nextGmrApplyTime;
+            if (budget > 0 && whamReady && (!gmrReady || _preferWhamNext))
             {
                 whamToApply = _pendingWham;
                 _pendingWham = null;
                 _whamDirty = false;
                 _nextWhamApplyTime = now + interval;
+                _preferWhamNext = false;
+                budget--;
             }
-            if (_gmrDirty && _pendingGmr != null && now >= _nextGmrApplyTime)
+            if (budget > 0 && gmrReady)
             {
                 gmrToApply = _pendingGmr;
                 _pendingGmr = null;
                 _gmrDirty = false;
                 _nextGmrApplyTime = now + interval;
+                _preferWhamNext = true;
+                budget--;
+            }
+            if (budget > 0 && whamToApply == null && whamReady)
+            {
+                whamToApply = _pendingWham;
+                _pendingWham = null;
+                _whamDirty = false;
+                _nextWhamApplyTime = now + interval;
+                _preferWhamNext = false;
             }
         }
 
@@ -413,8 +444,20 @@ public class StreamReceiver : MonoBehaviour
 
                 lock (_lock)
                 {
-                    if (streamId == 0) { _pendingWham = jpg; _whamDirty = true; _whamReceivedFrames++; }
-                    else if (streamId == 1) { _pendingGmr = jpg; _gmrDirty = true; _gmrReceivedFrames++; }
+                    if (streamId == 0)
+                    {
+                        if (_whamDirty && _pendingWham != null) _whamDroppedFrames++;
+                        _pendingWham = jpg;
+                        _whamDirty = true;
+                        _whamReceivedFrames++;
+                    }
+                    else if (streamId == 1)
+                    {
+                        if (_gmrDirty && _pendingGmr != null) _gmrDroppedFrames++;
+                        _pendingGmr = jpg;
+                        _gmrDirty = true;
+                        _gmrReceivedFrames++;
+                    }
                 }
 
                 if (logFrameReceive)
@@ -433,7 +476,7 @@ public class StreamReceiver : MonoBehaviour
         lock (_lock) _activeClients.Remove(client);
         try { stream?.Close(); } catch { }
         try { client.Close(); } catch { }
-        EnqueueLog("[StreamRecv] client disconnected");
+        EnqueueLog("[StreamRecv] client disconnected; listener stays open for reconnect");
     }
 
     // ── 辅助 ──────────────────────────────────────────────────────────────
@@ -456,8 +499,10 @@ public class StreamReceiver : MonoBehaviour
         if (tex == null)
             tex = new Texture2D(2, 2, TextureFormat.RGB24, false);
 
+        float start = Time.realtimeSinceStartup;
         if (tex.LoadImage(jpg))
         {
+            float decodeMs = (Time.realtimeSinceStartup - start) * 1000f;
             image.texture = tex;
             image.color = Color.white;
             FitRawImageToTexture(image, tex.width, tex.height);
@@ -465,13 +510,42 @@ public class StreamReceiver : MonoBehaviour
             {
                 _whamShownFrames++;
                 _lastWhamFrameTime = Time.unscaledTime;
+                lock (_lock) _lastWhamDecodeMs = decodeMs;
             }
             else if (image == gmrRawImage)
             {
                 _gmrShownFrames++;
                 _lastGmrFrameTime = Time.unscaledTime;
+                lock (_lock) _lastGmrDecodeMs = decodeMs;
             }
         }
+    }
+
+    private bool IsTargetVisibleForDecode(RawImage image)
+    {
+        if (!decodeOnlyWhenTargetVisible)
+        {
+            return image != null;
+        }
+
+        if (image == null || !image.enabled || !image.gameObject.activeInHierarchy)
+        {
+            return false;
+        }
+
+        Transform current = image.transform;
+        while (current != null)
+        {
+            CanvasGroup group = current.GetComponent<CanvasGroup>();
+            if (group != null && group.alpha <= 0.02f)
+            {
+                return false;
+            }
+
+            current = current.parent;
+        }
+
+        return true;
     }
 
     private void ApplyExistingTextureOrPlaceholder(Texture2D texture, RawImage image)
@@ -504,6 +578,8 @@ public class StreamReceiver : MonoBehaviour
                 _whamDirty = false;
                 _whamReceivedFrames = 0;
                 _whamShownFrames = 0;
+                _whamDroppedFrames = 0;
+                _lastWhamDecodeMs = 0f;
                 _lastWhamFrameTime = -1f;
             }
             else
@@ -512,6 +588,8 @@ public class StreamReceiver : MonoBehaviour
                 _gmrDirty = false;
                 _gmrReceivedFrames = 0;
                 _gmrShownFrames = 0;
+                _gmrDroppedFrames = 0;
+                _lastGmrDecodeMs = 0f;
                 _lastGmrFrameTime = -1f;
             }
         }
@@ -536,7 +614,7 @@ public class StreamReceiver : MonoBehaviour
 
     private void FlushLogQueue()
     {
-        for (int i = 0; i < 50 && _logQueue.TryDequeue(out QueuedStreamLog item); i++)
+        for (int i = 0; i < 6 && _logQueue.TryDequeue(out QueuedStreamLog item); i++)
         {
             switch (item.Type)
             {

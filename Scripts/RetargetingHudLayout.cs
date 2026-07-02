@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.IO;
 using System.Reflection;
 using TMPro;
 using UnityEngine;
@@ -36,6 +37,7 @@ public sealed class RetargetingHudLayout : MonoBehaviour
     private readonly List<Graphic> ownedGraphics = new List<Graphic>();
     private readonly List<Button> lockableButtons = new List<Button>();
     private readonly List<TMP_Dropdown> lockableDropdowns = new List<TMP_Dropdown>();
+    private readonly List<Toggle> lockableToggles = new List<Toggle>();
     private readonly List<ParamControl> paramControls = new List<ParamControl>();
     private readonly List<RectTransform> paramStaticRows = new List<RectTransform>();
     private readonly List<ParamGroup> paramGroups = new List<ParamGroup>();
@@ -58,6 +60,7 @@ public sealed class RetargetingHudLayout : MonoBehaviour
     private RawImage gmrVideoSurface;
     private RectTransform whamVideoViewport;
     private RectTransform gmrVideoViewport;
+    private TMP_Text cameraStatusText;
     private StreamReceiver streamReceiver;
     private StartInput startInput;
     private bool built;
@@ -78,6 +81,21 @@ public sealed class RetargetingHudLayout : MonoBehaviour
         public readonly List<RectTransform> Rows = new List<RectTransform>();
         public bool Expanded = true;
     }
+
+    private sealed class RobotHudEntry
+    {
+        public string Label;
+        public string Key;
+        public bool SelectedByDefault;
+    }
+
+    private static readonly RobotHudEntry[] RobotHudEntries =
+    {
+        new RobotHudEntry { Label = "G1", Key = "unitree_g1", SelectedByDefault = true },
+        new RobotHudEntry { Label = "H1", Key = "unitree_h1" },
+        new RobotHudEntry { Label = "X02Lite", Key = "x02lite" },
+        new RobotHudEntry { Label = "OpenLoong", Key = "openloong" },
+    };
 
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
     private static void Bootstrap()
@@ -107,6 +125,7 @@ public sealed class RetargetingHudLayout : MonoBehaviour
 
         Canvas sceneCanvas = FindBestCanvasStatic();
         var host = new GameObject(HudHostName, typeof(RectTransform));
+        host.hideFlags = HideFlags.DontSave;
         if (sceneCanvas != null)
         {
             host.transform.SetParent(sceneCanvas.transform, false);
@@ -151,8 +170,13 @@ public sealed class RetargetingHudLayout : MonoBehaviour
         if (host == null)
         {
             host = new GameObject(HudHostName, typeof(RectTransform));
+            host.hideFlags = HideFlags.DontSave;
             host.transform.SetParent(sceneCanvas.transform, false);
             UnityEditor.Undo.RegisterCreatedObjectUndo(host, "Create retargeting HUD layout host");
+        }
+        else
+        {
+            host.hideFlags = HideFlags.DontSave;
         }
 
         if (host.GetComponent<RetargetingHudLayout>() == null)
@@ -193,6 +217,7 @@ public sealed class RetargetingHudLayout : MonoBehaviour
         SyncRealtimeUiState();
         UpdateProgressPanel();
         UpdateStreamReceiverStatus();
+        UpdateCameraStatusText();
     }
 
     private void Build()
@@ -220,6 +245,7 @@ public sealed class RetargetingHudLayout : MonoBehaviour
         canvas.sortingOrder = 500;
         EnsureCanvasScaler(canvas.gameObject);
         EnsureEventSystem();
+        DestroyLeakedGeneratedHudChildren(canvas.transform);
 
         var existingRoot = GameObject.Find(HudRootName);
         if (existingRoot != null)
@@ -231,11 +257,13 @@ public sealed class RetargetingHudLayout : MonoBehaviour
         ownedGraphics.Clear();
         lockableButtons.Clear();
         lockableDropdowns.Clear();
+        lockableToggles.Clear();
         paramControls.Clear();
         paramStaticRows.Clear();
         paramGroups.Clear();
 
         hudRoot = CreateRect(HudRootName, canvas.transform);
+        hudRoot.gameObject.hideFlags = HideFlags.DontSave;
         Stretch(hudRoot);
 
         var movedRoots = new HashSet<Transform>();
@@ -249,29 +277,236 @@ public sealed class RetargetingHudLayout : MonoBehaviour
     private void BuildControlDock(HashSet<Transform> movedRoots)
     {
         RectTransform controlDock = CreatePanel("ControlDock", hudRoot, PanelBlue, blur: true);
-        AnchorTopLeft(controlDock, new Vector2(24f, -18f), new Vector2(420f, 760f));
+        AnchorTopLeft(controlDock, new Vector2(24f, -18f), new Vector2(420f, 800f));
         controlDock.gameObject.AddComponent<HudDragHandle>().Initialize(controlDock, hudRoot);
 
-        CreateProxyButton("HomeHudButton", new[] { "Home", "HomeButton" }, controlDock, new Vector2(32f, -24f), new Vector2(356f, 72f), "Home", HomeColor, false, movedRoots, OpenHomeScene);
+        CreateHudCommandButton("HomeHudButton", controlDock, new Vector2(32f, -24f), new Vector2(356f, 72f), "Home", HomeColor, false, OpenHomeScene);
 
         AddText(controlDock, "Title", "Retargeting", 32, FontStyles.Bold, new Vector2(32f, -128f), new Vector2(356f, 40f));
         AddText(controlDock, "Subtitle", "Robot imitation control", 15, FontStyles.Normal, new Vector2(32f, -164f), new Vector2(356f, 24f));
 
-        AddText(controlDock, "RobotLabel", "Robot", 20, FontStyles.Bold, new Vector2(32f, -214f), new Vector2(356f, 28f));
-        GameObject robo = MoveObject(new[] { "RoboList" }, controlDock, new Vector2(32f, -252f), new Vector2(356f, 58f), movedRoots);
-        StyleDropdown(robo);
+        AddText(controlDock, "RobotLabel", "Robot", 20, FontStyles.Bold, new Vector2(32f, -214f), new Vector2(128f, 28f));
+        AddText(controlDock, "CsvLabel", "Motion / CSV", 20, FontStyles.Bold, new Vector2(188f, -214f), new Vector2(200f, 28f));
+        BuildRobotSelectionRows(controlDock);
 
-        AddText(controlDock, "CsvLabel", "Motion / CSV", 20, FontStyles.Bold, new Vector2(32f, -330f), new Vector2(356f, 28f));
-        GameObject csv = MoveObject(new[] { "CsvList" }, controlDock, new Vector2(32f, -368f), new Vector2(356f, 58f), movedRoots);
-        StyleDropdown(csv);
-
-        CreateProxyButton("StartHudButton", new[] { "StartButton", "Start" }, controlDock, new Vector2(32f, -462f), new Vector2(356f, 70f), "Start", StartColor, true, movedRoots, null);
-        CreateProxyButton("ReplayHudButton", new[] { "ReplayButton", "Replay" }, controlDock, new Vector2(32f, -560f), new Vector2(164f, 64f), "Replay", ReplayColor, true, movedRoots, null);
-        CreateProxyButton("StopHudButton", new[] { "StopButton", "Stop" }, controlDock, new Vector2(224f, -560f), new Vector2(164f, 64f), "Stop", StopColor, false, movedRoots, null);
+        CreateHudCommandButton("StartHudButton", controlDock, new Vector2(32f, -500f), new Vector2(356f, 64f), "Start", StartColor, true, InvokeStartInput);
+        CreateHudCommandButton("ReplayHudButton", controlDock, new Vector2(32f, -586f), new Vector2(164f, 58f), "Replay", ReplayColor, true, InvokeReplay);
+        CreateHudCommandButton("StopHudButton", controlDock, new Vector2(224f, -586f), new Vector2(164f, 58f), "Stop", StopColor, false, InvokeStop);
 
         Button switchCamera = CreateButton("SwitchCameraButton", controlDock, "Switch Camera", SwitchColor);
-        AnchorTopLeft((RectTransform)switchCamera.transform, new Vector2(32f, -646f), new Vector2(356f, 64f));
+        AnchorTopLeft((RectTransform)switchCamera.transform, new Vector2(32f, -662f), new Vector2(164f, 52f));
         switchCamera.onClick.AddListener(SelectedRobotCameraFollow.SwitchNextView);
+
+        Button switchRobot = CreateButton("SwitchRobotButton", controlDock, "Switch Robot", ParamsColor);
+        AnchorTopLeft((RectTransform)switchRobot.transform, new Vector2(224f, -662f), new Vector2(164f, 52f));
+        switchRobot.onClick.AddListener(SelectedRobotCameraFollow.SwitchNextRobotTarget);
+
+        cameraStatusText = AddText(controlDock, "CameraStatus", SelectedRobotCameraFollow.GetCurrentCameraStatusText(), 14, FontStyles.Bold, new Vector2(32f, -730f), new Vector2(356f, 28f), TextAlignmentOptions.Center);
+        ConfigureSingleLine(cameraStatusText);
+    }
+
+    private void BuildRobotSelectionRows(RectTransform parent)
+    {
+        for (int i = 0; i < RobotHudEntries.Length; i++)
+        {
+            RobotHudEntry entry = RobotHudEntries[i];
+            RectTransform row = CreatePanel("RobotRow_" + entry.Key, parent, new Color(0.03f, 0.08f, 0.12f, 0.34f));
+            AnchorTopLeft(row, new Vector2(32f, -250f - i * 58f), new Vector2(356f, 50f));
+
+            CreateRobotToggle(row, entry);
+            TMP_Text label = AddText(row, "Label", entry.Label, 15, FontStyles.Bold, new Vector2(42f, -12f), new Vector2(108f, 24f));
+            ConfigureSingleLine(label);
+            CreateRobotCsvDropdown(row, entry);
+        }
+    }
+
+    private Toggle CreateRobotToggle(RectTransform row, RobotHudEntry entry)
+    {
+        RectTransform box = CreatePanel("Selected", row, new Color(0.02f, 0.08f, 0.11f, 0.95f));
+        AnchorTopLeft(box, new Vector2(10f, -10f), new Vector2(24f, 24f));
+        Image boxImage = box.GetComponent<Image>();
+        if (boxImage != null)
+        {
+            boxImage.raycastTarget = false;
+        }
+
+        RectTransform check = CreatePanel("Checkmark", box, new Color(0.00f, 0.92f, 0.42f, 0.95f));
+        Stretch(check, 5f, 5f, 5f, 5f);
+        Image checkImage = check.GetComponent<Image>();
+        if (checkImage != null)
+        {
+            checkImage.raycastTarget = false;
+        }
+
+        Toggle toggle = row.gameObject.AddComponent<Toggle>();
+        toggle.targetGraphic = row.GetComponent<Image>();
+        toggle.graphic = check.GetComponent<Image>();
+        toggle.transition = Selectable.Transition.ColorTint;
+
+        bool selected = startInput != null ? startInput.IsRobotSelected(entry.Key) : entry.SelectedByDefault;
+        toggle.SetIsOnWithoutNotify(selected);
+        check.gameObject.SetActive(selected);
+        if (selected && startInput != null)
+        {
+            startInput.SetRobotSelected(entry.Key, true);
+        }
+
+        toggle.onValueChanged.AddListener(value =>
+        {
+            check.gameObject.SetActive(value);
+            if (startInput == null)
+            {
+                startInput = FindObjectOfType<StartInput>(true);
+            }
+
+            if (startInput != null)
+            {
+                startInput.SetRobotSelected(entry.Key, value);
+            }
+        });
+
+        lockableToggles.Add(toggle);
+        return toggle;
+    }
+
+    private TMP_Dropdown CreateRobotCsvDropdown(RectTransform row, RobotHudEntry entry)
+    {
+        TMP_Dropdown dropdown = CreateRuntimeDropdown("CsvList_" + entry.Key, row);
+        GameObject dropdownObject = dropdown.gameObject;
+        RectTransform rect = (RectTransform)dropdown.transform;
+        AnchorTopLeft(rect, new Vector2(156f, -6f), new Vector2(190f, 38f));
+
+        FileBrowser browser = dropdownObject.AddComponent<FileBrowser>();
+        browser.dropdownMode = FileBrowser.DropdownMode.CsvFiles;
+        browser.folderPath = "Assets/Imitation/dataset/" + ResolveRobotDatasetFolder(entry.Key);
+        browser.fallbackFolderPaths = new List<string>
+        {
+            "Assets/Gewu/Imitation/dataset/" + ResolveRobotDatasetFolder(entry.Key),
+            "Assets/Imitation/dataset/" + ResolveRobotDatasetFolder(entry.Key),
+        };
+        browser.searchPattern = "*.csv";
+        browser.includeSubfolders = false;
+        browser.preserveManualOptionsOnFailure = false;
+        browser.PopulateDropdown();
+
+        StyleDropdown(dropdownObject);
+        EnsureDropdownHasVisibleCaption(dropdown);
+
+        if (startInput != null)
+        {
+            startInput.RegisterRobotCsvBrowser(entry.Key, browser, dropdown);
+        }
+
+        EnsureDropdownHasVisibleCaption(dropdown);
+        return dropdown;
+    }
+
+    private TMP_Dropdown CreateRuntimeDropdown(string name, RectTransform parent)
+    {
+        RectTransform root = CreatePanel(name, parent, DropdownCaption);
+        TMP_Dropdown dropdown = root.gameObject.AddComponent<TMP_Dropdown>();
+
+        TMP_Text caption = AddText(root, "Label", string.Empty, 18, FontStyles.Bold, new Vector2(10f, -6f), new Vector2(146f, 26f));
+        ConfigureSingleLine(caption);
+
+        TMP_Text arrow = AddText(root, "Arrow", "v", 16, FontStyles.Bold, new Vector2(162f, -7f), new Vector2(20f, 24f), TextAlignmentOptions.Center);
+        ConfigureSingleLine(arrow);
+
+        RectTransform template = CreatePanel("Template", root, DropdownList);
+        template.anchorMin = new Vector2(0f, 1f);
+        template.anchorMax = new Vector2(1f, 1f);
+        template.pivot = new Vector2(0.5f, 1f);
+        template.anchoredPosition = new Vector2(0f, -40f);
+        template.sizeDelta = new Vector2(0f, 260f);
+        template.gameObject.SetActive(false);
+
+        RectTransform viewport = CreatePanel("Viewport", template, new Color(1f, 1f, 1f, 0.04f));
+        Stretch(viewport, 0f, 0f, 0f, 0f);
+        Mask mask = viewport.gameObject.AddComponent<Mask>();
+        mask.showMaskGraphic = false;
+
+        RectTransform content = CreateRect("Content", viewport);
+        content.anchorMin = new Vector2(0f, 1f);
+        content.anchorMax = new Vector2(1f, 1f);
+        content.pivot = new Vector2(0.5f, 1f);
+        content.anchoredPosition = Vector2.zero;
+        content.sizeDelta = new Vector2(0f, 34f);
+
+        RectTransform item = CreatePanel("Item", content, new Color(0.02f, 0.06f, 0.11f, 0.92f));
+        item.anchorMin = new Vector2(0f, 1f);
+        item.anchorMax = new Vector2(1f, 1f);
+        item.pivot = new Vector2(0.5f, 1f);
+        item.anchoredPosition = Vector2.zero;
+        item.sizeDelta = new Vector2(0f, 34f);
+
+        Toggle itemToggle = item.gameObject.AddComponent<Toggle>();
+        Image itemImage = item.GetComponent<Image>();
+        itemToggle.targetGraphic = itemImage;
+
+        RectTransform itemCheck = CreatePanel("Item Checkmark", item, new Color(0.00f, 0.92f, 0.42f, 0.95f));
+        AnchorTopLeft(itemCheck, new Vector2(8f, -8f), new Vector2(18f, 18f));
+        itemToggle.graphic = itemCheck.GetComponent<Image>();
+
+        TMP_Text itemLabel = AddText(item, "Item Label", string.Empty, 18, FontStyles.Normal, new Vector2(34f, -5f), new Vector2(140f, 24f));
+        ConfigureSingleLine(itemLabel);
+
+        ScrollRect scroll = template.gameObject.AddComponent<ScrollRect>();
+        scroll.viewport = viewport;
+        scroll.content = content;
+        scroll.horizontal = false;
+        scroll.vertical = true;
+        scroll.movementType = ScrollRect.MovementType.Clamped;
+
+        dropdown.targetGraphic = root.GetComponent<Image>();
+        dropdown.captionText = caption;
+        dropdown.template = template;
+        dropdown.itemText = itemLabel;
+        dropdown.itemImage = null;
+        dropdown.value = 0;
+        dropdown.RefreshShownValue();
+        return dropdown;
+    }
+
+    private static string ResolveRobotDatasetFolder(string robotKey)
+    {
+        if (string.Equals(robotKey, "unitree_g1", StringComparison.OrdinalIgnoreCase))
+        {
+            return "unitree_g1";
+        }
+        if (string.Equals(robotKey, "unitree_h1", StringComparison.OrdinalIgnoreCase))
+        {
+            return "unitree_h1";
+        }
+        if (string.Equals(robotKey, "x02lite", StringComparison.OrdinalIgnoreCase))
+        {
+            return "x02lite";
+        }
+        if (string.Equals(robotKey, "openloong", StringComparison.OrdinalIgnoreCase))
+        {
+            return "openloong";
+        }
+
+        return robotKey;
+    }
+
+    private static void EnsureDropdownHasVisibleCaption(TMP_Dropdown dropdown)
+    {
+        if (dropdown == null || dropdown.captionText == null)
+        {
+            return;
+        }
+
+        if (dropdown.options != null && dropdown.options.Count > 0)
+        {
+            int index = Mathf.Clamp(dropdown.value, 0, dropdown.options.Count - 1);
+            dropdown.value = index;
+            dropdown.RefreshShownValue();
+            dropdown.captionText.text = dropdown.options[index].text;
+        }
+        else
+        {
+            dropdown.captionText.text = "No CSV";
+        }
     }
 
     private void BuildPluginDock(HashSet<Transform> movedRoots)
@@ -769,23 +1004,12 @@ public sealed class RetargetingHudLayout : MonoBehaviour
             lockableButtons.Add(button);
         }
 
-        foreach (Graphic graphic in go.GetComponentsInChildren<Graphic>(true))
+        TMP_Text text = go.transform.Find("HudText")?.GetComponent<TMP_Text>();
+        if (text == null)
         {
-            if (graphic == image)
-            {
-                continue;
-            }
-
-            if (graphic.transform.name == "HudText")
-            {
-                continue;
-            }
-
-            graphic.raycastTarget = false;
-            graphic.enabled = false;
+            text = go.GetComponentInChildren<TMP_Text>(true);
         }
 
-        TMP_Text text = go.transform.Find("HudText")?.GetComponent<TMP_Text>();
         if (text == null)
         {
             RectTransform textRect = CreateRect("HudText", rect);
@@ -793,9 +1017,10 @@ public sealed class RetargetingHudLayout : MonoBehaviour
             text = textRect.gameObject.AddComponent<TextMeshProUGUI>();
         }
 
+        text.gameObject.SetActive(true);
         text.enabled = true;
         text.text = label;
-        text.fontSize = label == "PARAMS" ? 24f : 26f;
+        text.fontSize = label.Length > 8 ? 20f : (label == "PARAMS" ? 24f : 26f);
         text.fontStyle = FontStyles.Bold;
         text.alignment = TextAlignmentOptions.Center;
         text.color = Color.white;
@@ -812,6 +1037,82 @@ public sealed class RetargetingHudLayout : MonoBehaviour
         Button button = rect.gameObject.AddComponent<Button>();
         StyleButton(rect.gameObject, label, color, lockable: false);
         return button;
+    }
+
+    private Button CreateHudCommandButton(
+        string name,
+        RectTransform parent,
+        Vector2 anchoredPosition,
+        Vector2 size,
+        string label,
+        Color color,
+        bool lockable,
+        UnityEngine.Events.UnityAction action)
+    {
+        Button button = CreateButton(name, parent, label, color);
+        AnchorTopLeft((RectTransform)button.transform, anchoredPosition, size);
+        if (lockable && !lockableButtons.Contains(button))
+        {
+            lockableButtons.Add(button);
+        }
+
+        if (action != null)
+        {
+            button.onClick.AddListener(action);
+        }
+
+        return button;
+    }
+
+    private void InvokeStartInput()
+    {
+        if (startInput == null)
+        {
+            startInput = FindObjectOfType<StartInput>(true);
+        }
+
+        if (startInput != null)
+        {
+            startInput.OnStartButtonClicked();
+            return;
+        }
+
+        Debug.LogError("[RetargetingHudLayout] Start clicked, but no StartInput component was found.");
+    }
+
+    private void InvokeReplay()
+    {
+        Replay replay = FindObjectOfType<Replay>(true);
+        if (replay != null)
+        {
+            replay.OnReplayButtonClicked();
+            return;
+        }
+
+        Debug.LogError("[RetargetingHudLayout] Replay clicked, but no Replay component was found.");
+    }
+
+    private void InvokeStop()
+    {
+        Stop stop = FindObjectOfType<Stop>(true);
+        if (stop != null)
+        {
+            stop.OnStopButtonClicked();
+            return;
+        }
+
+        if (startInput == null)
+        {
+            startInput = FindObjectOfType<StartInput>(true);
+        }
+
+        if (startInput != null)
+        {
+            startInput.StopStartPipeline();
+            return;
+        }
+
+        Debug.LogError("[RetargetingHudLayout] Stop clicked, but no Stop or StartInput component was found.");
     }
 
     private void StyleDropdown(GameObject go)
@@ -847,7 +1148,7 @@ public sealed class RetargetingHudLayout : MonoBehaviour
 
         if (dropdown.captionText != null)
         {
-            dropdown.captionText.fontSize = 22;
+            dropdown.captionText.fontSize = 18;
             dropdown.captionText.color = Color.white;
             dropdown.captionText.fontStyle = FontStyles.Bold;
             dropdown.captionText.raycastTarget = false;
@@ -855,7 +1156,7 @@ public sealed class RetargetingHudLayout : MonoBehaviour
 
         if (dropdown.itemText != null)
         {
-            dropdown.itemText.fontSize = 20;
+            dropdown.itemText.fontSize = 18;
             dropdown.itemText.color = Color.white;
             dropdown.itemText.fontStyle = FontStyles.Normal;
         }
@@ -873,7 +1174,7 @@ public sealed class RetargetingHudLayout : MonoBehaviour
         foreach (TMP_Text text in dropdown.template.GetComponentsInChildren<TMP_Text>(true))
         {
             text.color = Color.white;
-            text.fontSize = Mathf.Max(text.fontSize, 20f);
+            text.fontSize = Mathf.Max(text.fontSize, 18f);
             text.fontStyle = FontStyles.Normal;
             text.raycastTarget = false;
         }
@@ -934,6 +1235,14 @@ public sealed class RetargetingHudLayout : MonoBehaviour
             }
         }
 
+        for (int i = 0; i < lockableToggles.Count; i++)
+        {
+            if (lockableToggles[i] != null)
+            {
+                lockableToggles[i].interactable = !locked;
+            }
+        }
+
         for (int i = 0; i < paramControls.Count; i++)
         {
             ParamControl control = paramControls[i];
@@ -946,6 +1255,14 @@ public sealed class RetargetingHudLayout : MonoBehaviour
             {
                 control.Toggle.interactable = !locked;
             }
+        }
+    }
+
+    private void UpdateCameraStatusText()
+    {
+        if (cameraStatusText != null)
+        {
+            cameraStatusText.text = SelectedRobotCameraFollow.GetCurrentCameraStatusText();
         }
     }
 
@@ -1090,8 +1407,7 @@ public sealed class RetargetingHudLayout : MonoBehaviour
         close.onClick.AddListener(action);
     }
 
-    private Button CreateProxyButton(
-        string proxyName,
+    private Button MoveButton(
         string[] sourceNames,
         RectTransform parent,
         Vector2 anchoredPosition,
@@ -1102,35 +1418,41 @@ public sealed class RetargetingHudLayout : MonoBehaviour
         HashSet<Transform> movedRoots,
         UnityEngine.Events.UnityAction fallbackAction)
     {
-        GameObject sourceObject = ResolveHudObjectRoot(sourceNames, preferInteractiveRoot: true);
-        Button sourceButton = sourceObject != null ? sourceObject.GetComponent<Button>() : null;
-        if (sourceObject != null)
+        GameObject sourceObject = MoveObject(sourceNames, parent, anchoredPosition, size, movedRoots, preferInteractiveRoot: true);
+        if (sourceObject == null)
         {
-            HideLegacyInteractiveObject(sourceObject);
-            movedRoots.Add(sourceObject.transform);
-        }
-
-        Button proxy = CreateButton(proxyName, parent, label, color);
-        AnchorTopLeft((RectTransform)proxy.transform, anchoredPosition, size);
-        if (lockable && !lockableButtons.Contains(proxy))
-        {
-            lockableButtons.Add(proxy);
-        }
-
-        proxy.onClick.AddListener(() =>
-        {
-            if (sourceButton != null)
+            Button fallbackButton = CreateButton(label + "Button", parent, label, color);
+            AnchorTopLeft((RectTransform)fallbackButton.transform, anchoredPosition, size);
+            if (fallbackAction != null)
             {
-                sourceButton.onClick.Invoke();
-                if (fallbackAction == null || sourceButton.onClick.GetPersistentEventCount() > 0)
-                {
-                    return;
-                }
+                fallbackButton.onClick.AddListener(fallbackAction);
             }
 
-            fallbackAction?.Invoke();
-        });
-        return proxy;
+            if (lockable && !lockableButtons.Contains(fallbackButton))
+            {
+                lockableButtons.Add(fallbackButton);
+            }
+
+            return fallbackButton;
+        }
+
+        Button button = sourceObject.GetComponent<Button>() ?? sourceObject.GetComponentInParent<Button>(true);
+        if (button == null)
+        {
+            button = sourceObject.AddComponent<Button>();
+        }
+
+        sourceObject.SetActive(true);
+        button.enabled = true;
+        button.interactable = true;
+        StyleButton(button.gameObject, label, color, lockable);
+
+        if (fallbackAction != null && button.onClick.GetPersistentEventCount() == 0)
+        {
+            button.onClick.AddListener(fallbackAction);
+        }
+
+        return button;
     }
 
     private static bool TryParseBool(string value, out bool result)
@@ -1194,27 +1516,6 @@ public sealed class RetargetingHudLayout : MonoBehaviour
         }
 
         Debug.LogWarning("[RetargetingHudLayout] Home button clicked, but no Home/Menu scene is available in Build Settings.");
-    }
-
-    private static void HideLegacyInteractiveObject(GameObject sourceObject)
-    {
-        if (sourceObject == null)
-        {
-            return;
-        }
-
-        foreach (Graphic graphic in sourceObject.GetComponentsInChildren<Graphic>(true))
-        {
-            graphic.raycastTarget = false;
-            graphic.enabled = false;
-        }
-
-        Button button = sourceObject.GetComponent<Button>();
-        if (button != null)
-        {
-            button.transition = Selectable.Transition.None;
-            button.targetGraphic = null;
-        }
     }
 
     private RawImage CreateVideoSurface(string name, RectTransform parent, out RectTransform viewport)
@@ -1598,25 +1899,35 @@ public sealed class RetargetingHudLayout : MonoBehaviour
         scaler.referenceResolution = new Vector2(1920f, 1080f);
         scaler.matchWidthOrHeight = 0.5f;
 
-        if (canvasObject.GetComponent<GraphicRaycaster>() == null)
+        GraphicRaycaster raycaster = canvasObject.GetComponent<GraphicRaycaster>();
+        if (raycaster == null)
         {
-            canvasObject.AddComponent<GraphicRaycaster>();
+            raycaster = canvasObject.AddComponent<GraphicRaycaster>();
         }
+
+        raycaster.enabled = true;
     }
 
     private static void EnsureEventSystem()
     {
-        if (FindObjectOfType<EventSystem>(true) != null)
+        EventSystem eventSystem = FindObjectOfType<EventSystem>(true);
+        if (eventSystem != null)
         {
+            eventSystem.gameObject.SetActive(true);
+            eventSystem.enabled = true;
+            StandaloneInputModule module = eventSystem.GetComponent<StandaloneInputModule>() ?? eventSystem.gameObject.AddComponent<StandaloneInputModule>();
+            module.enabled = true;
             return;
         }
 
         var go = new GameObject("EventSystem", typeof(EventSystem), typeof(StandaloneInputModule));
+        go.hideFlags = HideFlags.DontSave;
     }
 
     private static RectTransform CreateRect(string name, Transform parent)
     {
         var go = new GameObject(name, typeof(RectTransform));
+        go.hideFlags = HideFlags.DontSave;
         RectTransform rect = go.GetComponent<RectTransform>();
         rect.SetParent(parent, false);
         return rect;
@@ -1731,12 +2042,66 @@ public sealed class RetargetingHudLayout : MonoBehaviour
         }
     }
 
+    private static void DestroyLeakedGeneratedHudChildren(Transform canvasTransform)
+    {
+        if (canvasTransform == null)
+        {
+            return;
+        }
+
+        var toDestroy = new List<GameObject>();
+        for (int i = 0; i < canvasTransform.childCount; i++)
+        {
+            Transform child = canvasTransform.GetChild(i);
+            if (child != null && IsGeneratedHudLeakName(child.name))
+            {
+                toDestroy.Add(child.gameObject);
+            }
+        }
+
+        for (int i = 0; i < toDestroy.Count; i++)
+        {
+            DestroyHudObject(toDestroy[i]);
+        }
+    }
+
+    private static bool IsGeneratedHudLeakName(string objectName)
+    {
+        if (string.IsNullOrEmpty(objectName))
+        {
+            return false;
+        }
+
+        switch (objectName)
+        {
+            case "ControlDock":
+            case "PluginDock":
+            case "StartProgressPanel":
+            case "WHAMDrawer":
+            case "GMRDrawer":
+            case "PARAMSDrawer":
+            case "SwitchCameraButton":
+            case "SwitchRobotButton":
+            case "WHAMEntry":
+            case "GMREntry":
+            case "PARAMSEntry":
+            case "HomeHudButton":
+            case "StartHudButton":
+            case "ReplayHudButton":
+            case "StopHudButton":
+                return true;
+            default:
+                return objectName.StartsWith("RobotRow_", StringComparison.Ordinal) ||
+                       objectName.StartsWith("CsvList_", StringComparison.Ordinal);
+        }
+    }
+
     private static void DetachPreservedHudObjects(Transform oldRoot, Transform fallbackParent)
     {
         string[] names =
         {
             "Home", "RoboList", "CsvList", "StartButton", "Start", "ReplayButton", "Replay",
-            "StopButton", "Stop", "SwitchCameraButton", "HomeButton", "WHAM", "GMR"
+            "StopButton", "Stop", "HomeButton", "WHAM", "GMR"
         };
 
         foreach (string name in names)

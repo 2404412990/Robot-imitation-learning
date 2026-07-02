@@ -38,6 +38,15 @@ public class Replay : MonoBehaviour
     private Button replayButton;
     private bool addedRuntimeListener;
 
+    private sealed class ReplayJob
+    {
+        public IMimicAgent Agent;
+        public string RobotKey;
+        public string CsvPath;
+        public string CsvName;
+        public int MotionId;
+    }
+
     private static readonly Dictionary<string, string> RobotAliases =
         new Dictionary<string, string>(System.StringComparer.OrdinalIgnoreCase)
         {
@@ -82,6 +91,11 @@ public class Replay : MonoBehaviour
     public void OnReplayButtonClicked()
     {
         ResolveReferences();
+
+        if (TryReplaySelectedRobots())
+        {
+            return;
+        }
 
         IMimicAgent agent = ResolveActiveAgent();
         if (agent == null)
@@ -140,6 +154,88 @@ public class Replay : MonoBehaviour
         agent.RequestEndEpisode();
 
         Debug.Log($"[Replay] Started replay from path: robot={agent.RobotKey}, csv={selectedCsvName}, path={csvAbsolutePath}");
+    }
+
+    private bool TryReplaySelectedRobots()
+    {
+        if (startInput == null || MimicAgentRegistry.Instance == null)
+        {
+            return false;
+        }
+
+        IReadOnlyList<string> selectedRobotKeys = startInput.GetSelectedRobotKeys();
+        if (selectedRobotKeys == null || selectedRobotKeys.Count == 0)
+        {
+            return false;
+        }
+
+        var replayJobs = new List<ReplayJob>();
+        for (int i = 0; i < selectedRobotKeys.Count; i++)
+        {
+            string robotKey = selectedRobotKeys[i];
+            if (!startInput.TryGetSelectedCsvForRobot(robotKey, out string csvPath, out string csvName))
+            {
+                Debug.LogWarning($"[Replay] No CSV selected for checked robot '{robotKey}'.");
+                continue;
+            }
+
+            IMimicAgent agent = MimicAgentRegistry.Instance.FindByKey(robotKey);
+            if (agent == null || agent.AgentGameObject == null)
+            {
+                Debug.LogWarning($"[Replay] No registered IMimicAgent for checked robot '{robotKey}'.");
+                continue;
+            }
+
+            replayJobs.Add(new ReplayJob
+            {
+                Agent = agent,
+                RobotKey = robotKey,
+                CsvPath = csvPath,
+                CsvName = csvName,
+                MotionId = ResolveMotionIdByName(csvName, robotKey)
+            });
+        }
+
+        if (replayJobs.Count == 0)
+        {
+            return false;
+        }
+
+        if (stopRealtimeTrackingOnReplay)
+        {
+            startInput.StopStartPipeline();
+        }
+
+        int loadedCount = 0;
+        foreach (var job in replayJobs)
+        {
+            bool loadedViaPath;
+            try
+            {
+                loadedViaPath = job.Agent.LoadReplayCsvFromPath(job.CsvPath, keepProgress: false);
+            }
+            catch (System.Exception e)
+            {
+                Debug.LogWarning($"[Replay] LoadReplayCsvFromPath threw on {job.RobotKey}: {e.Message}");
+                loadedViaPath = false;
+            }
+
+            if (!loadedViaPath)
+            {
+                Debug.LogWarning($"[Replay] Failed to load selected CSV for robot={job.RobotKey}: {job.CsvPath}.");
+                continue;
+            }
+
+            job.Agent.UseExternalReplayData = true;
+            job.Agent.ReplayMode = true;
+            job.Agent.MotionId = job.MotionId >= 0 ? job.MotionId : 0;
+            job.Agent.RequestEndEpisode();
+            loadedCount++;
+
+            Debug.Log($"[Replay] Started replay from path: robot={job.RobotKey}, csv={job.CsvName}, path={job.CsvPath}");
+        }
+
+        return loadedCount > 0;
     }
 
     /// <summary>

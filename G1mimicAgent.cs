@@ -13,7 +13,7 @@ using System.Globalization;
 using System.Reflection;
 using Gewu.Imitation;
 
-public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelectableMimicAgent
+public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelectableMimicAgent, IReplayRootOffsetMimicAgent
 {
     public bool train = false;
     public bool replay = false;
@@ -253,6 +253,7 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
     [SerializeField] private string datasetRelativePath = "Assets/Gewu/Imitation/dataset/unitree_g1";
     [SerializeField] private string datasetFallbackRelativePath = "Assets/Imitation/dataset/unitree_g1";
     public bool useExternalReplayData = false;
+    private bool selectionNeutralHold = true;
 
     private string dofFilePath;
     private string rotFilePath;
@@ -283,6 +284,9 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
     private float realtimeFrameCursor;
     private float realtimePlaybackFps = ReplayCsvUtility.SourceFps;
     private float realtimePlaybackBufferSeconds = 0.2f;
+    [SerializeField, Min(0)]
+    private int liveStartupHoldFixedFrames = 8;
+    private int liveStartupHoldFramesRemaining;
 
     float[] currentData = new float[36];
     float[] realtimeSampledData = new float[36];
@@ -321,10 +325,12 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
 
     private bool _isClone = false;
     private bool isRobotSelectedInScene = true;
+    private Vector3 replayRootOffset = Vector3.zero;
+    private bool explicitReplayRequested;
 
     // IMimicAgent surface
     public string RobotKey => string.IsNullOrWhiteSpace(robotKey) ? "unitree_g1" : robotKey.Trim();
-    public GameObject AgentGameObject => gameObject;
+    public GameObject AgentGameObject => this == null ? null : gameObject;
     public bool UseExternalReplayData
     {
         get => useExternalReplayData;
@@ -335,28 +341,61 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
             {
                 replayDataMode = ReplayDataMode.DatasetReplay;
                 realtimeFrameCursor = 0f;
+                liveStartupHoldFramesRemaining = 0;
+                explicitReplayRequested = false;
+                if (!replay)
+                {
+                    selectionNeutralHold = true;
+                }
                 return;
             }
 
+            selectionNeutralHold = false;
             if (replayDataMode != ReplayDataMode.LiveRealtimeCsv)
             {
                 replayDataMode = ReplayDataMode.ExternalCsvReplay;
             }
         }
     }
-    public bool ReplayMode { get => replay; set => replay = value; }
+    public bool ReplayMode
+    {
+        get => replay;
+        set
+        {
+            replay = value;
+            explicitReplayRequested = value;
+            if (value)
+            {
+                selectionNeutralHold = false;
+            }
+            else if (!useExternalReplayData)
+            {
+                selectionNeutralHold = true;
+            }
+        }
+    }
     public int MotionId { get => motion_id; set => motion_id = value; }
     public void RequestEndEpisode() => EndEpisode();
     public int ExpectedCsvColumns => 36;
     private bool IsLiveRealtimeCsv => useExternalReplayData && replayDataMode == ReplayDataMode.LiveRealtimeCsv;
 
+    public void SetReplayRootOffset(Vector3 offset)
+    {
+        replayRootOffset = offset;
+    }
+
     public void SetRobotSelectedInScene(bool isSelected)
     {
         isRobotSelectedInScene = isSelected;
-        if (isSelected) return;
+        if (isSelected)
+        {
+            EnterSelectionNeutralHold();
+            return;
+        }
 
         UseExternalReplayData = false;
         ReplayMode = false;
+        selectionNeutralHold = true;
         RestoreReplayMirrorColliders();
         if (art0 != null)
         {
@@ -379,6 +418,8 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
         motion_name = "live_motion";
         currentFrame = 0;
         realtimeFrameCursor = 0f;
+        liveStartupHoldFramesRemaining = Mathf.Max(0, liveStartupHoldFixedFrames);
+        selectionNeutralHold = false;
         useExternalReplayData = true;
         replayDataMode = ReplayDataMode.LiveRealtimeCsv;
         tt = 0;
@@ -407,6 +448,7 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
 
         UseExternalReplayData = false;
         replayDataMode = ReplayDataMode.DatasetReplay;
+        liveStartupHoldFramesRemaining = 0;
         RestoreReplayMirrorColliders();
     }
 
@@ -557,7 +599,11 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
         // once Agent.LazyInitialize has finished (otherwise registering during
         // an in-progress init could expose a half-constructed agent to UI
         // scripts that try to use it immediately).
-        MimicAgentRegistry.Instance.Register(this);
+        MimicAgentRegistry registry = MimicAgentRegistry.Instance;
+        if (registry != null)
+        {
+            registry.Register(this);
+        }
     }
 
     List<string> GetCsvFileNames(string directoryPath)
@@ -652,10 +698,26 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
 
         motion_name = Path.GetFileNameWithoutExtension(filePath);
         replayDataMode = ReplayDataMode.ExternalCsvReplay;
+        selectionNeutralHold = false;
+        explicitReplayRequested = true;
         useExternalReplayData = true;
         realtimeFrameCursor = 0f;
         DisableReplayMirrorColliders();
-        return ApplyReplayData(data, keepProgress, resample30FpsToFixed50Hz: true, startAtFrameZero: true);
+        bool isRuntimeLiveCsv = IsRuntimeLiveCsvPath(filePath);
+        return ApplyReplayData(data, keepProgress, resample30FpsToFixed50Hz: !isRuntimeLiveCsv, startAtFrameZero: true);
+    }
+
+    private static bool IsRuntimeLiveCsvPath(string filePath)
+    {
+        if (string.IsNullOrWhiteSpace(filePath))
+        {
+            return false;
+        }
+
+        string normalized = filePath.Replace('\\', '/').ToLowerInvariant();
+        return normalized.EndsWith("/live_motion.csv", StringComparison.Ordinal) &&
+               (normalized.IndexOf("/library/imitationruntime/", StringComparison.Ordinal) >= 0 ||
+                normalized.IndexOf("/imitationruntime/", StringComparison.Ordinal) >= 0);
     }
 
     private bool TryLoadCurrentMotionData(bool keepProgress)
@@ -876,6 +938,12 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
     {
         if (!isRobotSelectedInScene)
         {
+            return;
+        }
+
+        if (ShouldHoldSelectionNeutralPose())
+        {
+            HoldSelectionNeutralPose();
             return;
         }
 
@@ -1113,7 +1181,7 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
             return;
         }
 
-        if (replay || useExternalReplayData)
+        if (selectionNeutralHold || replay || useExternalReplayData)
         {
             return;
         }
@@ -1133,6 +1201,21 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
     {
         if (!isRobotSelectedInScene)
         {
+            return;
+        }
+
+        if (ShouldHoldSelectionNeutralPose())
+        {
+            HoldSelectionNeutralPose();
+            tt++;
+            return;
+        }
+
+        if (IsLiveRealtimeCsv && itpData != null && itpData.Count > 0 && liveStartupHoldFramesRemaining > 0)
+        {
+            HoldReplayMirrorStill();
+            liveStartupHoldFramesRemaining--;
+            tt++;
             return;
         }
 
@@ -1240,6 +1323,106 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
         AdvanceMotionFrameIfNeeded();
     }
 
+    private void HoldReplayMirrorStill()
+    {
+        if (arts == null || arts.Length == 0 || arts[0] == null)
+        {
+            return;
+        }
+
+        Physics.gravity = Vector3.zero;
+        arts[0].immovable = true;
+        arts[0].velocity = Vector3.zero;
+        arts[0].angularVelocity = Vector3.zero;
+        ZeroArticulationJointVelocities();
+        ZeroArticulationBodyVelocities();
+    }
+
+    private void EnterSelectionNeutralHold()
+    {
+        if (useExternalReplayData || (replay && explicitReplayRequested))
+        {
+            return;
+        }
+
+        replay = false;
+        explicitReplayRequested = false;
+        selectionNeutralHold = true;
+        HoldSelectionNeutralPose();
+    }
+
+    private bool ShouldHoldSelectionNeutralPose()
+    {
+        if (!selectionNeutralHold || useExternalReplayData)
+        {
+            return false;
+        }
+
+        if (!replay)
+        {
+            return true;
+        }
+
+        if (explicitReplayRequested)
+        {
+            return false;
+        }
+
+        replay = false;
+        return true;
+    }
+
+    private void HoldSelectionNeutralPose()
+    {
+        if (arts == null || arts.Length == 0 || arts[0] == null)
+        {
+            return;
+        }
+
+        Physics.gravity = Vector3.zero;
+        arts[0].immovable = true;
+        arts[0].velocity = Vector3.zero;
+        arts[0].angularVelocity = Vector3.zero;
+
+        int directWriteCount = 0;
+        for (int i = 0; i < 29; i++)
+        {
+            ArticulationBody joint = jh[i];
+            float restRad = GetRestJointPositionRad(i);
+            float restDeg = restRad * Mathf.Rad2Deg;
+            u[i] = 0f;
+            uff[i] = restDeg;
+            utotal[i] = restDeg;
+            SetJointTargetDeg(joint, restDeg);
+            if (SetJointPositionRad(joint, restRad))
+            {
+                directWriteCount++;
+            }
+        }
+
+        ZeroArticulationJointVelocities();
+        ZeroArticulationBodyVelocities();
+
+        if (directWriteCount == 0 && !hasLoggedDirectJointStateError)
+        {
+            UnityEngine.Debug.LogWarning($"[G1mimicAgent:{name}] Selection neutral hold could not write joint positions yet; articulation cache may still be rebuilding.");
+            hasLoggedDirectJointStateError = true;
+        }
+    }
+
+    private float GetRestJointPositionRad(int jointIndex)
+    {
+        if (restPositions == null || restPositions.Length == 0)
+        {
+            return 0f;
+        }
+
+        const int RootDofCount = 6; // Free articulation root: 3 translational + 3 rotational DOFs.
+        int offset = restPositions.Length >= RootDofCount + 29 ? RootDofCount : 0;
+        int index = offset + jointIndex;
+        return index >= 0 && index < restPositions.Length ? restPositions[index] : 0f;
+    }
+
     private void ApplyReplayFrameToArticulation()
     {
         if (arts == null || arts.Length == 0 || arts[0] == null)
@@ -1259,7 +1442,7 @@ public class G1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
 
         Physics.gravity = Vector3.zero;
         arts[0].immovable = true;
-        arts[0].TeleportRoot(newPosition, newRotation);
+        arts[0].TeleportRoot(newPosition + replayRootOffset, newRotation);
         arts[0].velocity = Vector3.zero;
         arts[0].angularVelocity = Vector3.zero;
 

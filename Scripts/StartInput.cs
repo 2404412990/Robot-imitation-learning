@@ -53,6 +53,8 @@ public class StartInput : MonoBehaviour
     [SerializeField] private string gmrCameraAzimuth = "";
     [SerializeField] private int gmrTcpRenderWidth = 960;
     [SerializeField] private int gmrTcpRenderHeight = 720;
+    [Tooltip("Limit GMR TCP preview rendering FPS. CSV generation still runs every frame.")]
+    [SerializeField] private float gmrPreviewFps = 3.0f;
 
     [Header("WHAM Performance")]
     [Tooltip("Enable AMP (mixed precision) inference for WHAM (CUDA only).")]
@@ -119,6 +121,8 @@ public class StartInput : MonoBehaviour
     [SerializeField] private bool hideInactiveRobotsOnSwitch = true;
     [Tooltip("Add lightweight BoxColliders at runtime, but only for the currently selected robot.")]
     [SerializeField] private bool addRuntimeCollidersForSelectedRobot = true;
+    [Tooltip("World-space X spacing between selected robots during multi-robot replay/live display.")]
+    [SerializeField] private float multiRobotDisplaySpacingMeters = 1.8f;
     [SerializeField] private Vector3 fallbackRuntimeColliderSize = new Vector3(0.08f, 0.08f, 0.08f);
     [Tooltip("Runtime-added robot colliders should be trigger/query-only. This prevents ArticulationBody self-contact from destabilizing joints.")]
     [SerializeField] private bool runtimeRobotCollidersAreTriggers = true;
@@ -158,7 +162,7 @@ public class StartInput : MonoBehaviour
     [Tooltip("Maximum realtime CSV batches applied on the Unity main thread per frame.")]
     [SerializeField] private int maxRealtimeCsvBatchesPerFrame = 4;
     [Tooltip("Maximum queued pipeline log lines emitted to the Unity console per frame.")]
-    [SerializeField] private int maxUnityLogMessagesPerFrame = 4;
+    [SerializeField] private int maxUnityLogMessagesPerFrame = 2;
     [Tooltip("Maximum pending Unity console log lines. Extra normal logs are dropped; warnings/errors are retained.")]
     [SerializeField] private int maxPendingUnityLogMessages = 200;
 
@@ -222,7 +226,13 @@ public class StartInput : MonoBehaviour
     private IRealtimeCsvMimicAgent activeRealtimeCsvAgent;
     private IMimicAgent activeRealtimeMimicAgent;
     private Thread csvWorkerThread;
+    private readonly List<Thread> csvWorkerThreads = new List<Thread>();
     private volatile bool csvWorkerRunning;
+    private readonly HashSet<string> selectedRobotKeys = new HashSet<string>(System.StringComparer.OrdinalIgnoreCase);
+    private bool hasExplicitRobotSelection;
+    private readonly Dictionary<string, FileBrowser> robotCsvBrowsers = new Dictionary<string, FileBrowser>(System.StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, TMP_Dropdown> robotCsvDropdowns = new Dictionary<string, TMP_Dropdown>(System.StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, RealtimeRobotState> realtimeRobotStates = new Dictionary<string, RealtimeRobotState>(System.StringComparer.OrdinalIgnoreCase);
     private volatile bool isStoppingPipeline;
     private readonly object processStateLock = new object();
     private readonly ConcurrentQueue<RealtimeCsvBatch> realtimeCsvRowsQueue = new ConcurrentQueue<RealtimeCsvBatch>();
@@ -258,6 +268,136 @@ public class StartInput : MonoBehaviour
     public float PipelineProgress01 { get; private set; }
     public string PipelineStatusText { get; private set; } = string.Empty;
     public string PipelineActivityText { get; private set; } = string.Empty;
+
+    public static string NormalizeRobotKeyForUi(string rawRobotName)
+    {
+        return TryResolveRobotKeyQuiet(rawRobotName);
+    }
+
+    public IReadOnlyList<string> GetSelectedRobotKeys()
+    {
+        return BuildSelectedRobotKeyList();
+    }
+
+    public IReadOnlyList<GameObject> GetSelectedRobotRoots()
+    {
+        var roots = new List<GameObject>();
+        List<string> keys = BuildSelectedRobotKeyList();
+        for (int i = 0; i < keys.Count; i++)
+        {
+            GameObject root = ResolveRobotRootByKey(keys[i]);
+            if (root != null && !roots.Contains(root))
+            {
+                roots.Add(root);
+            }
+        }
+
+        if (roots.Count == 0 && !hasExplicitRobotSelection && CurrentSelectedRobotRoot != null)
+        {
+            roots.Add(CurrentSelectedRobotRoot);
+        }
+
+        return roots;
+    }
+
+    public bool IsRobotSelected(string robotKeyOrLabel)
+    {
+        string key = TryResolveRobotKeyQuiet(robotKeyOrLabel);
+        if (string.IsNullOrWhiteSpace(key))
+        {
+            return false;
+        }
+
+        List<string> keys = BuildSelectedRobotKeyList();
+        return keys.Contains(key);
+    }
+
+    public void SetRobotSelected(string robotKeyOrLabel, bool selected)
+    {
+        string key = TryResolveRobotKeyQuiet(robotKeyOrLabel);
+        if (string.IsNullOrWhiteSpace(key))
+        {
+            Debug.LogWarning($"[StartInput] Ignoring unknown robot selection '{robotKeyOrLabel}'.");
+            return;
+        }
+
+        if (selected)
+        {
+            hasExplicitRobotSelection = true;
+            selectedRobotKeys.Add(key);
+        }
+        else
+        {
+            hasExplicitRobotSelection = true;
+            selectedRobotKeys.Remove(key);
+        }
+
+        if (selectedRobotKeys.Count == 0)
+        {
+            Debug.LogWarning("[StartInput] No robots selected. Start/replay will be disabled until at least one robot is selected.");
+        }
+
+        RefreshRegisteredCsvBrowsers();
+        ApplyRobotVisibility(string.Empty, key);
+        SelectedRobotCameraFollow.NotifyRobotSelectionChanged(key, selected);
+    }
+
+    public void RegisterRobotCsvBrowser(string robotKeyOrLabel, FileBrowser browser, TMP_Dropdown dropdown)
+    {
+        string key = TryResolveRobotKeyQuiet(robotKeyOrLabel);
+        if (string.IsNullOrWhiteSpace(key))
+        {
+            return;
+        }
+
+        if (browser != null)
+        {
+            robotCsvBrowsers[key] = browser;
+            browser.SetCsvRobotFilter(key);
+        }
+
+        if (dropdown != null)
+        {
+            robotCsvDropdowns[key] = dropdown;
+        }
+    }
+
+    public bool TryGetSelectedCsvForRobot(string robotKeyOrLabel, out string csvPath, out string csvName)
+    {
+        csvPath = string.Empty;
+        csvName = string.Empty;
+        string key = TryResolveRobotKeyQuiet(robotKeyOrLabel);
+        if (string.IsNullOrWhiteSpace(key))
+        {
+            return false;
+        }
+
+        if (robotCsvBrowsers.TryGetValue(key, out FileBrowser browser) && browser != null)
+        {
+            csvPath = browser.GetSelectedCsvPath();
+            csvName = browser.GetSelectedCsvName();
+            if (!string.IsNullOrWhiteSpace(csvPath) && File.Exists(csvPath))
+            {
+                return true;
+            }
+        }
+
+        if (string.Equals(key, TryResolveRobotKeyQuiet(ResolveSelectedRobotName()), System.StringComparison.OrdinalIgnoreCase))
+        {
+            ResolveCsvListReferences();
+            if (csvListFileBrowser != null)
+            {
+                csvPath = csvListFileBrowser.GetSelectedCsvPath();
+                csvName = csvListFileBrowser.GetSelectedCsvName();
+                if (!string.IsNullOrWhiteSpace(csvPath) && File.Exists(csvPath))
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
     public bool HasPipelineError { get; private set; }
     public string LastPipelineError { get; private set; } = string.Empty;
 
@@ -434,6 +574,14 @@ public class StartInput : MonoBehaviour
         "fourier_gr3",
     };
 
+    private static readonly string[] MultiRobotDisplayOrder =
+    {
+        "unitree_g1",
+        "unitree_h1",
+        "x02lite",
+        "openloong",
+    };
+
     private static readonly Dictionary<string, string> RobotAliases = new Dictionary<string, string>(System.StringComparer.OrdinalIgnoreCase)
     {
         { "fourier_gr3v2_1_1", "fourier_gr3" },
@@ -469,14 +617,30 @@ public class StartInput : MonoBehaviour
 
     private struct RealtimeCsvBatch
     {
+        public readonly string RobotKey;
         public readonly List<float[]> Rows;
         public readonly float ProducerFps;
 
-        public RealtimeCsvBatch(List<float[]> rows, float producerFps)
+        public RealtimeCsvBatch(string robotKey, List<float[]> rows, float producerFps)
         {
+            RobotKey = robotKey ?? string.Empty;
             Rows = rows;
             ProducerFps = producerFps;
         }
+    }
+
+    private sealed class RealtimeRobotState
+    {
+        public string RobotKey;
+        public string CsvPath;
+        public IMimicAgent MimicAgent;
+        public IRealtimeCsvMimicAgent CsvAgent;
+        public bool ReplayBootstrapped;
+        public int SourceRowsRead;
+        public float[] LastAcceptedRow;
+        public int ConsecutiveRejectedRows;
+        public bool SafetyWarningLogged;
+        public readonly List<float[]> PendingRows = new List<float[]>();
     }
 
     private struct RealtimeFpsSample
@@ -1065,6 +1229,7 @@ public class StartInput : MonoBehaviour
 
     void Awake()
     {
+        ResetTransientRuntimeStateForFreshPlay();
         EnsureStartButtonListener();
         LogVerbose($"Awake: runBashOnClick={runBashOnClick}, monitorCsvOnClick={monitorCsvOnClick}, defaultRobotName='{defaultRobotName}', tcp={enableTcpStreaming}");
 
@@ -1078,6 +1243,21 @@ public class StartInput : MonoBehaviour
         }
 
         RefreshCsvListForSelectedRobot();
+    }
+
+    public void ResetTransientRuntimeStateForFreshPlay()
+    {
+        selectedRobotKeys.Clear();
+        hasExplicitRobotSelection = false;
+        realtimeRobotStates.Clear();
+        pendingRealtimeRows.Clear();
+        DrainRealtimeCsvQueues();
+        replayBootstrapped = false;
+        realtimeSourceRowsRead = 0;
+        CurrentSelectedRobotRoot = null;
+        CurrentSelectedRobotKey = string.Empty;
+        ResetRealtimeCsvSafetyGate();
+        ResetRobotDisplayOffsets();
     }
 
     private IEnumerator Start()
@@ -1133,7 +1313,7 @@ public class StartInput : MonoBehaviour
         int maxBatches = Mathf.Max(1, maxRealtimeCsvBatchesPerFrame);
         for (int i = 0; i < maxBatches && realtimeCsvRowsQueue.TryDequeue(out RealtimeCsvBatch batch); i++)
         {
-            ApplyRealtimeCsvRows(batch.Rows, batch.ProducerFps);
+            ApplyRealtimeCsvRows(batch.RobotKey, batch.Rows, batch.ProducerFps);
         }
     }
 
@@ -1359,6 +1539,60 @@ public class StartInput : MonoBehaviour
 
         _cachedRobotColliders[root] = fresh;
         return fresh;
+    }
+
+    private static bool EnsureRootActiveForVisibility(GameObject root)
+    {
+        if (root == null) return false;
+
+        bool changed = false;
+        Transform current = root.transform;
+        while (current != null)
+        {
+            GameObject go = current.gameObject;
+            if (!go.activeSelf)
+            {
+                go.SetActive(true);
+                changed = true;
+            }
+
+            current = current.parent;
+        }
+
+        return changed;
+    }
+
+    private static int EnsureRendererHierarchyActive(GameObject root, Renderer[] renderers)
+    {
+        if (root == null || renderers == null) return 0;
+
+        int changed = 0;
+        Transform rootTransform = root.transform;
+        for (int i = 0; i < renderers.Length; i++)
+        {
+            Renderer renderer = renderers[i];
+            if (renderer == null) continue;
+
+            Transform current = renderer.transform;
+            while (current != null)
+            {
+                GameObject go = current.gameObject;
+                if (!go.activeSelf)
+                {
+                    go.SetActive(true);
+                    changed++;
+                }
+
+                if (current == rootTransform)
+                {
+                    break;
+                }
+
+                current = current.parent;
+            }
+        }
+
+        return changed;
     }
 
     private bool GetOriginalColliderEnabled(Collider collider)
@@ -1646,15 +1880,17 @@ public class StartInput : MonoBehaviour
     /// </summary>
     private void ApplyRobotVisibility(string selectedLabel, string selectedRobotKey)
     {
-        CurrentSelectedRobotKey = !string.IsNullOrWhiteSpace(selectedRobotKey)
-            ? selectedRobotKey.Trim()
-            : TryResolveRobotKeyQuiet(selectedLabel);
+        List<string> selectedKeys = BuildSelectedRobotKeyList();
+        HashSet<string> activeKeys = new HashSet<string>(selectedKeys, System.StringComparer.OrdinalIgnoreCase);
+        CurrentSelectedRobotKey = selectedKeys.Count > 0 ? selectedKeys[0] : string.Empty;
 
         if (!hideInactiveRobotsOnSwitch)
         {
-            CurrentSelectedRobotRoot = ResolveSelectedRobotRootForCamera(selectedLabel, CurrentSelectedRobotKey);
+            CurrentSelectedRobotRoot = ResolveRobotRootByKey(CurrentSelectedRobotKey);
             return;
         }
+
+        bool useLegacySingleSelection = !hasExplicitRobotSelection;
 
         // Collect every (GameObject, isSelected) pair we know about.
         // Using a dictionary keyed by GameObject so a robot listed in BOTH
@@ -1669,18 +1905,21 @@ public class StartInput : MonoBehaviour
                 if (entry == null || entry.robotRoot == null) continue;
                 string entryLabel = (entry.label ?? string.Empty).Trim();
 
-                bool match =
-                    !string.IsNullOrEmpty(entryLabel) && (
-                        string.Equals(entryLabel, selectedLabel, System.StringComparison.OrdinalIgnoreCase) ||
-                        string.Equals(entryLabel, selectedRobotKey, System.StringComparison.OrdinalIgnoreCase));
+                bool match = false;
+                if (useLegacySingleSelection)
+                {
+                    match =
+                        !string.IsNullOrEmpty(entryLabel) && (
+                            string.Equals(entryLabel, selectedLabel, System.StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(entryLabel, selectedRobotKey, System.StringComparison.OrdinalIgnoreCase));
+                }
 
                 // Or match by the resolved key going through the alias table
                 // (so "G1" label still matches a "unitree_g1" entry).
                 if (!match && !string.IsNullOrEmpty(entryLabel))
                 {
                     string entryKey = TryResolveRobotKeyQuiet(entryLabel);
-                    if (!string.IsNullOrEmpty(entryKey) &&
-                        string.Equals(entryKey, selectedRobotKey, System.StringComparison.OrdinalIgnoreCase))
+                    if (!string.IsNullOrEmpty(entryKey) && activeKeys.Contains(entryKey))
                     {
                         match = true;
                     }
@@ -1698,13 +1937,13 @@ public class StartInput : MonoBehaviour
             {
                 GameObject go = agent.AgentGameObject;
                 if (go == null) continue;
-                bool match = string.Equals(agent.RobotKey, selectedRobotKey, System.StringComparison.OrdinalIgnoreCase);
+                bool match = activeKeys.Contains(agent.RobotKey);
                 if (!roster.ContainsKey(go) || match)
                     roster[go] = match;
             }
         }
 
-        AddFallbackSceneRobotRoster(roster, selectedLabel, selectedRobotKey);
+        AddFallbackSceneRobotRoster(roster, selectedLabel, CurrentSelectedRobotKey);
 
         if (roster.Count == 0)
         {
@@ -1737,26 +1976,23 @@ public class StartInput : MonoBehaviour
                 selectedRoot = root;
             }
 
-            // ── One-time SetActive(true) bootstrap for never-shown robots ─
-            // If the scene shipped this robot SetActive(false) (typical for
-            // H1, X02Lite, etc. when G1 is the default), it has never run
-            // Awake / Initialize, so neither its IMimicAgent script nor its
-            // Renderer components are alive — Renderer-disable on a
-            // never-activated hierarchy can't make it visible, and a
-            // toggle-active mode change isn't possible because activeSelf
-            // is false. Activate it exactly once here when the user first
-            // selects it. Crucially, we NEVER SetActive(false) anything in
-            // this function — so the full SetActive(false)→(true) cycle
-            // that corrupts ArticulationBody state can never occur. Each
-            // robot's first (and only) SetActive(true) runs Initialize on a
-            // clean bind pose; afterwards Renderer.enabled handles visibility.
-            if (isSelected && !root.activeSelf)
+            // One-time SetActive(true) bootstrap for never-shown robots and
+            // inactive visual children. We still never SetActive(false) here:
+            // hidden robots are renderer-disabled only, so articulation state
+            // is not rebuilt on every visibility change.
+            if (isSelected)
             {
-                root.SetActive(true);
-                bootstrapped++;
-                // Invalidate the renderer cache for this root — the Renderer
-                // components were null before activation, so the cached
-                // array (if any) is full of nulls. Rebuild now.
+                bool rootActivated = EnsureRootActiveForVisibility(root);
+                Renderer[] freshRenderers = root.GetComponentsInChildren<Renderer>(includeInactive: true);
+                int visualNodesActivated = EnsureRendererHierarchyActive(root, freshRenderers);
+                if (rootActivated || visualNodesActivated > 0)
+                {
+                    bootstrapped++;
+                }
+
+                // Selection is the only path that can resurrect a previously
+                // inactive hierarchy, so rebuild the cached component arrays
+                // before enabling renderers/colliders below.
                 _cachedRobotRenderers.Remove(root);
                 _cachedRobotColliders.Remove(root);
             }
@@ -1819,8 +2055,82 @@ public class StartInput : MonoBehaviour
         {
             Debug.Log($"[StartInput] First-time activated {bootstrapped} robot(s) with SetActive(true) bootstrap.");
         }
-        CurrentSelectedRobotRoot = selectedRoot != null ? selectedRoot : ResolveSelectedRobotRootForCamera(selectedLabel, CurrentSelectedRobotKey);
-        Debug.Log($"[StartInput] Visibility switch (Renderer+Collider mode): shown={shown}, hidden={hidden}, selected='{selectedLabel}'.");
+        CurrentSelectedRobotRoot = ResolveFirstSelectedRobotRoot(selectedKeys) ?? selectedRoot;
+        Debug.Log($"[StartInput] Visibility switch (Renderer+Collider mode): shown={shown}, hidden={hidden}, selectedKeys='{string.Join(",", selectedKeys)}'.");
+    }
+
+    private GameObject ResolveFirstSelectedRobotRoot(List<string> selectedKeys)
+    {
+        if (selectedKeys == null)
+        {
+            return null;
+        }
+
+        for (int i = 0; i < selectedKeys.Count; i++)
+        {
+            GameObject root = ResolveRobotRootByKey(selectedKeys[i]);
+            if (root != null)
+            {
+                return root;
+            }
+        }
+
+        return null;
+    }
+
+    private void ApplySelectedRobotDisplayOffsets(HashSet<string> activeKeys)
+    {
+        if (activeKeys == null)
+        {
+            activeKeys = BuildSelectedRobotKeySet();
+        }
+
+        List<string> selectedKeys = BuildSelectedRobotKeyList();
+        float spacing = Mathf.Max(0f, multiRobotDisplaySpacingMeters);
+        float centerIndex = (selectedKeys.Count - 1) * 0.5f;
+
+        if (MimicAgentRegistry.Instance != null)
+        {
+            foreach (IMimicAgent agent in MimicAgentRegistry.Instance.All)
+            {
+                if (agent is IReplayRootOffsetMimicAgent offsetAgent)
+                {
+                    offsetAgent.SetReplayRootOffset(Vector3.zero);
+                }
+            }
+        }
+
+        for (int i = 0; i < selectedKeys.Count; i++)
+        {
+            string key = selectedKeys[i];
+            IMimicAgent agent = ResolveAgentByRobotKey(key);
+            if (agent is IReplayRootOffsetMimicAgent offsetAgent)
+            {
+                offsetAgent.SetReplayRootOffset(new Vector3((i - centerIndex) * spacing, 0f, 0f));
+            }
+        }
+    }
+
+    private void ResetRobotDisplayOffsets()
+    {
+        if (MimicAgentRegistry.Instance == null)
+        {
+            return;
+        }
+
+        foreach (IMimicAgent agent in MimicAgentRegistry.Instance.All)
+        {
+            if (agent is IReplayRootOffsetMimicAgent offsetAgent)
+            {
+                offsetAgent.SetReplayRootOffset(Vector3.zero);
+            }
+        }
+    }
+
+    private GameObject ResolveRobotRootByKey(string robotKeyOrLabel)
+    {
+        string key = TryResolveRobotKeyQuiet(robotKeyOrLabel);
+        return ResolveSelectedRobotRootForCamera(key, key);
     }
 
     private GameObject ResolveSelectedRobotRootForCamera(string selectedLabel, string selectedRobotKey)
@@ -1892,8 +2202,11 @@ public class StartInput : MonoBehaviour
             return;
         }
 
-        bool match = string.Equals(selectedRobotKey, robotKey, System.StringComparison.OrdinalIgnoreCase);
-        if (!match && !string.IsNullOrWhiteSpace(selectedLabel))
+        HashSet<string> activeKeys = BuildSelectedRobotKeySet();
+        bool useLegacySingleSelection = !hasExplicitRobotSelection;
+        bool match = activeKeys.Contains(robotKey) ||
+                     (useLegacySingleSelection && string.Equals(selectedRobotKey, robotKey, System.StringComparison.OrdinalIgnoreCase));
+        if (!match && useLegacySingleSelection && !string.IsNullOrWhiteSpace(selectedLabel))
         {
             string labelKey = TryResolveRobotKeyQuiet(selectedLabel);
             match = string.Equals(labelKey, robotKey, System.StringComparison.OrdinalIgnoreCase);
@@ -1979,6 +2292,12 @@ public class StartInput : MonoBehaviour
             selectedKey = TryResolveRobotKeyQuiet(defaultRobotName);
         }
 
+        if (!hasExplicitRobotSelection && !string.IsNullOrWhiteSpace(selectedKey))
+        {
+            selectedRobotKeys.Clear();
+            selectedRobotKeys.Add(selectedKey);
+        }
+
         RefreshCsvListForSelectedRobot(selectedKey, selectedLabel);
 
         if (!string.IsNullOrWhiteSpace(selectedLabel) || !string.IsNullOrWhiteSpace(selectedKey))
@@ -2054,7 +2373,7 @@ public class StartInput : MonoBehaviour
         ApplyInitialRobotSelectionState();
         string selectedRaw = ResolveSelectedRobotName();
         string selectedKey = TryResolveRobotKeyQuiet(selectedRaw);
-        Debug.LogWarning("[StartInput] Start button clicked.");
+        Debug.Log("[StartInput] Start button clicked.");
         AppendDebugLogLine("[StartInput] Start button clicked.");
         BeginPipelineStartupStatus($"Start clicked. robot='{selectedKey}', validating launch settings...");
         LogVerbose($"Start click: selectedRaw='{selectedRaw}', selectedKey='{selectedKey}', runBashOnClick={runBashOnClick}, monitorCsvOnClick={monitorCsvOnClick}");
@@ -2159,6 +2478,20 @@ public class StartInput : MonoBehaviour
         }
     }
 
+    private void TryClearRealtimeCsvFiles(IReadOnlyList<string> robotKeys, string caller)
+    {
+        if (robotKeys == null || robotKeys.Count == 0)
+        {
+            TryClearCsv(caller);
+            return;
+        }
+
+        foreach (string robotKey in robotKeys)
+        {
+            TryClearCsvPath(ResolveRobotRealtimeCsvPath(robotKey), caller);
+        }
+    }
+
     /// <summary>
     /// Resolves the absolute path of the CSV output file from current inspector settings.
     /// Returns empty string when the path cannot be determined.
@@ -2181,6 +2514,28 @@ public class StartInput : MonoBehaviour
 
         string csvRelative = ResolveCsvRelativePath();
         return ResolvePathFromBaseDirectory(csvRelative, outputRoot);
+    }
+
+    private string ResolveRealtimeCsvRootPath()
+    {
+        if (string.IsNullOrWhiteSpace(resolvedOutputRootPath))
+        {
+            string baseDir = ResolveWorkingDirectoryPath();
+            resolvedOutputRootPath = ResolveOutputRootAbsolutePath(baseDir);
+        }
+
+        return string.IsNullOrWhiteSpace(resolvedOutputRootPath)
+            ? string.Empty
+            : Path.Combine(resolvedOutputRootPath, "csv");
+    }
+
+    private string ResolveRobotRealtimeCsvPath(string robotKey)
+    {
+        string csvRoot = ResolveRealtimeCsvRootPath();
+        string safeKey = string.IsNullOrWhiteSpace(robotKey) ? "unitree_g1" : robotKey.Trim();
+        return string.IsNullOrWhiteSpace(csvRoot)
+            ? string.Empty
+            : Path.Combine(csvRoot, safeKey, "live_motion.csv");
     }
 
     // -------------------------------------------------------------------------
@@ -2237,7 +2592,8 @@ public class StartInput : MonoBehaviour
 
         }
 
-        string selectedRobot = ResolveSelectedRobotName();
+        List<string> selectedRobotKeysForLaunch = BuildSelectedRobotKeyList();
+        string selectedRobot = selectedRobotKeysForLaunch.Count > 0 ? selectedRobotKeysForLaunch[0] : ResolveSelectedRobotName();
         if (string.IsNullOrWhiteSpace(selectedRobot))
         {
             selectedRobot = defaultRobotName.Trim();
@@ -2250,7 +2606,8 @@ public class StartInput : MonoBehaviour
 
         }
 
-        string resolvedRobot = ResolveRobotNameForWham(selectedRobot);
+        string resolvedRobot = selectedRobotKeysForLaunch.Count > 0 ? selectedRobotKeysForLaunch[0] : ResolveRobotNameForWham(selectedRobot);
+        string resolvedRobots = selectedRobotKeysForLaunch.Count > 0 ? string.Join(",", selectedRobotKeysForLaunch) : resolvedRobot;
         if (string.IsNullOrWhiteSpace(resolvedRobot))
         {
             Debug.LogError($"当前机器人不受 WHAM 支持: {selectedRobot}");
@@ -2268,22 +2625,23 @@ public class StartInput : MonoBehaviour
 
         Directory.CreateDirectory(resolvedOutputRootPath);
 
-        // Resolve CSV path now so TryClearCsv and the monitor coroutine share the same value.
-        string csvRelative = ResolveCsvRelativePath();
-        resolvedCsvPath = ResolvePathFromBaseDirectory(csvRelative, resolvedOutputRootPath);
+        // Resolve CSV path now so cleanup, Python and Unity CSV readers agree.
+        string csvRootPath = ResolveRealtimeCsvRootPath();
+        Directory.CreateDirectory(csvRootPath);
+        resolvedCsvPath = ResolveRobotRealtimeCsvPath(resolvedRobot);
 
         // Clear stale CSV before launching so the monitor never sees data from a prior run.
         if (clearCsvOnStart)
         {
-            TryClearCsv("OnStart");
+            TryClearRealtimeCsvFiles(selectedRobotKeysForLaunch, "OnStart");
         }
 
         string resolvedScriptPath = ResolveScriptPath(resolvedWorkingDir);
         string resolvedVideoPath = ResolveVideoPath(resolvedWorkingDir);
         string commandArguments = BuildCommandArguments(executablePrefixArgs, resolvedScriptPath);
         ResetDebugLogFile();
-        bool streamWhamToUnity = enableTcpStreaming && recordWhamVideo;
-        bool streamGmrToUnity = enableTcpStreaming && recordGmrVideo;
+        bool streamWhamToUnity = enableTcpStreaming;
+        bool streamGmrToUnity = enableTcpStreaming;
         bool effectiveTcpStreaming = streamWhamToUnity || streamGmrToUnity;
         bool effectiveRecordGmrVideo = recordGmrVideo && !(enableTcpStreaming && disablePreviewVideoWhenTcpStreaming);
         bool effectiveRecordWhamVideo = recordWhamVideo && !(enableTcpStreaming && disablePreviewVideoWhenTcpStreaming);
@@ -2305,9 +2663,9 @@ public class StartInput : MonoBehaviour
         }
 
         LogVerbose(
-            $"Resolved launch config: selectedRobot='{selectedRobot}', resolvedRobot='{resolvedRobot}', " +
+            $"Resolved launch config: selectedRobot='{selectedRobot}', resolvedRobot='{resolvedRobot}', robots='{resolvedRobots}', " +
             $"workingDir='{resolvedWorkingDir}', script='{resolvedScriptPath}', outputRoot='{resolvedOutputRootPath}', " +
-            $"csv='{resolvedCsvPath}', video='{resolvedVideoPath}', tcp={effectiveTcpStreaming} (raw={enableTcpStreaming}), " +
+            $"csvRoot='{csvRootPath}', csv='{resolvedCsvPath}', video='{resolvedVideoPath}', tcp={effectiveTcpStreaming} (raw={enableTcpStreaming}), " +
             $"tcpWham={streamWhamToUnity}, tcpGmr={streamGmrToUnity}, track={track}, " +
             $"recordGmr={effectiveRecordGmrVideo} (raw={recordGmrVideo}), recordWham={effectiveRecordWhamVideo} (raw={recordWhamVideo}), " +
             $"gmrTorchDevice='{launchGmrTorchDevice}' (requested='{requestedGmrTorchDevice}')");
@@ -2354,6 +2712,22 @@ public class StartInput : MonoBehaviour
 
             startInfo.EnvironmentVariables["OUTPUT_ROOT"] = resolvedOutputRootPath;
             startInfo.EnvironmentVariables["ROBOT"] = resolvedRobot;
+            startInfo.EnvironmentVariables["ROBOTS"] = resolvedRobots;
+            startInfo.EnvironmentVariables["CSV_ROOT"] = csvRootPath;
+            startInfo.EnvironmentVariables["CSV_PATH"] = resolvedCsvPath;
+            int launchRobotCount = Mathf.Max(1, selectedRobotKeysForLaunch.Count);
+            bool launchLowMemoryMode = launchRobotCount >= 3;
+            float launchGmrPreviewFps = launchLowMemoryMode
+                ? Mathf.Min(Mathf.Clamp(gmrPreviewFps, 0.5f, 30f), 1.5f)
+                : Mathf.Clamp(gmrPreviewFps, 0.5f, 30f);
+            int launchWhamRenderQueueSize = launchLowMemoryMode ? 2 : 16;
+            int launchPipelineQueueSize = launchLowMemoryMode ? 4 : 10;
+            startInfo.EnvironmentVariables["WHAM_LOW_MEMORY_MODE"] = launchLowMemoryMode ? "1" : "0";
+            startInfo.EnvironmentVariables["WHAM_PIPELINE_QUEUE_SIZE"] = launchPipelineQueueSize.ToString(CultureInfo.InvariantCulture);
+            // Keep this compatible with older PyTorch builds. Some versions reject
+            // expandable_segments and abort before WHAM starts.
+            startInfo.EnvironmentVariables["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:64";
+            startInfo.EnvironmentVariables["CUDA_MODULE_LOADING"] = "LAZY";
             // Disable run.ps1's legacy RECORD_VIDEO fallback. The split WHAM/GMR
             // flags below are the only recording source of truth from the HUD.
             startInfo.EnvironmentVariables["RECORD_VIDEO"] = "0";
@@ -2385,6 +2759,8 @@ public class StartInput : MonoBehaviour
             startInfo.EnvironmentVariables["GMR_TORCH_DEVICE"] = launchGmrTorchDevice;
             startInfo.EnvironmentVariables["GMR_MAX_ITER"] = Mathf.Max(1, gmrMaxIter).ToString(CultureInfo.InvariantCulture);
             startInfo.EnvironmentVariables["GMR_CSV_FLUSH_INTERVAL"] = Mathf.Max(1, gmrCsvFlushInterval).ToString(CultureInfo.InvariantCulture);
+            startInfo.EnvironmentVariables["CSV_FLUSH_ROWS"] = Mathf.Max(1, gmrCsvFlushInterval).ToString(CultureInfo.InvariantCulture);
+            startInfo.EnvironmentVariables["CSV_FLUSH_INTERVAL_MS"] = "100";
             startInfo.EnvironmentVariables["WHAM_TAIL_FLUSH_INTERVAL"] = Mathf.Max(1, whamTailFlushInterval).ToString(CultureInfo.InvariantCulture);
             startInfo.EnvironmentVariables["PIPELINE_HEARTBEAT_FRAMES"] = Mathf.Max(1, pipelineHeartbeatFrames).ToString(CultureInfo.InvariantCulture);
             startInfo.EnvironmentVariables["CAMERA_FOLLOW"] = (gmrCameraFollow || track) ? "1" : "0";
@@ -2393,6 +2769,15 @@ public class StartInput : MonoBehaviour
             startInfo.EnvironmentVariables["CAMERA_DISTANCE_SCALE"] = Mathf.Max(0.1f, gmrCameraDistanceScale).ToString("F3", CultureInfo.InvariantCulture);
             startInfo.EnvironmentVariables["GMR_TCP_RENDER_WIDTH"] = Mathf.Max(320, gmrTcpRenderWidth).ToString(CultureInfo.InvariantCulture);
             startInfo.EnvironmentVariables["GMR_TCP_RENDER_HEIGHT"] = Mathf.Max(240, gmrTcpRenderHeight).ToString(CultureInfo.InvariantCulture);
+            startInfo.EnvironmentVariables["GMR_PREVIEW_FPS"] = launchGmrPreviewFps.ToString("F2", CultureInfo.InvariantCulture);
+            startInfo.EnvironmentVariables["WHAM_RENDER_QUEUE_SIZE"] = launchWhamRenderQueueSize.ToString(CultureInfo.InvariantCulture);
+            startInfo.EnvironmentVariables["GMR_WORKER_QUEUE_SIZE"] = "1";
+            if (launchLowMemoryMode)
+            {
+                AppendDebugLogLine(
+                    $"[StartInput] Low-memory realtime mode enabled for {launchRobotCount} robots: " +
+                    $"previewFps={launchGmrPreviewFps:F2}, whamRenderQueue={launchWhamRenderQueueSize}, pipelineQueue={launchPipelineQueueSize}.");
+            }
             if (!string.IsNullOrWhiteSpace(gmrCameraAzimuth))
             {
                 startInfo.EnvironmentVariables["CAMERA_AZIMUTH"] = gmrCameraAzimuth.Trim();
@@ -2452,9 +2837,11 @@ public class StartInput : MonoBehaviour
             string pipelineEnvLine =
                 "[StartInput] Pipeline env: " +
                 "ROBOT=" + resolvedRobot +
+                ", ROBOTS=" + resolvedRobots +
                 " (raw=" + selectedRobot + ")" +
                 ", VIDEO=" + (string.IsNullOrWhiteSpace(resolvedVideoPath) ? "<run.ps1 default>" : resolvedVideoPath) +
                 ", OUTPUT_ROOT=" + resolvedOutputRootPath +
+                ", CSV_ROOT=" + csvRootPath +
                 ", CSV=" + resolvedCsvPath +
                 ", TCP=" + (effectiveTcpStreaming ? "1" : "0") +
                 " (raw=" + (enableTcpStreaming ? "1" : "0") + ")" +
@@ -2738,6 +3125,10 @@ public class StartInput : MonoBehaviour
             return false;
         }
 
+        return StartMultiCsvMonitorForSelectedRobots();
+    }
+#if false
+
         string csvName = ResolveCsvRelativePath();
         resolvedCsvPath = ResolvePathFromBaseDirectory(csvName, resolvedOutputRootPath);
         if (string.IsNullOrWhiteSpace(resolvedCsvPath))
@@ -2787,10 +3178,113 @@ public class StartInput : MonoBehaviour
         return true;
     }
 
+#endif
+    private bool StartMultiCsvMonitorForSelectedRobots()
+    {
+        List<string> robotKeys = BuildSelectedRobotKeyList();
+        if (robotKeys.Count == 0)
+        {
+            Debug.LogError("[StartInput] No robot is selected, cannot start realtime CSV monitor.");
+            return false;
+        }
+
+        string csvRootPath = ResolveRealtimeCsvRootPath();
+        if (string.IsNullOrWhiteSpace(csvRootPath))
+        {
+            Debug.LogError("[StartInput] Realtime CSV root path is empty; cannot start monitor.");
+            return false;
+        }
+
+        StopCsvMonitor();
+        EndActiveRealtimeCsv();
+        realtimeRobotStates.Clear();
+
+        foreach (string robotKey in robotKeys)
+        {
+            IMimicAgent mimicAgent = ResolveAgentByRobotKey(robotKey);
+            IRealtimeCsvMimicAgent csvAgent = mimicAgent as IRealtimeCsvMimicAgent;
+            if (mimicAgent == null || csvAgent == null)
+            {
+                Debug.LogError($"[StartInput] Selected robot '{robotKey}' does not provide realtime CSV ingestion.");
+                realtimeRobotStates.Clear();
+                return false;
+            }
+
+            string csvPath = ResolveRobotRealtimeCsvPath(robotKey);
+            if (string.IsNullOrWhiteSpace(csvPath))
+            {
+                Debug.LogError($"[StartInput] Could not resolve realtime CSV path for robot '{robotKey}'.");
+                realtimeRobotStates.Clear();
+                return false;
+            }
+
+            realtimeRobotStates[robotKey] = new RealtimeRobotState
+            {
+                RobotKey = robotKey,
+                CsvPath = csvPath,
+                MimicAgent = mimicAgent,
+                CsvAgent = csvAgent
+            };
+        }
+
+        RealtimeRobotState firstState = realtimeRobotStates[robotKeys[0]];
+        activeRealtimeMimicAgent = firstState.MimicAgent;
+        activeRealtimeCsvAgent = firstState.CsvAgent;
+        resolvedCsvPath = firstState.CsvPath;
+
+        if (robotKeys.Count > 1)
+        {
+            ApplySelectedRobotDisplayOffsets(new HashSet<string>(robotKeys, System.StringComparer.OrdinalIgnoreCase));
+        }
+        else
+        {
+            ResetRobotDisplayOffsets();
+        }
+
+        lastCsvLength = -1;
+        lastCsvWriteTimeUtc = System.DateTime.MinValue;
+        replayBootstrapped = false;
+        csvMissingLogged = false;
+        csvMonitorStartUtc = System.DateTime.UtcNow;
+        lastCsvNoDataWarningUtc = System.DateTime.MinValue;
+        firstNonEmptyCsvLogged = false;
+        csvReadOffset = 0;
+        csvPendingText = string.Empty;
+        realtimeSourceRowsRead = 0;
+        ResetRealtimeCsvSafetyGate();
+        pendingRealtimeRows.Clear();
+        DrainRealtimeCsvQueues();
+        if (writeDebugLogFile && string.IsNullOrWhiteSpace(resolvedDebugLogPath))
+        {
+            resolvedDebugLogPath = ResolveDebugLogPath();
+            EnsureDebugLogWriter();
+        }
+
+        foreach (RealtimeRobotState state in realtimeRobotStates.Values)
+        {
+            StartCsvWorker(state.CsvPath, state.CsvAgent.ExpectedCsvColumns, state.RobotKey);
+        }
+
+        LogVerbose(
+            $"CSV workers started: robots='{string.Join(",", robotKeys)}', root='{csvRootPath}', pollInterval={csvPollInterval}, realtimeWarmupSourceRows={realtimeWarmupSourceRows}");
+
+        Debug.Log($"[StartInput] Started realtime CSV monitor for robots: {string.Join(", ", robotKeys)}; csvRoot={csvRootPath}");
+        return true;
+    }
 
     private void StopCsvMonitor()
     {
         csvWorkerRunning = false;
+        for (int i = 0; i < csvWorkerThreads.Count; i++)
+        {
+            Thread thread = csvWorkerThreads[i];
+            if (thread != null && thread.IsAlive)
+            {
+                try { thread.Join(250); } catch { }
+            }
+        }
+        csvWorkerThreads.Clear();
+
         Thread worker = csvWorkerThread;
         if (worker != null && worker.IsAlive)
         {
@@ -2806,6 +3300,7 @@ public class StartInput : MonoBehaviour
         }
 
         DrainRealtimeCsvQueues();
+        ResetRobotDisplayOffsets();
     }
 
     private void DrainRealtimeCsvQueues()
@@ -2833,6 +3328,7 @@ public class StartInput : MonoBehaviour
             Name = "StartInput-CsvWorker",
             IsBackground = true
         };
+        csvWorkerThreads.Add(csvWorkerThread);
         csvWorkerThread.Start();
     }
 
@@ -2953,7 +3449,7 @@ public class StartInput : MonoBehaviour
                             lastChangeLogUtc = rowsUtc;
                         }
 
-                        realtimeCsvRowsQueue.Enqueue(new RealtimeCsvBatch(rows, producerFps));
+                        realtimeCsvRowsQueue.Enqueue(new RealtimeCsvBatch(robotKey, rows, producerFps));
                     }
                 }
 
@@ -3291,114 +3787,179 @@ public class StartInput : MonoBehaviour
 
     private void ApplyRealtimeCsvRows(List<float[]> rows, float producerFps)
     {
+        ApplyRealtimeCsvRows(ResolvePrimarySelectedRobotKey(), rows, producerFps);
+    }
+
+    private void ApplyRealtimeCsvRows(string robotKey, List<float[]> rows, float producerFps)
+    {
         if (rows == null || rows.Count == 0)
         {
             return;
         }
 
-        if (activeRealtimeMimicAgent == null || activeRealtimeCsvAgent == null)
+        RealtimeRobotState state = null;
+        if (string.IsNullOrWhiteSpace(robotKey) || !realtimeRobotStates.TryGetValue(robotKey, out state))
+        {
+            if (activeRealtimeMimicAgent != null && activeRealtimeCsvAgent != null)
+            {
+                state = new RealtimeRobotState
+                {
+                    RobotKey = activeRealtimeMimicAgent.RobotKey,
+                    CsvPath = resolvedCsvPath,
+                    MimicAgent = activeRealtimeMimicAgent,
+                    CsvAgent = activeRealtimeCsvAgent,
+                    ReplayBootstrapped = replayBootstrapped,
+                    SourceRowsRead = realtimeSourceRowsRead,
+                    LastAcceptedRow = lastAcceptedRealtimeRow,
+                    ConsecutiveRejectedRows = consecutiveRejectedRealtimeRows,
+                    SafetyWarningLogged = realtimeSafetyWarningLogged
+                };
+                state.PendingRows.AddRange(pendingRealtimeRows);
+            }
+        }
+
+        if (state == null || state.MimicAgent == null || state.CsvAgent == null)
         {
             Debug.LogWarning("[StartInput] Realtime CSV rows arrived but no realtime-capable agent is active.");
             return;
         }
 
         int receivedRowCount = rows.Count;
-        rows = FilterSafeRealtimeCsvRows(rows);
+        rows = FilterSafeRealtimeCsvRows(rows, state);
         if (rows.Count == 0)
         {
             return;
         }
 
-        realtimeSourceRowsRead += receivedRowCount;
+        state.SourceRowsRead += receivedRowCount;
         float playbackFps = ClampRealtimeCsvFps(producerFps);
-        float playbackBufferSeconds = ResolveRealtimePlaybackBufferSeconds(activeRealtimeMimicAgent.RobotKey, playbackFps);
-        activeRealtimeCsvAgent.SetRealtimePlaybackRate(playbackFps, playbackBufferSeconds);
+        float playbackBufferSeconds = ResolveRealtimePlaybackBufferSeconds(state.MimicAgent.RobotKey, playbackFps);
+        state.CsvAgent.SetRealtimePlaybackRate(playbackFps, playbackBufferSeconds);
 
-        if (!replayBootstrapped)
+        if (!state.ReplayBootstrapped)
         {
-            pendingRealtimeRows.AddRange(rows);
+            state.PendingRows.AddRange(rows);
             int warmupRows = Mathf.Max(1, realtimeWarmupSourceRows);
-            if (pendingRealtimeRows.Count < warmupRows)
+            if (state.PendingRows.Count < warmupRows)
             {
                 return;
             }
 
-            if (!activeRealtimeCsvAgent.BeginRealtimeCsv())
+            if (!state.CsvAgent.BeginRealtimeCsv())
             {
-                Debug.LogError($"[StartInput] Realtime CSV bootstrap failed for '{activeRealtimeMimicAgent.RobotKey}': agent refused BeginRealtimeCsv.");
-                AbortRealtimeCsvBootstrap();
+                Debug.LogError($"[StartInput] Realtime CSV bootstrap failed for '{state.MimicAgent.RobotKey}': agent refused BeginRealtimeCsv.");
+                AbortRealtimeCsvBootstrap(state);
                 return;
             }
 
-            if (!activeRealtimeCsvAgent.AppendRealtimeCsvRows(pendingRealtimeRows))
+            if (!state.CsvAgent.AppendRealtimeCsvRows(state.PendingRows))
             {
-                Debug.LogWarning($"[StartInput] Initial realtime CSV append produced no frames for '{activeRealtimeMimicAgent.RobotKey}'.");
-                AbortRealtimeCsvBootstrap();
+                Debug.LogWarning($"[StartInput] Initial realtime CSV append produced no frames for '{state.MimicAgent.RobotKey}'.");
+                AbortRealtimeCsvBootstrap(state);
                 return;
             }
 
-            activeRealtimeMimicAgent.UseExternalReplayData = true;
-            activeRealtimeMimicAgent.ReplayMode = true;
-            pendingRealtimeRows.Clear();
-            if (MimicAgentRegistry.Instance != null)
+            state.MimicAgent.UseExternalReplayData = true;
+            state.MimicAgent.ReplayMode = true;
+            state.PendingRows.Clear();
+            if (MimicAgentRegistry.Instance != null && realtimeRobotStates.Count <= 1)
             {
-                MimicAgentRegistry.Instance.SetActiveTarget(activeRealtimeMimicAgent);
+                MimicAgentRegistry.Instance.SetActiveTarget(state.MimicAgent);
             }
 
             if (restartEpisodeOnFirstCsv)
             {
-                activeRealtimeMimicAgent.RequestEndEpisode();
+                state.MimicAgent.RequestEndEpisode();
             }
 
-            replayBootstrapped = true;
+            state.ReplayBootstrapped = true;
             string playbackStartedMessage =
-                $"[StartInput] Realtime CSV playback started for '{activeRealtimeMimicAgent.RobotKey}' after {realtimeSourceRowsRead} source rows: {resolvedCsvPath}. " +
-                $"expectedColumns={activeRealtimeCsvAgent.ExpectedCsvColumns}, warmupRows={Mathf.Max(1, realtimeWarmupSourceRows)}, " +
+                $"[StartInput] Realtime CSV playback started for '{state.MimicAgent.RobotKey}' after {state.SourceRowsRead} source rows: {state.CsvPath}. " +
+                $"expectedColumns={state.CsvAgent.ExpectedCsvColumns}, warmupRows={Mathf.Max(1, realtimeWarmupSourceRows)}, " +
                 $"producerFps={playbackFps:F2}, playbackBuffer={playbackBufferSeconds:F2}s, selectedRobot='{ResolveSelectedRobotName()}', bufferedBatches={realtimeCsvRowsQueue.Count}, " +
                 $"rootMapping=csv[0..2]->Unity(-y,z,x), quat=csv[3..6]->Unity(-y,z,x,-w)";
-            FinishPipelineStartup(playbackStartedMessage);
+            if (AllRealtimeRobotStatesBootstrapped())
+            {
+                FinishPipelineStartup(playbackStartedMessage);
+            }
+            else
+            {
+                AdvancePipelineStartup(
+                    "Waiting for all selected robots",
+                    playbackStartedMessage,
+                    0.86f,
+                    0.01f);
+            }
             Debug.Log(playbackStartedMessage);
             return;
         }
 
-        activeRealtimeCsvAgent.AppendRealtimeCsvRows(rows);
+        state.CsvAgent.AppendRealtimeCsvRows(rows);
     }
 
-    private List<float[]> FilterSafeRealtimeCsvRows(List<float[]> rows)
+    private bool AllRealtimeRobotStatesBootstrapped()
+    {
+        if (realtimeRobotStates.Count == 0)
+        {
+            return false;
+        }
+
+        foreach (RealtimeRobotState state in realtimeRobotStates.Values)
+        {
+            if (state == null || !state.ReplayBootstrapped)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private List<float[]> FilterSafeRealtimeCsvRows(List<float[]> rows, RealtimeRobotState state)
     {
         if (!enableRealtimeCsvSafetyGate || rows == null || rows.Count == 0)
         {
             return rows;
         }
 
-        int expectedColumns = activeRealtimeCsvAgent != null ? activeRealtimeCsvAgent.ExpectedCsvColumns : 0;
+        int expectedColumns = state?.CsvAgent != null ? state.CsvAgent.ExpectedCsvColumns : 0;
         var accepted = new List<float[]>(rows.Count);
         for (int i = 0; i < rows.Count; i++)
         {
             float[] row = rows[i];
-            if (IsRealtimeCsvRowSafe(row, expectedColumns, out string reason))
+            if (IsRealtimeCsvRowSafe(row, expectedColumns, state?.LastAcceptedRow, out string reason))
             {
                 accepted.Add(row);
-                lastAcceptedRealtimeRow = row;
-                consecutiveRejectedRealtimeRows = 0;
-                realtimeSafetyWarningLogged = false;
+                if (state != null)
+                {
+                    state.LastAcceptedRow = row;
+                    state.ConsecutiveRejectedRows = 0;
+                    state.SafetyWarningLogged = false;
+                }
                 continue;
             }
 
-            consecutiveRejectedRealtimeRows++;
+            if (state != null)
+            {
+                state.ConsecutiveRejectedRows++;
+            }
+            int rejectedRows = state?.ConsecutiveRejectedRows ?? 1;
             string message =
-                $"[StartInput] Realtime CSV safety gate rejected row for '{activeRealtimeMimicAgent?.RobotKey ?? "<none>"}': {reason}. " +
-                $"consecutiveRejected={consecutiveRejectedRealtimeRows}/{Mathf.Max(1, realtimeMaxConsecutiveRejectedRows)}, csv='{resolvedCsvPath}'.";
-            if (!realtimeSafetyWarningLogged || consecutiveRejectedRealtimeRows >= Mathf.Max(1, realtimeMaxConsecutiveRejectedRows))
+                $"[StartInput] Realtime CSV safety gate rejected row for '{state?.RobotKey ?? "<none>"}': {reason}. " +
+                $"consecutiveRejected={rejectedRows}/{Mathf.Max(1, realtimeMaxConsecutiveRejectedRows)}, csv='{state?.CsvPath ?? resolvedCsvPath}'.";
+            if (state == null || !state.SafetyWarningLogged || rejectedRows >= Mathf.Max(1, realtimeMaxConsecutiveRejectedRows))
             {
                 Debug.LogWarning(message);
                 AppendDebugLogLine(message);
-                realtimeSafetyWarningLogged = true;
+                if (state != null)
+                {
+                    state.SafetyWarningLogged = true;
+                }
             }
 
-            if (consecutiveRejectedRealtimeRows >= Mathf.Max(1, realtimeMaxConsecutiveRejectedRows))
+            if (rejectedRows >= Mathf.Max(1, realtimeMaxConsecutiveRejectedRows))
             {
-                AbortUnsafeRealtimeCsv(message);
+                AbortUnsafeRealtimeCsv(state, message);
                 break;
             }
         }
@@ -3406,7 +3967,7 @@ public class StartInput : MonoBehaviour
         return accepted;
     }
 
-    private bool IsRealtimeCsvRowSafe(float[] row, int expectedColumns, out string reason)
+    private bool IsRealtimeCsvRowSafe(float[] row, int expectedColumns, float[] previousAcceptedRow, out string reason)
     {
         reason = string.Empty;
         if (row == null)
@@ -3467,13 +4028,13 @@ public class StartInput : MonoBehaviour
             }
         }
 
-        if (lastAcceptedRealtimeRow == null || lastAcceptedRealtimeRow.Length != row.Length)
+        if (previousAcceptedRow == null || previousAcceptedRow.Length != row.Length)
         {
             return true;
         }
 
         float rootJump = Vector3.Distance(
-            new Vector3(lastAcceptedRealtimeRow[0], lastAcceptedRealtimeRow[1], lastAcceptedRealtimeRow[2]),
+            new Vector3(previousAcceptedRow[0], previousAcceptedRow[1], previousAcceptedRow[2]),
             new Vector3(row[0], row[1], row[2]));
         if (rootJump > Mathf.Max(0.01f, realtimeMaxRootJumpMeters))
         {
@@ -3483,7 +4044,7 @@ public class StartInput : MonoBehaviour
 
         if (row.Length >= 7)
         {
-            Quaternion previous = NormalizeCsvQuaternion(lastAcceptedRealtimeRow);
+            Quaternion previous = NormalizeCsvQuaternion(previousAcceptedRow);
             Quaternion current = NormalizeCsvQuaternion(row);
             float angle = Quaternion.Angle(previous, current);
             if (angle > Mathf.Max(1f, realtimeMaxRootRotationJumpDegrees))
@@ -3496,7 +4057,7 @@ public class StartInput : MonoBehaviour
         float jointLimit = Mathf.Max(0.01f, realtimeMaxJointJumpRadians);
         for (int i = 7; i < row.Length; i++)
         {
-            float delta = Mathf.Abs(row[i] - lastAcceptedRealtimeRow[i]);
+            float delta = Mathf.Abs(row[i] - previousAcceptedRow[i]);
             if (delta > jointLimit)
             {
                 reason = $"joint column {i} jump {delta:F3}rad > {jointLimit:F3}rad";
@@ -3527,14 +4088,39 @@ public class StartInput : MonoBehaviour
         realtimeSafetyWarningLogged = false;
     }
 
-    private void AbortUnsafeRealtimeCsv(string message)
+    private void AbortUnsafeRealtimeCsv(RealtimeRobotState state, string message)
     {
         SetPipelineStartupError(message);
-        StopCsvMonitor();
+        if (state != null)
+        {
+            state.CsvAgent?.EndRealtimeCsv();
+            state.PendingRows.Clear();
+            state.ReplayBootstrapped = false;
+            state.MimicAgent.UseExternalReplayData = false;
+            state.MimicAgent.ReplayMode = false;
+        }
     }
 
     private void AbortRealtimeCsvBootstrap()
     {
+        AbortRealtimeCsvBootstrap(null);
+    }
+
+    private void AbortRealtimeCsvBootstrap(RealtimeRobotState state)
+    {
+        if (state != null)
+        {
+            state.PendingRows.Clear();
+            state.ReplayBootstrapped = false;
+            if (state.MimicAgent != null)
+            {
+                state.MimicAgent.UseExternalReplayData = false;
+                state.MimicAgent.ReplayMode = false;
+            }
+            state.CsvAgent?.EndRealtimeCsv();
+            return;
+        }
+
         pendingRealtimeRows.Clear();
         replayBootstrapped = false;
 
@@ -3543,7 +4129,6 @@ public class StartInput : MonoBehaviour
             activeRealtimeMimicAgent.UseExternalReplayData = false;
             activeRealtimeMimicAgent.ReplayMode = false;
         }
-
         StopCsvMonitor();
         EndActiveRealtimeCsv();
         SetRealtimeDropdownsInteractable(true);
@@ -3552,6 +4137,27 @@ public class StartInput : MonoBehaviour
     private void ResetRealtimeCsvReader(string reason)
     {
         LogVerbose($"Reset realtime CSV reader: {reason}");
+        foreach (RealtimeRobotState state in realtimeRobotStates.Values)
+        {
+            if (state == null)
+            {
+                continue;
+            }
+
+            state.SourceRowsRead = 0;
+            state.LastAcceptedRow = null;
+            state.ConsecutiveRejectedRows = 0;
+            state.SafetyWarningLogged = false;
+            state.ReplayBootstrapped = false;
+            state.PendingRows.Clear();
+            state.CsvAgent?.EndRealtimeCsv();
+            if (state.MimicAgent != null)
+            {
+                state.MimicAgent.UseExternalReplayData = false;
+                state.MimicAgent.ReplayMode = false;
+            }
+        }
+
         csvReadOffset = 0;
         csvPendingText = string.Empty;
         realtimeSourceRowsRead = 0;
@@ -3569,6 +4175,23 @@ public class StartInput : MonoBehaviour
 
     private void EndActiveRealtimeCsv()
     {
+        foreach (RealtimeRobotState state in realtimeRobotStates.Values)
+        {
+            if (state == null)
+            {
+                continue;
+            }
+
+            state.CsvAgent?.EndRealtimeCsv();
+            state.PendingRows.Clear();
+            state.ReplayBootstrapped = false;
+            state.SourceRowsRead = 0;
+            state.LastAcceptedRow = null;
+            state.ConsecutiveRejectedRows = 0;
+            state.SafetyWarningLogged = false;
+        }
+        realtimeRobotStates.Clear();
+
         activeRealtimeCsvAgent?.EndRealtimeCsv();
         activeRealtimeCsvAgent = null;
         activeRealtimeMimicAgent = null;
@@ -3578,6 +4201,7 @@ public class StartInput : MonoBehaviour
         realtimeSourceRowsRead = 0;
         ResetRealtimeCsvSafetyGate();
         replayBootstrapped = false;
+        ResetRobotDisplayOffsets();
     }
 
     private void MaybeWarnCsvStillEmpty()
@@ -3617,10 +4241,48 @@ public class StartInput : MonoBehaviour
             "[StartInput] live_motion.csv is still empty. " +
             $"elapsed={(now - csvMonitorStartUtc).TotalSeconds:F1}s, " +
             $"processAlive={processAlive}, pid={(processId >= 0 ? processId.ToString() : "<none>")}, " +
-            $"csv='{resolvedCsvPath}'. " +
+            $"csv='{resolvedCsvPath}', robots=[{BuildRealtimeCsvStatusSummary()}]. " +
             "Check [Pipeline]/[Pipeline-ERR] logs for [Input], [Detect], [WHAM], [GMR], and [TCP] messages.";
         Debug.LogWarning(warning);
         AppendDebugLogLine(warning);
+    }
+
+    private string BuildRealtimeCsvStatusSummary()
+    {
+        if (realtimeRobotStates.Count == 0)
+        {
+            return "<none>";
+        }
+
+        var parts = new List<string>(realtimeRobotStates.Count);
+        foreach (RealtimeRobotState state in realtimeRobotStates.Values)
+        {
+            if (state == null)
+            {
+                continue;
+            }
+
+            long length = -1;
+            bool exists = false;
+            try
+            {
+                if (!string.IsNullOrWhiteSpace(state.CsvPath))
+                {
+                    var info = new FileInfo(state.CsvPath);
+                    exists = info.Exists;
+                    length = exists ? info.Length : -1;
+                }
+            }
+            catch
+            {
+                length = -1;
+            }
+
+            parts.Add(
+                $"{state.RobotKey}:exists={exists},bytes={length},rows={state.SourceRowsRead},pending={state.PendingRows.Count},boot={state.ReplayBootstrapped}");
+        }
+
+        return parts.Count > 0 ? string.Join("; ", parts) : "<none>";
     }
 
     /// <summary>
@@ -3686,6 +4348,33 @@ public class StartInput : MonoBehaviour
         }
 
         targetAgent = null;
+        return null;
+    }
+
+    private IMimicAgent ResolveAgentByRobotKey(string robotKey)
+    {
+        string selectedKey = ResolveRobotNameForWham(robotKey);
+        if (string.IsNullOrWhiteSpace(selectedKey))
+        {
+            return null;
+        }
+
+        if (MimicAgentRegistry.Instance != null)
+        {
+            IMimicAgent byKey = MimicAgentRegistry.Instance.FindByKey(selectedKey);
+            if (byKey != null && byKey.AgentGameObject != null)
+            {
+                return byKey;
+            }
+        }
+
+        if (targetAgentBehaviour is IMimicAgent pinned &&
+            pinned.AgentGameObject != null &&
+            string.Equals(pinned.RobotKey, selectedKey, System.StringComparison.OrdinalIgnoreCase))
+        {
+            return pinned;
+        }
+
         return null;
     }
 
@@ -4172,6 +4861,72 @@ public class StartInput : MonoBehaviour
         }
 
         return string.Empty;
+    }
+
+    private List<string> BuildSelectedRobotKeyList()
+    {
+        var result = new List<string>();
+        foreach (string supported in MultiRobotDisplayOrder)
+        {
+            if (selectedRobotKeys.Contains(supported))
+            {
+                result.Add(supported);
+            }
+        }
+
+        foreach (string supported in SupportedRobotNames)
+        {
+            if (selectedRobotKeys.Contains(supported) && !result.Contains(supported))
+            {
+                result.Add(supported);
+            }
+        }
+
+        if (result.Count > 0)
+        {
+            return result;
+        }
+
+        if (hasExplicitRobotSelection)
+        {
+            return result;
+        }
+
+        string selected = ResolveSelectedRobotName();
+        string selectedKey = TryResolveRobotKeyQuiet(selected);
+        if (string.IsNullOrWhiteSpace(selectedKey))
+        {
+            selectedKey = TryResolveRobotKeyQuiet(defaultRobotName);
+        }
+
+        if (!string.IsNullOrWhiteSpace(selectedKey))
+        {
+            result.Add(selectedKey);
+        }
+
+        return result;
+    }
+
+    private HashSet<string> BuildSelectedRobotKeySet()
+    {
+        return new HashSet<string>(BuildSelectedRobotKeyList(), System.StringComparer.OrdinalIgnoreCase);
+    }
+
+    private string ResolvePrimarySelectedRobotKey()
+    {
+        List<string> keys = BuildSelectedRobotKeyList();
+        return keys.Count > 0 ? keys[0] : string.Empty;
+    }
+
+    private void RefreshRegisteredCsvBrowsers()
+    {
+        foreach (var kv in robotCsvBrowsers)
+        {
+            if (kv.Value != null)
+            {
+                kv.Value.SetCsvRobotFilter(kv.Key);
+            }
+        }
     }
 
     private void ResolveRoboListReferences()

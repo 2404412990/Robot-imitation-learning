@@ -14,7 +14,7 @@ using UnityEditor;
 #endif
 using Gewu.Imitation;
 
-public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelectableMimicAgent
+public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelectableMimicAgent, IReplayRootOffsetMimicAgent
 {
     public bool train = false;
     public bool replay = false;
@@ -36,6 +36,42 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
     [Tooltip("If ON, print every Unity revolute joint's GameObject name on Initialize() so the " +
              "user can verify the H1 prefab traversal still yields URDF order.")]
     [SerializeField] private bool logJointMappingOnStart = true;
+    [SerializeField] private bool logMirrorRootRotationDiagnostics = false;
+    [SerializeField] private int mirrorRootRotationLogInterval = 120;
+    [SerializeField] private bool logRetargetCalibrationDiagnostics = false;
+    [SerializeField] private int retargetCalibrationLogInterval = 120;
+
+    private static readonly string[] H1JointNames =
+    {
+        "left_hip_yaw", "left_hip_roll", "left_hip_pitch", "left_knee", "left_ankle",
+        "right_hip_yaw", "right_hip_roll", "right_hip_pitch", "right_knee", "right_ankle",
+        "torso",
+        "left_shoulder_pitch", "left_shoulder_roll", "left_shoulder_yaw", "left_elbow",
+        "right_shoulder_pitch", "right_shoulder_roll", "right_shoulder_yaw", "right_elbow",
+    };
+
+    private static readonly UnityRetargetCalibrationEntry[] H1UnityCalibration =
+    {
+        new UnityRetargetCalibrationEntry(0,  "left_hip_yaw",          1f, 0f),
+        new UnityRetargetCalibrationEntry(1,  "left_hip_roll",         1f, 0f),
+        new UnityRetargetCalibrationEntry(2,  "left_hip_pitch",        1f, 0f),
+        new UnityRetargetCalibrationEntry(3,  "left_knee",             1f, 0f),
+        new UnityRetargetCalibrationEntry(4,  "left_ankle",            1f, 0f),
+        new UnityRetargetCalibrationEntry(5,  "right_hip_yaw",         1f, 0f),
+        new UnityRetargetCalibrationEntry(6,  "right_hip_roll",        1f, 0f),
+        new UnityRetargetCalibrationEntry(7,  "right_hip_pitch",       1f, 0f),
+        new UnityRetargetCalibrationEntry(8,  "right_knee",            1f, 0f),
+        new UnityRetargetCalibrationEntry(9,  "right_ankle",           1f, 0f),
+        new UnityRetargetCalibrationEntry(10, "torso",                 1f, 0f),
+        new UnityRetargetCalibrationEntry(11, "left_shoulder_pitch",   1f, 0f),
+        new UnityRetargetCalibrationEntry(12, "left_shoulder_roll",    1f, 0f),
+        new UnityRetargetCalibrationEntry(13, "left_shoulder_yaw",     1f, 0f),
+        new UnityRetargetCalibrationEntry(14, "left_elbow",            1f, 0f),
+        new UnityRetargetCalibrationEntry(15, "right_shoulder_pitch",  1f, 0f),
+        new UnityRetargetCalibrationEntry(16, "right_shoulder_roll",   1f, 0f),
+        new UnityRetargetCalibrationEntry(17, "right_shoulder_yaw",    1f, 0f),
+        new UnityRetargetCalibrationEntry(18, "right_elbow",           1f, 0f),
+    };
 
     /// <summary>
     /// Dump the Unity-joint-index → joint-name → CSV-index correspondence to
@@ -118,32 +154,88 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
 
     private bool _isClone = false;
     private bool isRobotSelectedInScene = true;
+    private bool holdSelectionNeutralPose;
+    private Vector3 replayRootOffset = Vector3.zero;
+    private int mirrorDiagnosticFrame;
+    private int retargetCalibrationLogCounter;
+
+    private bool ShouldHoldNeutralPose()
+    {
+        return !replay && !useExternalReplayData && (holdSelectionNeutralPose || !train);
+    }
+
+    private void FreezeRoot()
+    {
+        if (art0 == null)
+        {
+            return;
+        }
+
+        art0.velocity = Vector3.zero;
+        art0.angularVelocity = Vector3.zero;
+        art0.immovable = true;
+    }
 
     // ── IMimicAgent surface ───────────────────────────────────────────────────
     public string RobotKey => string.IsNullOrWhiteSpace(robotKey) ? "unitree_h1" : robotKey.Trim();
-    public GameObject AgentGameObject => gameObject;
+    public GameObject AgentGameObject => this == null ? null : gameObject;
     public bool UseExternalReplayData
     {
         get => useExternalReplayData;
         set
         {
             useExternalReplayData = value;
+            if (value)
+            {
+                holdSelectionNeutralPose = false;
+            }
             if (!value)
             {
                 hasExternalReplayCsv = false;
             }
         }
     }
-    public bool ReplayMode { get => replay; set => replay = value; }
+    public bool ReplayMode
+    {
+        get => replay;
+        set
+        {
+            replay = value;
+            if (value)
+            {
+                holdSelectionNeutralPose = false;
+            }
+        }
+    }
     public int MotionId { get => motion_idx; set => motion_idx = value; }
     public void RequestEndEpisode() => EndEpisode();
     public int ExpectedCsvColumns => 26;
 
+    public void SetReplayRootOffset(Vector3 offset)
+    {
+        replayRootOffset = offset;
+    }
+
     public void SetRobotSelectedInScene(bool isSelected)
     {
         isRobotSelectedInScene = isSelected;
-        if (isSelected) return;
+        if (isSelected)
+        {
+            if (!replay && !useExternalReplayData)
+            {
+                holdSelectionNeutralPose = true;
+                ResetToInitialState();
+                if (art0 != null)
+                {
+                    art0.velocity = Vector3.zero;
+                    art0.angularVelocity = Vector3.zero;
+                    art0.immovable = true;
+                }
+            }
+            return;
+        }
 
+        holdSelectionNeutralPose = false;
         UseExternalReplayData = false;
         ReplayMode = false;
         hasExternalReplayCsv = false;
@@ -174,6 +266,7 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
         realtimeFrameCursor = 0f;
         tt = 0;
         isEndEpisode = false;
+        holdSelectionNeutralPose = false;
         return true;
     }
 
@@ -209,6 +302,7 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
         realtimeFrameCursor = 0f;
         currentFrame = 0;
         isEndEpisode = false;
+        holdSelectionNeutralPose = true;
     }
 
     /// <summary>
@@ -351,6 +445,7 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
         hasExternalReplayCsv = true;
         useExternalReplayData = true;
         replay = true;
+        holdSelectionNeutralPose = false;
         isEndEpisode = false;
 
         if (keepProgress)
@@ -461,7 +556,11 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
 
         // Register with the scene-wide IMimicAgent registry — see G1mimicAgent
         // for why this happens here rather than in OnEnable.
-        MimicAgentRegistry.Instance.Register(this);
+        MimicAgentRegistry registry = MimicAgentRegistry.Instance;
+        if (registry != null)
+        {
+            registry.Register(this);
+        }
     }
     void LoadActionFolders(string basePath)
     {
@@ -574,10 +673,255 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
         return result;
     }
 
+    private bool IsMirrorMode => replay || useExternalReplayData;
+
+    private bool TryGetMirrorFrame(out float[] currentPos, out float[] currentRot, out float[] currentDof, out bool hasRealtimeRows)
+    {
+        currentPos = null;
+        currentRot = null;
+        currentDof = null;
+        hasRealtimeRows = useExternalReplayData && !hasExternalReplayCsv && realtimeRawRows.Count > 0;
+
+        if (hasRealtimeRows)
+        {
+            realtimeFrameCursor = Mathf.Clamp(realtimeFrameCursor, 0f, realtimeRawRows.Count - 1);
+            float[] currentFlatRow = realtimeSampledRow;
+            if (!ReplayCsvUtility.SampleRowsAtFrame(realtimeRawRows, realtimeFrameCursor, ExpectedCsvColumns, realtimeSampledRow))
+            {
+                currentFlatRow = realtimeRawRows[Mathf.Clamp(currentFrame, 0, realtimeRawRows.Count - 1)];
+            }
+
+            currentFrame = Mathf.Clamp(Mathf.FloorToInt(realtimeFrameCursor), 0, realtimeRawRows.Count - 1);
+            currentPos = realtimeCurrentPos;
+            currentRot = realtimeCurrentRot;
+            currentDof = realtimeCurrentDof;
+            System.Array.Copy(currentFlatRow, 0, currentPos, 0, 3);
+            System.Array.Copy(currentFlatRow, 3, currentRot, 0, 4);
+            System.Array.Copy(currentFlatRow, 7, currentDof, 0, 19);
+            return true;
+        }
+
+        if (allDofData == null || allDofData.Count == 0 ||
+            allPosData == null || allPosData.Count == 0 ||
+            allRotData == null || allRotData.Count == 0)
+        {
+            return false;
+        }
+
+        currentFrame = Mathf.Clamp(currentFrame, 0, allDofData.Count - 1);
+        int posFrame = Mathf.Clamp(currentFrame, 0, allPosData.Count - 1);
+        int rotFrame = Mathf.Clamp(currentFrame, 0, allRotData.Count - 1);
+        currentDof = allDofData[currentFrame];
+        currentPos = allPosData[posFrame];
+        currentRot = allRotData[rotFrame];
+        return true;
+    }
+
+    private Vector3 MapH1RootPosition(float[] currentPos)
+    {
+        return UnityQposMapper.MapRootPosition(currentPos, pos0, replayRootOffset);
+    }
+
+    private Quaternion MapH1RootRotation(float[] currentRot)
+    {
+        return UnityQposMapper.MapRootRotationFromCsvXyzw(currentRot);
+    }
+
+    private static Quaternion NormalizeQuaternion(Quaternion rotation)
+    {
+        float magnitude = Mathf.Sqrt(
+            rotation.x * rotation.x +
+            rotation.y * rotation.y +
+            rotation.z * rotation.z +
+            rotation.w * rotation.w);
+        if (magnitude < 0.0001f)
+        {
+            return Quaternion.identity;
+        }
+
+        float inv = 1f / magnitude;
+        return new Quaternion(rotation.x * inv, rotation.y * inv, rotation.z * inv, rotation.w * inv);
+    }
+
+    private void LogMirrorRootRotationIfNeeded(float[] currentRot, Quaternion mappedRotation)
+    {
+        if (!logMirrorRootRotationDiagnostics)
+        {
+            return;
+        }
+
+        int interval = Mathf.Max(1, mirrorRootRotationLogInterval);
+        mirrorDiagnosticFrame++;
+        if (mirrorDiagnosticFrame % interval != 0)
+        {
+            return;
+        }
+
+        Vector3 euler = mappedRotation.eulerAngles;
+        UnityEngine.Debug.Log(
+            $"[H1mimicAgent:{name}] mirror root rot csv=({currentRot[0]:F3},{currentRot[1]:F3},{currentRot[2]:F3},{currentRot[3]:F3}) " +
+            $"unityEuler=({euler.x:F1},{euler.y:F1},{euler.z:F1}) frame={currentFrame}");
+    }
+
+    private bool SetJointPositionRad(ArticulationBody joint, float radians)
+    {
+        if (joint == null || joint.jointType != ArticulationJointType.RevoluteJoint) return false;
+        try
+        {
+            ArticulationReducedSpace jointPosition = joint.jointPosition;
+            if (jointPosition.dofCount <= 0) return false;
+            jointPosition[0] = radians;
+            joint.jointPosition = jointPosition;
+
+            ArticulationReducedSpace jointVelocity = joint.jointVelocity;
+            if (jointVelocity.dofCount > 0)
+            {
+                jointVelocity[0] = 0f;
+                joint.jointVelocity = jointVelocity;
+            }
+            return true;
+        }
+        catch (System.Exception e)
+        {
+            UnityEngine.Debug.LogWarning($"[H1mimicAgent] Failed to set joint '{joint.name}' position: {e.Message}");
+            return false;
+        }
+    }
+
+    private void ZeroArticulationVelocities()
+    {
+        if (arts == null) return;
+        for (int i = 0; i < arts.Length; i++)
+        {
+            ArticulationBody bodyPart = arts[i];
+            if (bodyPart == null) continue;
+            bodyPart.velocity = Vector3.zero;
+            bodyPart.angularVelocity = Vector3.zero;
+            try
+            {
+                ArticulationReducedSpace jointVelocity = bodyPart.jointVelocity;
+                for (int dof = 0; dof < jointVelocity.dofCount; dof++)
+                {
+                    jointVelocity[dof] = 0f;
+                }
+                if (jointVelocity.dofCount > 0) bodyPart.jointVelocity = jointVelocity;
+            }
+            catch (System.Exception)
+            {
+                // Some articulation states report an empty reduced-space cache during scene teardown.
+            }
+        }
+    }
+
+    private void ApplyMirrorFrameToArticulation(float[] currentPos, float[] currentRot, float[] currentDof)
+    {
+        if (art0 == null || currentPos == null || currentRot == null || currentDof == null) return;
+
+        Physics.gravity = Vector3.zero;
+        newPosition = MapH1RootPosition(currentPos);
+        newRotation = MapH1RootRotation(currentRot);
+        LogMirrorRootRotationIfNeeded(currentRot, newRotation);
+
+        art0.immovable = true;
+        art0.TeleportRoot(newPosition, newRotation);
+        ZeroArticulationVelocities();
+
+        for (int i = 0; i < 19 && i < currentDof.Length; i++)
+        {
+            float radians = ApplyH1Calibration(i, currentDof[i]);
+            float degrees = radians * Mathf.Rad2Deg;
+            uff[i] = degrees;
+            utotal[i] = degrees;
+            u[i] = 0f;
+            if (jh[i] == null) continue;
+            SetJointTargetDeg(jh[i], degrees);
+            SetJointPositionRad(jh[i], radians);
+            LogRetargetCalibrationIfNeeded(i, currentDof[i], radians);
+        }
+    }
+
+    private float ApplyH1Calibration(int csvIndex, float csvRad)
+    {
+        string jointName = csvIndex >= 0 && csvIndex < H1JointNames.Length
+            ? H1JointNames[csvIndex]
+            : string.Empty;
+        UnityRetargetCalibrationEntry calibration = UnityRetargetCalibration.Resolve(
+            csvIndex,
+            jointName,
+            H1UnityCalibration);
+        return calibration.Apply(csvRad);
+    }
+
+    private void LogRetargetCalibrationIfNeeded(int csvIndex, float csvRad, float targetRad)
+    {
+        if (!logRetargetCalibrationDiagnostics)
+        {
+            return;
+        }
+
+        int interval = Mathf.Max(1, retargetCalibrationLogInterval);
+        retargetCalibrationLogCounter++;
+        if (retargetCalibrationLogCounter % interval != 0)
+        {
+            return;
+        }
+
+        UnityRetargetCalibrationEntry calibration = UnityRetargetCalibration.Resolve(
+            csvIndex,
+            csvIndex >= 0 && csvIndex < H1JointNames.Length ? H1JointNames[csvIndex] : string.Empty,
+            H1UnityCalibration);
+        ArticulationBody joint = csvIndex >= 0 && csvIndex < jh.Length ? jh[csvIndex] : null;
+        float actualRad = 0f;
+        if (joint != null && joint.jointPosition.dofCount > 0)
+        {
+            actualRad = joint.jointPosition[0];
+        }
+
+        UnityEngine.Debug.Log(
+            $"[H1Calib] frame={currentFrame} csvIndex={csvIndex} joint={calibration.jointName} " +
+            $"csvRad={csvRad:F4} sign={calibration.sign:F1} offsetRad={calibration.offsetRad:F4} " +
+            $"targetRad={targetRad:F4} actualRad={actualRad:F4} errorRad={(actualRad - targetRad):F4}");
+    }
+
+    private void AdvanceMirrorFrame(bool hasRealtimeRows)
+    {
+        int availableFrameCount = hasRealtimeRows ? realtimeRawRows.Count : (allDofData != null ? allDofData.Count : 0);
+        if (availableFrameCount <= 0) return;
+
+        if (currentFrame < availableFrameCount - 1)
+        {
+            if (hasRealtimeRows)
+            {
+                realtimeFrameCursor = ReplayCsvUtility.AdvanceRealtimeCursor(
+                    realtimeFrameCursor,
+                    realtimeRawRows.Count,
+                    realtimePlaybackFps,
+                    Time.fixedDeltaTime,
+                    realtimePlaybackBufferSeconds);
+                currentFrame = Mathf.Clamp(Mathf.FloorToInt(realtimeFrameCursor), 0, realtimeRawRows.Count - 1);
+            }
+            else
+            {
+                currentFrame++;
+            }
+        }
+        else if (!useExternalReplayData)
+        {
+            currentFrame = 0;
+        }
+    }
+
     public override void OnEpisodeBegin()
     {
         if (!isRobotSelectedInScene)
         {
+            return;
+        }
+
+        if (ShouldHoldNeutralPose())
+        {
+            ResetToInitialState();
+            FreezeRoot();
             return;
         }
 
@@ -590,6 +934,32 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
         // surviving value 6 slots left → joints get root values, arms end up
         // twisted into the body. Restoring immovable=false here resizes the
         // cache to match P0 before the SetJointPositions call.
+        if (IsMirrorMode)
+        {
+            if (!useExternalReplayData && replay &&
+                (allDofData == null || allDofData.Count == 0) &&
+                actionFolders != null && actionFolders.Count > 0)
+            {
+                int clamped = Mathf.Clamp(motion_idx, 0, actionFolders.Count - 1);
+                LoadDataForAction(actionFolders[clamped]);
+                motion_name = actionFolders[clamped];
+            }
+
+            tt = 0;
+            isEndEpisode = false;
+            if (TryGetMirrorFrame(out float[] mirrorPos, out float[] mirrorRot, out float[] mirrorDof, out _))
+            {
+                ApplyMirrorFrameToArticulation(mirrorPos, mirrorRot, mirrorDof);
+            }
+            else if (art0 != null)
+            {
+                art0.velocity = Vector3.zero;
+                art0.angularVelocity = Vector3.zero;
+                art0.immovable = true;
+            }
+            return;
+        }
+
         art0.immovable = false;
         art0.TeleportRoot(pos0, rot0);
         art0.velocity = Vector3.zero;
@@ -667,15 +1037,8 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
             currentPos = allPosData[Mathf.Min(seedFrame, allPosData.Count - 1)];
             currentRot = allRotData[Mathf.Min(seedFrame, allRotData.Count - 1)];
         }
-        Vector3 newPosition = new Vector3(-currentPos[1], currentPos[2], currentPos[0]);
-        Quaternion newRotation = new Quaternion(
-            currentRot[1], 
-            -currentRot[2], 
-            currentRot[0], 
-            currentRot[3]
-        );
-        newPosition.x+=pos0.x;
-        newPosition.z+=pos0.z;
+        Vector3 newPosition = UnityQposMapper.MapRootPosition(currentPos, pos0, replayRootOffset);
+        Quaternion newRotation = UnityQposMapper.MapRootRotationFromCsvXyzw(currentRot);
         
         art0.TeleportRoot(newPosition, newRotation);
         art0.velocity = Vector3.zero;
@@ -741,6 +1104,16 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
             return;
         }
 
+        if (ShouldHoldNeutralPose())
+        {
+            return;
+        }
+
+        if (IsMirrorMode)
+        {
+            return;
+        }
+
         var continuousActions = actionBuffers.ContinuousActions;
         var kk = 0.9f;
         
@@ -759,6 +1132,28 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
     {
         if (!isRobotSelectedInScene)
         {
+            return;
+        }
+
+        if (ShouldHoldNeutralPose())
+        {
+            FreezeRoot();
+            return;
+        }
+
+        if (IsMirrorMode)
+        {
+            if (TryGetMirrorFrame(out float[] mirrorPos, out float[] mirrorRot, out float[] mirrorDof, out bool mirrorRealtimeRows))
+            {
+                ApplyMirrorFrameToArticulation(mirrorPos, mirrorRot, mirrorDof);
+                AdvanceMirrorFrame(mirrorRealtimeRows);
+            }
+            else if (art0 != null)
+            {
+                art0.velocity = Vector3.zero;
+                art0.angularVelocity = Vector3.zero;
+                art0.immovable = true;
+            }
             return;
         }
 
@@ -795,24 +1190,8 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
         }
 		for (int i = 0; i < 19; i++)uff[i] = currentDof[i]* 180f / 3.14f;
 
-        Quaternion gymQuat = new Quaternion(
-            currentRot[0], 
-            currentRot[1], 
-            currentRot[2], 
-            currentRot[3]
-        );
-        Quaternion conversionQ = new Quaternion(0.5f, -0.5f, -0.5f, 0.5f);
-        newRotation = conversionQ * gymQuat * Quaternion.Inverse(conversionQ);
-		newPosition = new Vector3(-currentPos[1], currentPos[2], currentPos[0]);
-        newRotation = new Quaternion(
-            currentRot[1], 
-            -currentRot[2], 
-            currentRot[0], 
-            currentRot[3]
-        );
-
-        newPosition.x+=pos0.x;
-        newPosition.z+=pos0.z;
+        newPosition = MapH1RootPosition(currentPos);
+        newRotation = MapH1RootRotation(currentRot);
 
     	if(replay)
     	{
@@ -824,7 +1203,7 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
     		// OnActionReceived (replay mode forces kb=0 so utotal=uff), which
     		// is enough as long as the DecisionRequester period is 1.
     		Physics.gravity = Vector3.zero;
-    		art0.TeleportRoot(newPosition, newRotation);
+            art0.TeleportRoot(newPosition, newRotation);
     	}
         int availableFrameCount = hasRealtimeRows ? realtimeRawRows.Count : allDofData.Count;
         if (currentFrame < availableFrameCount - 1)
