@@ -6890,8 +6890,8 @@ GameObject:
   m_Component:
   - component: {fileID: 440978435}
   - component: {fileID: 440978434}
-  - component: {fileID: 440978433}
   - component: {fileID: 440978432}
+  - component: {fileID: 440978436}
   m_Layer: 6
   m_Name: H1
   m_TagString: robot
@@ -6914,26 +6914,6 @@ MonoBehaviour:
   DecisionPeriod: 1
   DecisionStep: 0
   TakeActionsBetweenDecisions: 1
---- !u!114 &440978433
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 440978431}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 0fd1a9d97eb916c8690540ccb0130c76, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
-  agentParameters:
-    maxStep: 0
-  hasUpgradedFromAgentParameters: 1
-  MaxStep: 1000
-  train: 0
-  replay: 0
-  motion_idx: 0
-  motion_name: 
 --- !u!114 &440978434
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -6981,6 +6961,22 @@ Transform:
   - {fileID: 2119574034}
   m_Father: {fileID: 0}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!114 &440978436
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 440978431}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 88b6042bc9a5d4aa58d931eae49442e5, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  agentParameters:
+    maxStep: 0
+  hasUpgradedFromAgentParameters: 1
+  MaxStep: 0
 --- !u!1 &447697303
 GameObject:
   m_ObjectHideFlags: 0
@@ -26691,9 +26687,9 @@ GameObject:
   serializedVersion: 6
   m_Component:
   - component: {fileID: 1479756073}
-  - component: {fileID: 1479756074}
   - component: {fileID: 1479756071}
   - component: {fileID: 1479756070}
+  - component: {fileID: 1479756074}
   m_Layer: 6
   m_Name: G1
   m_TagString: Untagged
@@ -26772,20 +26768,13 @@ MonoBehaviour:
   m_GameObject: {fileID: 1479756069}
   m_Enabled: 1
   m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 3d230f5c0a44b0251acb2f73ea15e46b, type: 3}
+  m_Script: {fileID: 11500000, guid: 88b6042bc9a5d4aa58d931eae49442e5, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
   agentParameters:
     maxStep: 0
   hasUpgradedFromAgentParameters: 1
   MaxStep: 0
-  train: 0
-  replay: 1
-  motion_id: 8
-  motion_name: 
-  currentFrame: 0
-  frame0: 500
-  rand: 0
 --- !u!1 &1482997065
 GameObject:
   m_ObjectHideFlags: 8
@@ -32807,20 +32796,6 @@ Light:
   m_UseViewFrustumForShadowCasterCull: 1
   m_ShadowRadius: 0
   m_ShadowAngle: 0
---- !u!114 &1852714199
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 1852714196}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 9bd3d8e0e9d9456881f9af33ef52d5bd, type: 3}
-  m_Name: 
-  m_EditorClassIdentifier: 
-  rotationSpeedDegreesPerSecond: 5
-  rotateInWorldSpace: 1
 --- !u!4 &1852714198
 Transform:
   m_ObjectHideFlags: 0
@@ -32836,6 +32811,20 @@ Transform:
   m_Children: []
   m_Father: {fileID: 0}
   m_LocalEulerAnglesHint: {x: 50, y: 170, z: 0}
+--- !u!114 &1852714199
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1852714196}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 9bd3d8e0e9d9456881f9af33ef52d5bd, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  rotationSpeedDegreesPerSecond: 5
+  rotateInWorldSpace: 1
 --- !u!1 &1858480093
 GameObject:
   m_ObjectHideFlags: 0

@@ -1196,17 +1196,14 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
         for (int i = 0; i < DofCount; i++)
         {
             float targetRad = ToUnityJointRadians(i, currentDof[i]);
-            if (!directWrite)
-            {
-                LogDriveClampIfNeeded(i, jh[i], targetRad);
-            }
+            LogDriveClampIfNeeded(i, jh[i], targetRad);
             float targetDeg = targetRad * Mathf.Rad2Deg;
             uff[i] = targetDeg;
-            SetJointTargetDeg(jh[i], targetDeg, clampToDriveLimits: !directWrite);
+            SetJointTargetDeg(jh[i], targetDeg, clampToDriveLimits: true);
 
             if (directWrite && writeReplayJointPositionsDirectly)
             {
-                if (SetJointPositionRad(jh[i], targetRad, clampToDriveLimits: false))
+                if (SetJointPositionRad(jh[i], targetRad, clampToDriveLimits: true))
                 {
                     directWriteCount++;
                 }
@@ -1336,6 +1333,7 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
                     joint.jointVelocity = jointVelocity;
                 }
             }
+
             return true;
         }
         catch (System.Exception e)
@@ -1482,14 +1480,24 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
 
         for (int i = 0; i < DofCount; i++)
         {
-            float targetRad = 0f;
-            if (neutralPoseFrame != null && neutralPoseFrame.Length >= CsvColumnCount)
+            float unityTargetRad;
+            if (i < 8)
             {
-                targetRad = neutralPoseFrame[7 + i];
+                currentDof[i] = 0f;
+                unityTargetRad = GetRestJointPositionRad(i);
+            }
+            else
+            {
+                float targetRad = 0f;
+                if (neutralPoseFrame != null && neutralPoseFrame.Length >= CsvColumnCount)
+                {
+                    targetRad = neutralPoseFrame[7 + i];
+                }
+
+                currentDof[i] = targetRad;
+                unityTargetRad = ToUnityJointRadians(i, targetRad);
             }
 
-            currentDof[i] = targetRad;
-            float unityTargetRad = ToUnityJointRadians(i, targetRad);
             uff[i] = unityTargetRad * Mathf.Rad2Deg;
             SetJointTargetDeg(jh[i], uff[i]);
             if (writeReplayJointPositionsDirectly)
@@ -1499,6 +1507,19 @@ public class X02LiteMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISe
         }
 
         tt = 0;
+    }
+
+    private float GetRestJointPositionRad(int jointIndex)
+    {
+        if (restPositions == null || restPositions.Length == 0)
+        {
+            return 0f;
+        }
+
+        const int RootDofCount = 6;
+        int offset = restPositions.Length >= RootDofCount + DofCount ? RootDofCount : 0;
+        int index = offset + jointIndex;
+        return index >= 0 && index < restPositions.Length ? restPositions[index] : 0f;
     }
 
     private void RestoreInitialRootPose()

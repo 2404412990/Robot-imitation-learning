@@ -8,7 +8,9 @@ using System.Collections.Generic;
 using System.IO;
 using System.Diagnostics;
 using System.Linq;
+using System;
 using System.Globalization;
+using System.Reflection;
 #if UNITY_EDITOR
 using UnityEditor;
 #endif
@@ -50,6 +52,29 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
         "right_shoulder_pitch", "right_shoulder_roll", "right_shoulder_yaw", "right_elbow",
     };
 
+    private static readonly string[][] H1CsvJointAliases =
+    {
+        new[] { "left_hip_yaw_joint", "left_hip_yaw_link", "left_hip_yaw" },
+        new[] { "left_hip_roll_joint", "left_hip_roll_link", "left_hip_roll" },
+        new[] { "left_hip_pitch_joint", "left_hip_pitch_link", "left_hip_pitch" },
+        new[] { "left_knee_joint", "left_knee_link", "left_knee" },
+        new[] { "left_ankle_joint", "left_ankle_link", "left_ankle" },
+        new[] { "right_hip_yaw_joint", "right_hip_yaw_link", "right_hip_yaw" },
+        new[] { "right_hip_roll_joint", "right_hip_roll_link", "right_hip_roll" },
+        new[] { "right_hip_pitch_joint", "right_hip_pitch_link", "right_hip_pitch" },
+        new[] { "right_knee_joint", "right_knee_link", "right_knee" },
+        new[] { "right_ankle_joint", "right_ankle_link", "right_ankle" },
+        new[] { "torso_joint", "torso_link", "torso" },
+        new[] { "left_shoulder_pitch_joint", "left_shoulder_pitch_link", "left_shoulder_pitch" },
+        new[] { "left_shoulder_roll_joint", "left_shoulder_roll_link", "left_shoulder_roll" },
+        new[] { "left_shoulder_yaw_joint", "left_shoulder_yaw_link", "left_shoulder_yaw" },
+        new[] { "left_elbow_joint", "left_elbow_link", "left_elbow" },
+        new[] { "right_shoulder_pitch_joint", "right_shoulder_pitch_link", "right_shoulder_pitch" },
+        new[] { "right_shoulder_roll_joint", "right_shoulder_roll_link", "right_shoulder_roll" },
+        new[] { "right_shoulder_yaw_joint", "right_shoulder_yaw_link", "right_shoulder_yaw" },
+        new[] { "right_elbow_joint", "right_elbow_link", "right_elbow" },
+    };
+
     private static readonly UnityRetargetCalibrationEntry[] H1UnityCalibration =
     {
         new UnityRetargetCalibrationEntry(0,  "left_hip_yaw",          1f, 0f),
@@ -87,7 +112,7 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
     private void DumpJointMapping()
     {
         var sb = new System.Text.StringBuilder();
-        sb.AppendLine($"[H1mimicAgent:{name}] Joint mapping (identity assumed):");
+        sb.AppendLine($"[H1mimicAgent:{name}] Joint mapping (explicit CSV index -> Unity joint, valid={h1JointMapValid}):");
         for (int i = 0; i < 19 && i < jh.Length; i++)
         {
             string jointName = (jh[i] != null) ? jh[i].name : "<null>";
@@ -99,9 +124,14 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
         sb.AppendLine("  10    torso");
         sb.AppendLine("  11..14 left  arm: shoulder_pitch, shoulder_roll, shoulder_yaw, elbow");
         sb.AppendLine("  15..18 right arm: same suborder");
-        sb.AppendLine("If names don't line up, fill in a permutation table or fix the prefab's transform hierarchy.");
+        sb.AppendLine("Replay/live is refused when this explicit map is incomplete.");
         UnityEngine.Debug.Log(sb.ToString());
     }
+
+    private bool h1JointMapValid;
+    private bool hasLoggedInvalidJointMap;
+    private static readonly PropertyInfo ArticulationJointNameProperty =
+        typeof(ArticulationBody).GetProperty("jointName", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
 
     [Header("Live CSV (set when retargeted from WHAM+GMR)")]
     public bool useExternalReplayData = false;
@@ -191,11 +221,9 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
         }
 
         art0.immovable = false;
-        art0.TeleportRoot(pos0, rot0);
+        art0.TeleportRoot(pos0, GetUprightNeutralRootRotation());
         art0.velocity = Vector3.zero;
         art0.angularVelocity = Vector3.zero;
-        SafeSetJointPositions(P0);
-        SafeSetJointVelocities(W0);
 
         for (int i = 0; i < 19; i++)
         {
@@ -205,14 +233,22 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
             if (jh[i] != null)
             {
                 SetJointTargetDeg(jh[i], 0f);
+                SetJointPositionRad(jh[i], 0f);
             }
         }
 
+        ZeroArticulationVelocities();
         currentFrame = 0;
+        realtimeFrameCursor = 0f;
         tt = 0;
         isEndEpisode = false;
         art0.immovable = true;
         neutralPoseRestorePending = false;
+    }
+
+    private Quaternion GetUprightNeutralRootRotation()
+    {
+        return KeepRootYawOnly(rot0);
     }
 
     // ── IMimicAgent surface ───────────────────────────────────────────────────
@@ -382,9 +418,13 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
             utotal[i] = 0f;
         }
 
+        realtimeRawRows.Clear();
+        realtimeFrameCursor = 0f;
+        hasExternalReplayCsv = false;
         currentFrame = 0;
         tt = 0;
         isEndEpisode = false;
+        QueueNeutralPoseRestore();
     }
 
     // Registration with the scene-wide registry happens at the end of the
@@ -557,6 +597,111 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
         foreach (Transform child in obj.transform)ChangeLayerRecursively(child.gameObject, targetLayer);
     }
 
+    private void BuildDeterministicH1JointMap(IReadOnlyList<ArticulationBody> revoluteJoints)
+    {
+        Array.Clear(jh, 0, jh.Length);
+        h1JointMapValid = false;
+        hasLoggedInvalidJointMap = false;
+
+        var byName = new Dictionary<string, ArticulationBody>(StringComparer.Ordinal);
+        for (int i = 0; i < revoluteJoints.Count; i++)
+        {
+            ArticulationBody joint = revoluteJoints[i];
+            if (joint == null)
+            {
+                continue;
+            }
+
+            AddJointName(byName, GetSerializedJointName(joint), joint);
+            AddJointName(byName, joint.name, joint);
+            AddJointName(byName, joint.gameObject.name, joint);
+        }
+
+        var missing = new List<string>();
+        for (int i = 0; i < H1CsvJointAliases.Length && i < jh.Length; i++)
+        {
+            ArticulationBody joint = FindJointByAlias(byName, H1CsvJointAliases[i]);
+            if (joint != null && joint.jointType == ArticulationJointType.RevoluteJoint)
+            {
+                jh[i] = joint;
+                continue;
+            }
+
+            missing.Add($"CSV[{i}] {H1JointNames[i]} expected one of [{string.Join(", ", H1CsvJointAliases[i])}]");
+        }
+
+        if (missing.Count == 0)
+        {
+            h1JointMapValid = true;
+            return;
+        }
+
+        for (int i = 0; i < jh.Length && i < revoluteJoints.Count; i++)
+        {
+            if (jh[i] == null)
+            {
+                jh[i] = revoluteJoints[i];
+            }
+        }
+
+        UnityEngine.Debug.LogError(
+            $"[H1mimicAgent:{name}] Explicit H1 joint map is incomplete. " +
+            "Replay/live qpos mirror will be refused to avoid applying CSV values to wrong joints. " +
+            string.Join("; ", missing));
+    }
+
+    private static ArticulationBody FindJointByAlias(Dictionary<string, ArticulationBody> byName, string[] aliases)
+    {
+        if (aliases == null)
+        {
+            return null;
+        }
+
+        for (int i = 0; i < aliases.Length; i++)
+        {
+            string key = NormalizeJointName(aliases[i]);
+            if (!string.IsNullOrEmpty(key) && byName.TryGetValue(key, out ArticulationBody joint))
+            {
+                return joint;
+            }
+        }
+
+        return null;
+    }
+
+    private static void AddJointName(Dictionary<string, ArticulationBody> byName, string rawName, ArticulationBody joint)
+    {
+        string key = NormalizeJointName(rawName);
+        if (string.IsNullOrEmpty(key) || byName.ContainsKey(key))
+        {
+            return;
+        }
+
+        byName.Add(key, joint);
+    }
+
+    private static string GetSerializedJointName(ArticulationBody joint)
+    {
+        if (joint == null || ArticulationJointNameProperty == null)
+        {
+            return string.Empty;
+        }
+
+        try
+        {
+            return ArticulationJointNameProperty.GetValue(joint) as string ?? string.Empty;
+        }
+        catch
+        {
+            return string.Empty;
+        }
+    }
+
+    private static string NormalizeJointName(string rawName)
+    {
+        return string.IsNullOrWhiteSpace(rawName) ? string.Empty : rawName.Trim().ToLowerInvariant();
+    }
+
     // Tracks whether the spawn-pose snapshot has been captured. Without this
     // guard, ML-Agents' Agent.OnEnable re-fires LazyInitialize each time the
     // GameObject is SetActive(true), and the second-and-later captures grab
@@ -568,15 +713,15 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
     {
 
         arts = this.GetComponentsInChildren<ArticulationBody>();
-        int ActionNum = 0;
+        var revoluteJoints = new List<ArticulationBody>();
         for (int k = 0; k < arts.Length; k++)
         {
-            if(arts[k].jointType.ToString() == "RevoluteJoint")
+            if (arts[k] != null && arts[k].jointType == ArticulationJointType.RevoluteJoint)
             {
-                jh[ActionNum] = arts[k];
-                ActionNum++;
+                revoluteJoints.Add(arts[k]);
             }
         }
+        BuildDeterministicH1JointMap(revoluteJoints);
         body = arts[0].GetComponent<Transform>();
         art0 = body.GetComponent<ArticulationBody>();
 
@@ -776,7 +921,13 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
 
     private Quaternion MapH1RootRotation(float[] currentRot)
     {
-        return UnityQposMapper.MapRootRotationFromCsvXyzw(currentRot);
+        return KeepRootYawOnly(UnityQposMapper.MapRootRotationFromCsvXyzw(currentRot));
+    }
+
+    private static Quaternion KeepRootYawOnly(Quaternion rotation)
+    {
+        Vector3 euler = rotation.eulerAngles;
+        return Quaternion.Euler(0f, euler.y, 0f);
     }
 
     private static Quaternion NormalizeQuaternion(Quaternion rotation)
@@ -831,6 +982,7 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
                 jointVelocity[0] = 0f;
                 joint.jointVelocity = jointVelocity;
             }
+
             return true;
         }
         catch (System.Exception e)
@@ -868,6 +1020,16 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
     private void ApplyMirrorFrameToArticulation(float[] currentPos, float[] currentRot, float[] currentDof)
     {
         if (art0 == null || currentPos == null || currentRot == null || currentDof == null) return;
+        if (!h1JointMapValid)
+        {
+            if (!hasLoggedInvalidJointMap)
+            {
+                UnityEngine.Debug.LogError($"[H1mimicAgent:{name}] Replay/live qpos mirror skipped because the explicit H1 joint map is invalid.");
+                hasLoggedInvalidJointMap = true;
+            }
+            FreezeRoot();
+            return;
+        }
 
         Physics.gravity = Vector3.zero;
         newPosition = MapH1RootPosition(currentPos);
@@ -1343,6 +1505,3 @@ public class H1mimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, ISelecta
     }
     
 }
-
-
-

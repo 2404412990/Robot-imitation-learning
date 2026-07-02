@@ -805,6 +805,9 @@ public class OpenLoongMimicAgent : Agent, IMimicAgent, IRealtimeCsvMimicAgent, I
                     joint.jointVelocity = jointVelocity;
                 }
             }
+
+            joint.velocity = Vector3.zero;
+            joint.angularVelocity = Vector3.zero;
         }
 
         if (wroteCount == 0 && !hasLoggedDirectJointStateError)

@@ -167,8 +167,8 @@ MonoBehaviour:
   m_Enabled: 1
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: 1c0c8ba1123c5f949b20e50d5dd6afe4, type: 3}
-  m_Name:
-  m_EditorClassIdentifier:
+  m_Name: 
+  m_EditorClassIdentifier: 
   geometryType: 1
 --- !u!1 &1040952
 GameObject:
@@ -56850,187 +56850,6 @@ RectTransform:
   m_AnchoredPosition: {x: 0, y: 0}
   m_SizeDelta: {x: 0, y: 0}
   m_Pivot: {x: 0, y: 0}
---- !u!1 &2147000001
-GameObject:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  serializedVersion: 6
-  m_Component:
-  - component: {fileID: 2147000002}
-  - component: {fileID: 2147000003}
-  - component: {fileID: 2147000004}
-  - component: {fileID: 2147000005}
-  m_Layer: 5
-  m_Name: RuntimeControlHost
-  m_TagString: Untagged
-  m_Icon: {fileID: 0}
-  m_NavMeshLayer: 0
-  m_StaticEditorFlags: 0
-  m_IsActive: 1
---- !u!224 &2147000002
-RectTransform:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 2147000001}
-  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 0, y: 0, z: 0}
-  m_LocalScale: {x: 1, y: 1, z: 1}
-  m_ConstrainProportionsScale: 0
-  m_Children: []
-  m_Father: {fileID: 863758332}
-  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
-  m_AnchorMin: {x: 0, y: 1}
-  m_AnchorMax: {x: 0, y: 1}
-  m_AnchoredPosition: {x: 0, y: 0}
-  m_SizeDelta: {x: 1, y: 1}
-  m_Pivot: {x: 0, y: 1}
---- !u!114 &2147000003
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 2147000001}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 127ac913eadf51247abdea6174bb19d2, type: 3}
-  m_Name:
-  m_EditorClassIdentifier:
-  runBashOnClick: 1
-  bashExecutable: powershell -ExecutionPolicy Bypass -File
-  bashScriptPath: run.ps1
-  bashArguments:
-  bashWorkingDirectory: Robot-imitation-learning/
-  restartBashIfRunning: 0
-  logBashOutput: 1
-  outputRoot: output/my_run
-  keepRuntimeOutputOutsideAssets: 1
-  outputCsvFileName: csv/live_motion.csv
-  defaultRobotName: unitree_g1
-  recordGmrVideo: 0
-  recordWhamVideo: 0
-  track: 1
-  enableTcpStreaming: 1
-  disablePreviewVideoWhenTcpStreaming: 1
-  videoPath: examples/IMG_9732.mov
-  gmrCameraFollow: 1
-  gmrCameraLookatHeightOffset: 0.5
-  gmrCameraElevation: -28
-  gmrCameraDistanceScale: 1.7
-  gmrCameraAzimuth:
-  gmrTcpRenderWidth: 1064
-  gmrTcpRenderHeight: 726
-  gmrPreviewFps: 3
-  whamUseAmp: 0
-  whamDetectInterval: 1
-  whamInferInterval: 1
-  whamStreamSeqLen: 16
-  whamInputScale: 1
-  gmrTorchDevice: cpu
-  gmrMaxIter: 5
-  gmrCsvFlushInterval: 5
-  whamTailFlushInterval: 10
-  pipelineHeartbeatFrames: 60
-  clearCsvOnStart: 1
-  clearCsvOnExit: 0
-  roboListDropdown: {fileID: 2027246831}
-  roboListFileBrowser: {fileID: 2027246834}
-  roboListObjectName: RoboList
-  csvListDropdown: {fileID: 571795712}
-  csvListFileBrowser: {fileID: 571795715}
-  csvListObjectName: CsvList
-  filterCsvListByRobot: 1
-  replayButton: {fileID: 0}
-  replayButtonObjectName: Replay
-  stopButton: {fileID: 0}
-  stopButtonObjectName: Stop
-  switchActiveRobotOnDropdownChange: 1
-  autoStartOnRobotSwitch: 0
-  hideInactiveRobotsOnSwitch: 1
-  addRuntimeCollidersForSelectedRobot: 1
-  multiRobotDisplaySpacingMeters: 1.8
-  fallbackRuntimeColliderSize: {x: 0.08, y: 0.08, z: 0.08}
-  runtimeRobotCollidersAreTriggers: 1
-  sceneRobots:
-  - label: unitree_g1
-    robotRoot: {fileID: 1841660982}
-  - label: unitree_h1
-    robotRoot: {fileID: 440978431}
-  - label: X02Lite
-    robotRoot: {fileID: 746369503}
-  - label: OpenLoong
-    robotRoot: {fileID: 2020107932}
-  monitorCsvOnClick: 1
-  csvPollInterval: 0.1
-  restartEpisodeOnFirstCsv: 1
-  realtimeWarmupSourceRows: 6
-  realtimePlaybackBufferSeconds: 0.2
-  defaultRealtimeCsvFps: 30
-  estimateRealtimeCsvProducerFps: 1
-  realtimeCsvFpsWindowSeconds: 2
-  maxRealtimeCsvBatchesPerFrame: 4
-  maxUnityLogMessagesPerFrame: 2
-  maxPendingUnityLogMessages: 200
-  enableRealtimeCsvSafetyGate: 1
-  realtimeMaxRootJumpMeters: 1
-  realtimeMaxRootRotationJumpDegrees: 120
-  realtimeMaxJointJumpRadians: 3.5
-  realtimeMaxAbsRootPositionMeters: 50
-  realtimeMaxAbsJointRadians: 20
-  realtimeMaxConsecutiveRejectedRows: 5
-  verboseDebugLogging: 0
-  logCsvChangeEvents: 0
-  emitRealtimeCsvAppendLogsToConsole: 0
-  emitPipelineOutputToUnityConsole: 0
-  csvChangeLogIntervalSeconds: 1
-  logReferenceResolution: 0
-  writeDebugLogFile: 1
-  debugLogFileName: unity_startinput.log
-  csvNoDataWarningSeconds: 10
-  targetAgentBehaviour: {fileID: 0}
---- !u!114 &2147000004
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 2147000001}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: ee99b090d3e9a8d45bfa9b83b419db1e, type: 3}
-  m_Name:
-  m_EditorClassIdentifier:
-  csvListDropdown: {fileID: 571795712}
-  csvListFileBrowser: {fileID: 571795715}
-  targetAgentBehaviour: {fileID: 0}
-  startInput: {fileID: 2147000003}
-  roboListDropdown: {fileID: 2027246831}
-  roboListFileBrowser: {fileID: 2027246834}
-  roboListObjectName: RoboList
-  stopRealtimeTrackingOnReplay: 1
-  replayDatasetRelativePath: Assets/Gewu/Imitation/dataset
-  replayDatasetFallbackRelativePath: Assets/Imitation/dataset
-  replayDatasetExtraFallbacks:
-  - Assets/Gewu/Imitation/dataset
-  - Assets/Imitation/dataset
---- !u!114 &2147000005
-MonoBehaviour:
-  m_ObjectHideFlags: 0
-  m_CorrespondingSourceObject: {fileID: 0}
-  m_PrefabInstance: {fileID: 0}
-  m_PrefabAsset: {fileID: 0}
-  m_GameObject: {fileID: 2147000001}
-  m_Enabled: 1
-  m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: e2c52fa6723923b4cb0399a10582d172, type: 3}
-  m_Name:
-  m_EditorClassIdentifier:
-  startInput: {fileID: 2147000003}
-  targetAgentBehaviour: {fileID: 0}
 --- !u!1 &865040269
 GameObject:
   m_ObjectHideFlags: 0
@@ -124597,7 +124416,7 @@ Light:
   m_Type: 1
   m_Shape: 0
   m_Color: {r: 1, g: 0.95686275, b: 0.8392157, a: 1}
-  m_Intensity: 1.5
+  m_Intensity: 0.4
   m_Range: 10
   m_SpotAngle: 30
   m_InnerSpotAngle: 21.80208
@@ -144924,6 +144743,187 @@ BoxCollider:
   serializedVersion: 3
   m_Size: {x: 1, y: 1, z: 1}
   m_Center: {x: 0, y: 0, z: 0}
+--- !u!1 &2147000001
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 2147000002}
+  - component: {fileID: 2147000003}
+  - component: {fileID: 2147000004}
+  - component: {fileID: 2147000005}
+  m_Layer: 5
+  m_Name: RuntimeControlHost
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!224 &2147000002
+RectTransform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 2147000001}
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: 0, y: 0, z: 0}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 0
+  m_Children: []
+  m_Father: {fileID: 863758332}
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+  m_AnchorMin: {x: 0, y: 1}
+  m_AnchorMax: {x: 0, y: 1}
+  m_AnchoredPosition: {x: 0, y: 0}
+  m_SizeDelta: {x: 1, y: 1}
+  m_Pivot: {x: 0, y: 1}
+--- !u!114 &2147000003
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 2147000001}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 127ac913eadf51247abdea6174bb19d2, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  runBashOnClick: 1
+  bashExecutable: powershell -ExecutionPolicy Bypass -File
+  bashScriptPath: run.ps1
+  bashArguments: 
+  bashWorkingDirectory: Robot-imitation-learning/
+  restartBashIfRunning: 0
+  logBashOutput: 1
+  outputRoot: output/my_run
+  keepRuntimeOutputOutsideAssets: 1
+  outputCsvFileName: csv/live_motion.csv
+  defaultRobotName: unitree_g1
+  recordGmrVideo: 0
+  recordWhamVideo: 0
+  track: 1
+  enableTcpStreaming: 1
+  disablePreviewVideoWhenTcpStreaming: 1
+  videoPath: examples/IMG_9732.mov
+  gmrCameraFollow: 1
+  gmrCameraLookatHeightOffset: 0.5
+  gmrCameraElevation: -28
+  gmrCameraDistanceScale: 1.7
+  gmrCameraAzimuth: 
+  gmrTcpRenderWidth: 1064
+  gmrTcpRenderHeight: 726
+  gmrPreviewFps: 3
+  whamUseAmp: 0
+  whamDetectInterval: 1
+  whamInferInterval: 1
+  whamStreamSeqLen: 16
+  whamInputScale: 1
+  gmrTorchDevice: cpu
+  gmrMaxIter: 5
+  gmrCsvFlushInterval: 5
+  whamTailFlushInterval: 10
+  pipelineHeartbeatFrames: 60
+  clearCsvOnStart: 1
+  clearCsvOnExit: 0
+  roboListDropdown: {fileID: 2027246831}
+  roboListFileBrowser: {fileID: 2027246834}
+  roboListObjectName: RoboList
+  csvListDropdown: {fileID: 571795712}
+  csvListFileBrowser: {fileID: 571795715}
+  csvListObjectName: CsvList
+  filterCsvListByRobot: 1
+  replayButton: {fileID: 0}
+  replayButtonObjectName: Replay
+  stopButton: {fileID: 0}
+  stopButtonObjectName: Stop
+  switchActiveRobotOnDropdownChange: 1
+  autoStartOnRobotSwitch: 0
+  hideInactiveRobotsOnSwitch: 1
+  addRuntimeCollidersForSelectedRobot: 1
+  multiRobotDisplaySpacingMeters: 1.8
+  fallbackRuntimeColliderSize: {x: 0.08, y: 0.08, z: 0.08}
+  runtimeRobotCollidersAreTriggers: 1
+  sceneRobots:
+  - label: unitree_g1
+    robotRoot: {fileID: 1841660982}
+  - label: unitree_h1
+    robotRoot: {fileID: 440978431}
+  - label: X02Lite
+    robotRoot: {fileID: 746369503}
+  - label: OpenLoong
+    robotRoot: {fileID: 2020107932}
+  monitorCsvOnClick: 1
+  csvPollInterval: 0.1
+  restartEpisodeOnFirstCsv: 1
+  realtimeWarmupSourceRows: 6
+  realtimePlaybackBufferSeconds: 0.2
+  defaultRealtimeCsvFps: 30
+  estimateRealtimeCsvProducerFps: 1
+  realtimeCsvFpsWindowSeconds: 2
+  maxRealtimeCsvBatchesPerFrame: 4
+  maxUnityLogMessagesPerFrame: 2
+  maxPendingUnityLogMessages: 200
+  enableRealtimeCsvSafetyGate: 1
+  realtimeMaxRootJumpMeters: 1
+  realtimeMaxRootRotationJumpDegrees: 120
+  realtimeMaxJointJumpRadians: 3.5
+  realtimeMaxAbsRootPositionMeters: 50
+  realtimeMaxAbsJointRadians: 20
+  realtimeMaxConsecutiveRejectedRows: 5
+  verboseDebugLogging: 0
+  logCsvChangeEvents: 0
+  emitRealtimeCsvAppendLogsToConsole: 0
+  emitPipelineOutputToUnityConsole: 0
+  csvChangeLogIntervalSeconds: 1
+  logReferenceResolution: 0
+  writeDebugLogFile: 1
+  debugLogFileName: unity_startinput.log
+  csvNoDataWarningSeconds: 10
+  targetAgentBehaviour: {fileID: 0}
+--- !u!114 &2147000004
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 2147000001}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: ee99b090d3e9a8d45bfa9b83b419db1e, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  csvListDropdown: {fileID: 571795712}
+  csvListFileBrowser: {fileID: 571795715}
+  targetAgentBehaviour: {fileID: 0}
+  startInput: {fileID: 2147000003}
+  roboListDropdown: {fileID: 2027246831}
+  roboListFileBrowser: {fileID: 2027246834}
+  roboListObjectName: RoboList
+  stopRealtimeTrackingOnReplay: 1
+  replayDatasetRelativePath: Assets/Gewu/Imitation/dataset
+  replayDatasetFallbackRelativePath: Assets/Imitation/dataset
+  replayDatasetExtraFallbacks:
+  - Assets/Gewu/Imitation/dataset
+  - Assets/Imitation/dataset
+--- !u!114 &2147000005
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 2147000001}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: e2c52fa6723923b4cb0399a10582d172, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  startInput: {fileID: 2147000003}
+  targetAgentBehaviour: {fileID: 0}
 --- !u!1660057539 &9223372036854775807
 SceneRoots:
   m_ObjectHideFlags: 0
