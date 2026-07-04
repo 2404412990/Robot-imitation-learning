@@ -47,29 +47,6 @@ public class Replay : MonoBehaviour
         public int MotionId;
     }
 
-    private static readonly Dictionary<string, string> RobotAliases =
-        new Dictionary<string, string>(System.StringComparer.OrdinalIgnoreCase)
-        {
-            { "G1", "unitree_g1" },
-            { "G1H", "unitree_g1_with_hands" },
-            { "H1", "unitree_h1" },
-            { "H1_2", "unitree_h1_2" },
-            { "X02", "x02lite" },
-            { "X02Lite", "x02lite" },
-            { "OpenLoong", "openloong" },
-        };
-
-    private static readonly Dictionary<string, string> RobotDatasetFolders =
-        new Dictionary<string, string>(System.StringComparer.OrdinalIgnoreCase)
-        {
-            { "unitree_g1", "unitree_g1" },
-            { "unitree_g1_with_hands", "unitree_g1" },
-            { "unitree_h1", "unitree_h1" },
-            { "unitree_h1_2", "unitree_h1" },
-            { "x02lite", "x02lite" },
-            { "openloong", "openloong" },
-        };
-
     void Awake()
     {
         replayButton = GetComponent<Button>();
@@ -340,8 +317,7 @@ public class Replay : MonoBehaviour
             return string.Empty;
         }
 
-        string trimmed = raw.Trim();
-        return RobotAliases.TryGetValue(trimmed, out string alias) ? alias : trimmed;
+        return RobotCatalog.NormalizeKeyOrOriginal(raw);
     }
 
     private void ResolveReferences()
@@ -491,8 +467,7 @@ public class Replay : MonoBehaviour
 
     private static string ResolveRobotDatasetFolder(string robotKey)
     {
-        string normalized = NormalizeRobotKey(robotKey);
-        return RobotDatasetFolders.TryGetValue(normalized, out string folder) ? folder : string.Empty;
+        return RobotCatalog.TryGetDatasetFolder(robotKey, out string folder) ? folder : string.Empty;
     }
 
     private void AddRobotDatasetCandidate(List<string> candidatePaths, string configuredPath, string robotFolder)

@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using TMPro;
 using UnityEngine;
+using Gewu.Imitation;
 
 public class FileBrowser : MonoBehaviour
 {
@@ -65,18 +66,6 @@ public class FileBrowser : MonoBehaviour
 
     private static readonly Dictionary<string, CsvColumnCacheEntry> CsvColumnCache =
         new Dictionary<string, CsvColumnCacheEntry>(StringComparer.OrdinalIgnoreCase);
-
-    // Store only normalized keys here; aliases are handled by NormalizeRobotKey.
-    private static readonly Dictionary<string, int> CsvExpectedColumnsByRobot =
-        new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
-        {
-            { "unitree_g1", 36 },
-            { "unitree_g1_with_hands", 36 },
-            { "unitree_h1", 26 },
-            { "unitree_h1_2", 26 },
-            { "x02lite", 25 },
-            { "openloong", 38 },
-        };
 
     void Start()
     {
@@ -255,7 +244,7 @@ public class FileBrowser : MonoBehaviour
             return false;
         }
 
-        string normalizedRobot = NormalizeRobotKey(robotKeyOrLabel);
+        string normalizedRobot = RobotCatalog.NormalizeKeyOrOriginal(robotKeyOrLabel);
         if (string.IsNullOrWhiteSpace(normalizedRobot))
         {
             return false;
@@ -265,7 +254,7 @@ public class FileBrowser : MonoBehaviour
         char[] separators = { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar };
         foreach (string segment in directory.Split(separators, StringSplitOptions.RemoveEmptyEntries))
         {
-            if (string.Equals(NormalizeRobotKey(segment), normalizedRobot, StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(RobotCatalog.NormalizeKeyOrOriginal(segment), normalizedRobot, StringComparison.OrdinalIgnoreCase))
             {
                 return true;
             }
@@ -274,49 +263,9 @@ public class FileBrowser : MonoBehaviour
         return false;
     }
 
-    private static string NormalizeRobotKey(string raw)
-    {
-        if (string.IsNullOrWhiteSpace(raw))
-        {
-            return string.Empty;
-        }
-
-        string key = raw.Trim();
-        if (string.Equals(key, "G1", StringComparison.OrdinalIgnoreCase))
-        {
-            return "unitree_g1";
-        }
-        if (string.Equals(key, "G1H", StringComparison.OrdinalIgnoreCase))
-        {
-            return "unitree_g1_with_hands";
-        }
-        if (string.Equals(key, "H1", StringComparison.OrdinalIgnoreCase))
-        {
-            return "unitree_h1";
-        }
-        if (string.Equals(key, "H1_2", StringComparison.OrdinalIgnoreCase))
-        {
-            return "unitree_h1_2";
-        }
-        if (string.Equals(key, "X02", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(key, "X02Lite", StringComparison.OrdinalIgnoreCase))
-        {
-            return "x02lite";
-        }
-
-        return key;
-    }
-
     private static bool TryResolveExpectedColumns(string robotKeyOrLabel, out int expectedColumns)
     {
-        expectedColumns = 0;
-        if (string.IsNullOrWhiteSpace(robotKeyOrLabel))
-        {
-            return false;
-        }
-
-        string normalizedKey = NormalizeRobotKey(robotKeyOrLabel);
-        return CsvExpectedColumnsByRobot.TryGetValue(normalizedKey, out expectedColumns);
+        return RobotCatalog.TryGetExpectedCsvColumns(robotKeyOrLabel, out expectedColumns);
     }
 
     private static bool TryReadCsvColumnCount(string filePath, out int columnCount)

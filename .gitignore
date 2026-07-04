@@ -6,6 +6,10 @@ Robot-imitation-learning/**/*.pyc
 
 dataset/live_motion*.csv
 dataset/live_motion*.csv.meta
+dataset/*/20*_*.csv
+dataset/*/20*_*.csv.meta
+dataset/*/20*_*.csv.replay.json
+dataset/*/20*_*.csv.replay.json.meta
 __pycache__/
 *.pyc
 .cache/
