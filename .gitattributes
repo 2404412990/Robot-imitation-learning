@@ -1,3 +1,9 @@
-*.mp4 filter=lfs diff=lfs merge=lfs -text
-*.gif filter=lfs diff=lfs merge=lfs -text
-*.png filter=lfs diff=lfs merge=lfs -text
+# Keep repository demonstrations in Git LFS without forcing every model asset
+# or vendored third-party image through LFS.
+*.md text eol=lf
+*.py text eol=lf
+*.sh text eol=lf
+docs/video/*.mp4 filter=lfs diff=lfs merge=lfs -text
+docs/video/*.gif filter=lfs diff=lfs merge=lfs -text
+docs/video/*.png filter=lfs diff=lfs merge=lfs -text
+docs/img/*.png filter=lfs diff=lfs merge=lfs -text
